@@ -115,6 +115,10 @@ export class TestHooks extends DurableObject<Env> {
     return this.#gatekeeper(facetName, creation).describe();
   }
 
+  async autoApprovableActions(facetName: string, creation?: { title: string }) {
+    return this.#gatekeeper(facetName, creation).getAutoApprovableActions();
+  }
+
   async applyAction(
       facetName: string, actionId: number, creation?: { title: string },
   ): Promise<string | null> {

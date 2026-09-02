@@ -343,6 +343,16 @@ describe("Google Doc write receipts", () => {
 describe("Google Doc creation (createExternalResource)", () => {
   const CREATION = { title: "My New Doc" };
 
+  it("advertises creation as its own auto-approvable kind", async () => {
+    new DocsModel().install();
+    // A separate tag from edits, so hands-free creation (a scheduled task minting a doc each
+    // day) is its own opt-in rule.
+    expect(await hooks().autoApprovableActions("create-kinds", CREATION)).toEqual([
+      { tag: "editDocument", label: "Document edits" },
+      { tag: "createDocument", label: "Document creation" },
+    ]);
+  });
+
   it("simulates the uncreated document without touching the provider", async () => {
     let docs = new DocsModel();
     docs.install();
