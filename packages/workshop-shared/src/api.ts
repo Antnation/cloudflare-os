@@ -3233,6 +3233,37 @@ export type AiToolCall = {
     bindingName?: string;
   };
   output?: string;
+} | {
+  /**
+   * Create a brand-new external resource through an already-connected account (contrast
+   * requestConnection, which binds an EXISTING resource and requires user acceptance before the
+   * agent proceeds). Non-blocking: the gatekeeper simulates the resource until the user approves
+   * the creation action (a normal action card), so the binding is usable immediately.
+   */
+  toolName: "createExternalResource";
+  input: {
+    vendorId: string;
+
+    /** urlPattern of the resource type to create (one whose SupportedResource is creatable). */
+    resourceUrlPattern: string;
+
+    /** Human-readable title for the new resource (e.g. the document title). */
+    title: string;
+
+    /** Name under which the resource appears in the chat's env (see validateBindingName()). */
+    bindingName: string;
+
+    /** Which connected account creates the resource; required only when several match. */
+    accountId?: number;
+  };
+
+  /**
+   * On success, the full tool result: the created gatekeeper workpiece, its provisional
+   * resourceUrl, and the message shown to the model — replay re-binds and re-renders from it
+   * instead of re-creating, like createGadget. A string output is a fixable rejection returned
+   * to the model (no binding was made), like requestConnection's output.
+   */
+  output?: {gatekeeperId: WorkpieceId, resourceUrl: string, message: string} | string;
 });
 
 // TODO: Extend AiToolCall for code-mode tool calls.
