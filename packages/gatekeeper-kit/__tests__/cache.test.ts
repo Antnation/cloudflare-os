@@ -197,7 +197,7 @@ describe("KvTtlCache.partitionedBy", () => {
       account: () => ({
         getCredentials: async () =>
           ({ creds: { token: "live" }, identity: account.identity, generation: account.generation }),
-        noteCredentialsExpired: async () => {},
+        noteCredentialsExpired: async () => true,
       }),
       isAuthError: error => error instanceof Error && error.message === "401",
       expiredMessage: "Reconnect the account.",

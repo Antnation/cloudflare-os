@@ -334,21 +334,38 @@ export class CredentialCoordinator<Creds> {                  // lives in the Use
 
 export class CredentialSource<Creds> {          // held by User entrypoint / facet / verifier
   constructor(opts: {
-    account: () => AccountCredentialStub<Creds>;   // { getCredentials(): Promise<{ creds, identity, generation }>; noteCredentialsExpired(identity) }
-    isAuthError(e: unknown): boolean;              // grant death only, never a per-resource denial
+    account: () => AccountCredentialStub<Creds>;   // { getCredentials(): Promise<CredentialsWithIdentity<Creds>>;
+                                 //   noteCredentialsExpired(identity): Promise<boolean> — whether
+                                 //   identity is still the account's current one, never whether
+                                 //   notification succeeded (delivery is the latch's, §4.4);
+                                 //   explicit false = superseded, resolved as the retry message
+                                 //   with the authority dropped to unknown }
+    refreshCredentials?(rejected: CredentialsWithIdentity<Creds>):
+      Promise<CredentialsWithIdentity<Creds>>;     // §4.13: mints past a provider rejection.
+                                 // REQUIRED by `replayable` runs, which throw without it — an
+                                 // unwired derived-bearer port would otherwise report a routine
+                                 // stale bearer as grant death. Per-vendor account RPC behind it
+    isAuthError(e: unknown): boolean;              // credential rejection — the provider refusing
+                                 // the presented credentials — never a per-resource denial; the
+                                 // refresh outcome, not the classifier, tells a stale derived
+                                 // bearer from a dead grant
     expiredMessage: string;
     vendorId?: string;                             // log attribution
   });
   get(): Promise<Creds>;       // reads the account; concurrent reads coalesce onto one round trip
-  run<T>(fn: (creds: Creds) => Promise<T>): Promise<T>;   // hands the call its creds, captures their
+  run<T>(fn: (creds: Creds) => Promise<T>,
+    opts?: { replayable?: boolean }): Promise<T>;  // hands the call its creds, captures their
                                  // identity; an auth failure under an identity a refetch has since
                                  // superseded with a live successor is stale — rethrown as retry,
                                  // not reported as expiry. No live successor, no retry: a mismatch
-                                 // alone can mean the read was fenced out, and its failure reports
+                                 // alone can mean the read was fenced out, and its failure reports.
+                                 // `replayable`: one refresh and replay through the source before
+                                 // any of that, throwing without the channel (§4.13)
   authority(): string | undefined;  // the connection generation of the last fetch, synchronously —
                                  // named for its facet-side cache-authority role, wired through
                                  // KvTtlCache.partitionedBy (§4.10). undefined before the first
-                                 // fetch, and from a reported expiry until a fetch started after
+                                 // fetch, and from a reported or account-refused expiry until a
+                                 // fetch started after
                                  // the report adopts an undead identity: partition unknown, so a
                                  // cache keyed on it bypasses rather than serves. Last-seen and
                                  // shared — never the action-fence capture, which rides the
@@ -424,9 +441,13 @@ the commit persisting it can lose the new token. The README documents this; noth
 may promise otherwise.
 
 `CredentialSource.run` resolves the credentials, hands them to the operation, and captures their
-identity before awaiting it. When `isAuthError(e)` is true and that captured identity is still the
-last one a fetch adopted, it calls `account().noteCredentialsExpired(identity)` and throws
-`new Error(expiredMessage, { cause: e })`, adding that identity to a dead set (per-activation and
+identity before awaiting it. With `replayable`, one refresh-and-replay through the
+`refreshCredentials` channel precedes everything below (§4.13) — the flag without a channel throws
+at the call. When `isAuthError(e)` is true and that captured identity is still the
+last one a fetch adopted, it calls `account().noteCredentialsExpired(identity)` — whose answer is
+authoritative: an explicit `false` means a newer credential superseded the report, and `run`
+throws the fixed retry message with the authority dropped to unknown instead — and on acceptance
+throws `new Error(expiredMessage, { cause: e })`, adding that identity to a dead set (per-activation and
 never evicted: growth is bounded by account commits, and stale failures mark identities out of
 commit order, so no eviction order is safe): the account keeps the grant until reconnect, so a
 refetch returns the same identity,
@@ -443,10 +464,14 @@ partition, so `run` reports nothing, clears nothing, and throws a fixed retry me
 bare identity mismatch is not enough: a fetch fenced out by the report still hands its credentials
 to its caller without adopting them, and when those fail too, nothing live succeeded them — the
 failure is fresh evidence and reports as expiry, or a later refetch would re-adopt the dead grant.
+A replay's second rejection skips the snapshot gate entirely: it reports the identity the channel
+minted — which a rotating mint moves past the snapshot — and the account alone adjudicates it
+(§4.13); gating it locally would suppress the report a rotated dead grant needs.
 The account hop is itself wrapped, so its failure cannot replace `expiredMessage`; everything else
 passes through.
 
-**`isAuthError` is the one classifier the agent can aim.** It decides that a *grant* is dead, and
+**`isAuthError` is the one classifier the agent can aim.** It decides that the provider *rejected
+the credentials* — grant death on the plain path, a refreshable rejection under `replayable` — and
 the agent chooses which operations run — so a classifier matching bare 401/403 lets it retire a
 healthy connection by requesting one resource the grant does not cover, and the user is prompted to
 reconnect something that never broke. Per-resource denials are `isNoAccessError`'s job (§4.5); this
@@ -1560,8 +1585,9 @@ export function withAuthRetry<Token, T>(options: AuthRetryOptions<Token>,
   run: (token: Token) => Promise<T>): Promise<T>;
 ```
 
-`CredentialSource.run()` has exactly two outcomes: pass the call through, or report the account
-expired. That is right for the five gatekeepers whose 401 means the grant is gone (supabase,
+Without `replayable`, `CredentialSource.run()` has three outcomes: pass the call through, report
+the account expired, or — when the account refuses the report as superseded — throw the fixed
+retry message. That is right for the five gatekeepers whose 401 means the grant is gone (supabase,
 github, linear, spotify, homeassistant), and wrong for the four that mint a short-lived derived
 bearer from a longer-lived grant, where a 401 usually means *that bearer* is stale. All four
 hand-roll the same single retry: marketo (`marketo-api.ts:462-477`), google
@@ -1576,32 +1602,74 @@ the refresh so a shared cache can skip a redundant mint when another caller alre
 (google's shape). A non-auth error at either attempt propagates immediately: transport failures and
 5xx are not credential problems, and retrying them here would double every provider outage.
 
-**This module reports nothing, because it holds no credential identity to fence a report on.** An
-expiry notification racing a reconnect is exactly what the identity fence exists to reject, and a
-stale notifier that stepped on one would mark a healthy grant dead — so neither a failing `getToken`
-nor a twice-rejected credential is reported from here. Both belong to the caller's
-`CredentialSource.run(creds => withAuthRetry(...))`: `withAuthRetry` swallows the first 401 and
-rethrows only a persistent one, so `run`'s catch fires exactly once, against the identity it
-captured *before* the attempt (§5.6).
+**This module reports nothing, and a `CredentialSource.run()` wrapped around it cannot reliably
+report either** *(revised 2026-09-03; this section previously blessed that composition)*: a
+report is fenced on the identity the source observed, and `withAuthRetry`'s refresh happens where
+no source sees it. For a grant that rotates on refresh — confluence persists a rotated refresh
+token on every redemption (`confluence.ts:372`) — the mint supersedes the identity mid-operation,
+so a persistent 401's report names the superseded grant and the account's fence gates it out: the
+dead grant stays accepted and the Workshop is never told to reconnect. The retry a source user
+needs therefore lives *in the source*, where the refresh flows through the reporter:
+`run(operation, { replayable: true })` replays once via
+`CredentialSourceOptions.refreshCredentials` and reports the identity it actually replayed, and it
+refuses a replay whose refresh crossed a connection generation (a reconnect — possibly a different
+principal). **The refresh is observed, never adopted** *(simplified 2026-09-03, superseding the
+fence stack earlier revisions of this section accumulated)*: plain reads are the snapshot's only
+writer — rejection handling only clears it — so a mint cannot race the authority, and the
+interleaving fences previously specified here (refresh adoption, its read fence, client-side
+identity succession) went with the second writer that required them. What remains is hard-signal
+only: `replayable` without a channel throws at the call; a refresh resolving to a grant already
+reported dead reports instead of replaying; a replay is refused when a generation moved, in the
+refresh result or adopted meanwhile (one adopted before the refresh starts skips the channel
+entirely — its failures have nothing to tell a caller who only needs to re-enter) — and a
+crossing observed in the result stales any authority
+not adopted past it, so one unknown or still on the rejected generation drops with a fence (a
+pending read could otherwise restore the pre-reconnect partition) while one adopted meanwhile
+stays; a channel-confirmed
+expiry takes the death fences, or resolves as the retry message when a reconnect was adopted
+meanwhile. Identity succession is the account's to adjudicate: `noteCredentialsExpired` answers
+whether the reported identity is still its current one — an adjudication of identity, never of
+notification delivery, whose latch deliberately stays unset on a failed callback so a later expiry
+re-notifies (returning that failure would mask a dead grant as superseded) — asked first, with the
+clear and fences landing as one synchronous
+transition after the answer, so a read resolving mid-adjudication cannot outlive the verdict —
+and an explicit `false` — superseded — resolves as the fixed retry message with the authority
+dropped to unknown, because a snapshot the account just called stale cannot vouch for the current
+principal on a cache hit (§4.10). The deliberate costs: a stale mint may spend one provider call
+before the account's verdict lands; the rejected authority serves hits for the one round-trip the
+answer takes (it served them right up to the rejection anyway — fencing before the ask was
+considered and rejected: mid-ask reads re-adopt the grant the account still serves, forcing a
+second post-answer transition regardless, and the bypass converts bounded stale hits into a storm
+of guaranteed 401 misses); and any adjudicated rejection
+costs a cache-bypass window until the next read re-establishes the partition — never a lasting
+authority the source cannot stand behind.
+Replays coalesce per rejected read, never per identity — an identity-keyed flight would replay to
+one caller credentials another already saw rejected, expiring a still-refreshable grant. The
+coalescing covers overlapping attempts only: the flight releases when the mint settles, so a run
+rejecting later re-enters the channel, and sequential dedup is the account RPC's contract — handed
+the rejected credentials, it mints only past those and answers an already-superseded rejection
+from what it holds (google's `staleToken` check, `google.ts:560`), so a straggler can neither
+spend a rotation nor invalidate a bearer a replay is mid-flight with.
+`withAuthRetry` remains for token flows that hold no source, where nothing reports; a configurator
+holds one (`AccountHandle.creds`, §5.1), which retries where the port wired
+`kitUserConfig().refreshCredentials` (§5.8) — the assembly passes it into the source it builds,
+keeping refresh material account-side (§5.6).
 
-**Where `getToken` comes from is the port's, and today it is a vendor RPC.** For the five providers
-whose 401 means the grant is gone, there is nothing to wire: `CredentialSource.run` alone is the
-whole story. For the four that mint a derived bearer, `getToken({ forceRefresh: true })` has to
-reach the account, because §5.6 forbids refresh material crossing to a facet — so the mint is
-account-side by construction, and the channel is per-vendor: google passes
-`getAccessToken({ forceRefresh, staleToken })`, notion calls a separate `refreshCredentials()`
-(doc'd at §5.6's projection rule). The kit does not name that channel yet; the §5.6 work item below
-records the shape it should take, and until it lands a port supplies its own.
+**Where the refresh comes from is still the port's, and it is account-side by construction.** For
+the five providers whose 401 means the grant is gone, there is nothing to wire:
+`CredentialSource.run` alone is the whole story, and they do not mark operations replayable —
+`replayable` without the channel throws at the call. For the four that mint a derived bearer, the
+per-vendor RPC behind `refreshCredentials` reaches the account (§5.6 forbids refresh material
+crossing to a facet): google's `getAccessToken({ forceRefresh, staleToken })` shape, notion's
+`refreshCredentials()`. `getCredentials()` cannot serve: it is `coordinator.fresh(...)`, which
+refreshes on expiry only, so a grant killed by `invalid_grant` while its access token is still
+unexpired is re-served unchanged. `coordinator.rotate()` is the account-side half that forces one;
+whatever RPC a port puts in front of it owes the same dead-grant treatment `getCredentials()`
+gives — a still-current `CredentialsExpiredError` becomes `noteCredentialsExpired()`, fenced on
+the identity.
 
-`CredentialSource` cannot serve as that channel: `getCredentials()` is `coordinator.fresh(...)`,
-which refreshes on expiry only, so a grant killed by `invalid_grant` while its access token is
-still unexpired is re-served unchanged. `coordinator.rotate()` is the account-side half that
-forces one; whatever RPC a port puts in front of it owes the same dead-grant treatment
-`getCredentials()` gives — a still-current `CredentialsExpiredError` becomes
-`noteCredentialsExpired()`, fenced on the identity.
-
-This closes the "401 retry" *logic* the §4.8 table recorded as deferred. The refresh channel the
-retry depends on stays per-vendor until the work item lands.
+This closes the "401 retry" logic the §4.8 table recorded as deferred and names its refresh
+channel (`CredentialSourceOptions.refreshCredentials`), superseding the §5.6 deferral below.
 
 ### 4.14 `./endpoint`
 
@@ -1938,9 +2006,13 @@ Public loopback-RPC methods and their sequencing:
   RPC (the transport strips the class), since the source drops its cache authority on it; verify
   preservation at the first port. Any other refresh error rethrows with credentials intact. **The
   projection is not optional — see below.**
-- `noteCredentialsExpired(identity)` — no-ops unless `identity` matches the coordinator's
-  current one (a stale notifier lost the race to a reconnect); otherwise delegates to
-  `notifyCredentialsExpiredOnce` with `vendorId = spec.id`.
+- `noteCredentialsExpired(identity)` — returns `false` without notifying unless `identity` matches
+  the coordinator's current one (a stale notifier lost the race to a reconnect); on a match,
+  delegates to `notifyCredentialsExpiredOnce` with `vendorId = spec.id` and returns `true`
+  regardless of the notification's outcome. The boolean adjudicates identity only: the latch
+  deliberately stays unset on a failed callback so a later expiry re-notifies, and returning that
+  failure would make the source resolve a dead grant as superseded — an endless retry the user is
+  never told about.
 - `revoke()` — clears `"attemptGeneration"`, `deleteAlarm()` and `deleteAll()` **before** the first
   await, then best-effort `strategy.revoke` on the grant it captured (failures log `error` with
   event `oauth.grant.revoke.failed`). Destroying local state after awaiting the provider would let
@@ -1993,30 +2065,35 @@ here, by wiring the two to one type — which is precisely why this is written d
 built. `KitUserAccountBase<E, Creds, Public>` gains the third parameter; where a gatekeeper has no
 refresh flow (github), `Public = Creds` is a legitimate instantiation, not a default to fall into.
 
-**Deferred: the force-refresh channel (§4.13).** `getCredentials()` is `coordinator.fresh(...)`,
-which refreshes on expiry only, so nothing in the base's RPC list reaches `coordinator.rotate()`.
-A derived-bearer port therefore supplies `withAuthRetry`'s `getToken({ forceRefresh: true })` from
-its own vendor RPC — google's `getAccessToken({ forceRefresh, staleToken })`, notion's
-`refreshCredentials()`. Naming that channel here is what stops each port inventing one. Design
-notes for whoever lands it:
+**Landed 2026-09-03: the force-refresh channel is `CredentialSourceOptions.refreshCredentials`**,
+a consumer-side option (the per-vendor account RPC sits behind it), triggered by
+`run(operation, { replayable: true })`. The composition this deferral assumed —
+`run(creds => withAuthRetry(...))` — routed the refresh around the reporter, so a rotating grant's
+expiry was unreportable (§4.13). How the design notes above resolved:
 
-- **A required method, not an optional parameter.** TypeScript accepts a zero-argument
-  implementation as satisfying `getCredentials(options?: …)`, and jsrpc drops the argument at
-  runtime, so an account that ignores `forceRefresh` compiles and silently re-serves the rejected
-  token; `withAuthRetry` then replays it, `run`'s catch fires, and a healthy grant is retired. A
-  required `rotateBearer()` fails with TS2741 at the mistake, and has no option to ignore.
-- **`staleBearer`, not `staleIdentity`.** `run` hands its callback `creds` only — `identity` stays
-  private — so an identity is unobtainable where this is wired. The rejected bearer is in scope by
-  construction, and comparing bearer values is what google already does (`google.ts:556`) to skip a
-  redundant mint. Required, since `withAuthRetry` always supplies it on the forced call.
-- **Expiry gates first.** Google refuses any cached token inside the safety window whatever the
-  request asks for (`google.ts:555`); a forced rotate must not be answered with one either.
-- **Do not widen `AccountCredentialStub`.** It would be dead surface for the five grant-death
-  providers. A free-standing type plus a small adapter over the bearer `run` already fetched keeps
-  the unforced path free of a second account round trip, which is the common case.
-- **Interaction with the fencing row (§4.8).** `getCredentialsForGeneration(expected)` extends this
-  same seam on a *different* trigger (the first principal-switching port), and generation overlaps
-  with `staleBearer` semantically. Whichever lands first should leave room for the other.
+- **Required method → presence-gated local option.** An optional method on the RPC stub cannot be
+  presence-checked (stubs are proxies that answer every property), and a required one is dead
+  surface for the five grant-death providers. A local option is both checkable and omittable:
+  absent, `replayable` throws at the call — for a derived-bearer port an unwired channel would
+  report a routine stale-bearer rejection as grant death, so the misconfiguration surfaces at
+  first use instead of in production; grant-death providers simply do not pass the flag. The
+  remaining trust point is documented on the option: a wired channel that re-serves a rejected
+  cached bearer retires a healthy grant, and the source cannot verify freshness for generic creds.
+- **`staleBearer` → the whole rejected read.** `refreshCredentials(rejected)` receives
+  `{ creds, identity, generation }`: the creds for google-style redundant-mint skipping
+  (`google.ts:556`), the identity for the account's grant gate. The "identity is unobtainable"
+  objection applied to the withAuthRetry wiring; the source holds it and passes it itself.
+- **Expiry gates first.** Unchanged (`google.ts:555`); it is the channel implementation's
+  obligation.
+- **`AccountCredentialStub` stays unwidened.** The channel lives on `CredentialSourceOptions`.
+  `noteCredentialsExpired` did change shape — `Promise<void>` → `Promise<boolean>`, the account's
+  authoritative answer on whether the reported identity is still current — but that is a return on
+  an existing required method, not the optional method a proxy stub cannot presence-check.
+- **Interaction with the fencing row (§4.8).** Still open. One constraint discovered here narrows
+  it: the source refuses a replay whose refresh crossed a connection generation (a reconnect —
+  possibly a different principal) and rethrows as "changed during the operation", and it coalesces
+  concurrent replays per rejected read — never per identity, which would replay to one caller
+  credentials another already saw rejected.
 
 ### 5.7 `./vendor` — `KitVendorBase<E>`
 
@@ -2029,11 +2106,17 @@ DurableObjectNamespace<…> }`. Implements `describe()` (returns `spec.vendor` a
 ### 5.8 `./user` — `KitUserBase<E, Creds, X>`
 
 Abstract `WorkerEntrypoint<E, KitAccountProps>` with hook `[kitUserConfig](): { spec; exports():
-X; account(): AccountStub<Creds> }`. The typed `exports()` closure is what lets the default
-resolver call `def.facet(exports(), props)` without a cast. Implements:
+X; account(): AccountStub<Creds>; refreshCredentials?(rejected: CredentialsWithIdentity<Creds>):
+Promise<CredentialsWithIdentity<Creds>> }`. The typed `exports()`
+closure is what lets the default resolver call `def.facet(exports(), props)` without a cast.
+`refreshCredentials` is the derived-bearer port's per-vendor mint RPC (§4.13), the same shape as
+`CredentialSourceOptions`: it closes over the port's concretely typed account stub — the base
+`AccountStub<Creds>` cannot type a vendor RPC like `getAccessToken`, so handing one in would force
+a cast — which keeps refresh material account-side (§5.6) all the same. The base passes it into
+every `CredentialSource` it builds; absent, `replayable` runs throw at the call. Implements:
 
 - `describe` / `getAuthenticatedEmail` via `spec.account.*` with a lazily built `AccountHandle`
-  (a `CredentialSource` over `account()`).
+  (a `CredentialSource` over `account()`, carrying `refreshCredentials` when the config wires it).
 - `getSupportedResources`.
 - Default `getGatekeeperClassFor(url)`: the first resource whose `resolve(new URL(url))` returns
   non-null wins, yielding `{ class: def.facet(exports(), { ...props, userObjectId }), resource:
@@ -2255,9 +2338,24 @@ Each step leaves the tree building; tests land with the module they cover. Nothi
    credentials already reported expired. For
    `withAuthRetry` (§4.13): the success path asks for a token once with `forceRefresh: false`; a
    non-auth error at either attempt propagates with no refresh and no report; an auth error
-   refreshes with `{ forceRefresh: true, staleToken }` and returns the replay's result; two auth
-   errors surface the second one; and when composed under `CredentialSource.run`, the outer source
-   reports it exactly once.
+   refreshes with `{ forceRefresh: true, staleToken }` and returns the replay's result; and two
+   auth errors surface the second one. For `run(fn, { replayable: true })` (§4.13): an auth rejection
+   refreshes through the channel and replays once, and a second rejection reports the replayed
+   identity (a first non-auth failure propagates with the channel uncalled); the flag without a
+   channel throws before the read; the refresh result is observed, never adopted — plain reads
+   stay the snapshot's only writer; a generation moved anywhere in sight — the refresh result, or
+   adopted meanwhile — refuses the replay (adopted before the refresh starts, without calling the
+   channel), and a crossing in the result also fences, dropping an
+   authority unknown or still on the rejected generation while one adopted meanwhile stays; a
+   channel-confirmed expiry takes the death fences against a
+   read still in flight, or resolves as the retry message when a reconnect was adopted meanwhile;
+   a rejection under a grant already reported dead — or a refresh resolving to one — reports
+   without minting or replaying; the account's `noteCredentialsExpired` answer decides — asked
+   before any state moves, so an identity adopted while the answer was pending never outlives the
+   verdict, and an explicit `false` resolves as the retry message with the authority dropped to
+   unknown; and distinct rejected reads refresh separately while overlapping refreshes for one
+   read coalesce — one that settles first releases the flight, and a later rejection re-enters the
+   channel, whose account RPC dedupes against the rejected credentials.
 6. **`actions` (§4.8).** Node tests: sequential IDs; staged→pending transitions; the default
    keys landing records at `pending:action:<id>` with counter `pending:nextActionId` (a
    live-storage contract for the supabase/google-family ports, so those literals are
@@ -2354,7 +2452,10 @@ Each step leaves the tree building; tests land with the module they cover. Nothi
     dispatched through the queue (interleaving asserted against a concurrent apply), bound with
     `retainApplied: true` so its record survives apply, and firing `afterResolve("reverted")`;
     the facet-base assert rejects (named config error) a revert hook whose actions don't retain;
-    a stale-identity `noteCredentialsExpired` after a reconnect no-ops; with the
+    a stale-identity `noteCredentialsExpired` after a reconnect returns `false` without notifying,
+    and a current-identity one returns `true` even when the Workshop callback fails (the latch
+    stays unset for a later re-notify; the boolean adjudicates identity only) — both through the
+    real account RPC; with the
     hook absent, `revertAction` throws not-implemented; strategy-B observer denial. This suite is
     also the proof that decorated subclasses of the kit's generic bases survive the
     `capnweb-validate` transform.

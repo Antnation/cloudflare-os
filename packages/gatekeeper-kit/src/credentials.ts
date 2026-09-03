@@ -279,10 +279,16 @@ export type AccountCredentialStub<Creds> = {
    */
   getCredentials(): Promise<CredentialsWithIdentity<Creds>>;
   /**
-   * Reports expiry when the credential identity is still current.
+   * Reports expiry and answers whether the report was accepted.
    * @param identity Credential identity used by the failed call.
+   * @returns Whether `identity` is still the account's current one — an adjudication of identity,
+   * never of notification delivery, which the account owns end to end. `false` means a newer
+   * credential superseded it and the failure was stale; the source resolves that as retryable and
+   * drops its now-stale authority until the next read. Anything else — including a transport that
+   * drops return values — reads as accepted, so a dead grant is never masked as retryable by a
+   * lost answer.
    */
-  noteCredentialsExpired(identity: string): Promise<void>;
+  noteCredentialsExpired(identity: string): Promise<boolean>;
 };
 
 /** `CredentialSource` keeps one flight -- the account's current credentials -- so it needs one key. */
@@ -293,8 +299,30 @@ export type CredentialSourceOptions<Creds> = {
   /** @returns A fresh or caller-owned account credential stub. */
   account(): AccountCredentialStub<Creds>;
   /**
-   * Classifies provider-confirmed credential expiry. Per-resource access denials must remain separate
-   * so an unauthorized request cannot disconnect a healthy account.
+   * Replaces credentials the provider rejected — required by `run`'s `replayable` retry, which
+   * throws without it. Wire it where a rejection short of grant death is survivable — a derived
+   * bearer minted from a longer-lived grant, or a rotating grant; grant-death providers leave it
+   * unset and do not mark operations replayable. The mint is account-side by construction
+   * (refresh material never reaches a facet); the RPC behind this callback is per-vendor.
+   *
+   * The contract is the mint: return credentials the provider has not already rejected — never a
+   * cache that may still hold `rejected.creds` — unless the stored grant has moved past
+   * `rejected.identity`, where current credentials answer as they are. A lazy implementation that
+   * re-serves the rejected credentials retires a healthy grant on its first stale rejection; the
+   * source cannot verify freshness for it.
+   * @param rejected The read whose credentials the provider just rejected.
+   * @returns Credentials refreshed past the rejected ones.
+   * @throws As `getCredentials`: confirmed grant expiry is an error named `CredentialsExpiredError`.
+   */
+  refreshCredentials?(
+    rejected: CredentialsWithIdentity<Creds>,
+  ): Promise<CredentialsWithIdentity<Creds>>;
+  /**
+   * Classifies credential rejection — the provider refusing the presented credentials. Per-resource
+   * access denials must remain separate so an unauthorized request cannot disconnect a healthy
+   * account. The classifier need not tell a stale derived bearer from a dead grant — the
+   * provider's signal is the same; with a `refreshCredentials` channel the refresh outcome
+   * disambiguates.
    * @param error Caught provider error.
    * @returns Whether credentials caused the failure.
    */
@@ -326,6 +354,7 @@ export class CredentialSource<Creds> {
   readonly #options: CredentialSourceOptions<Creds>;
   readonly #logger: typeof logger;
   readonly #fetches = new SingleFlight();
+  readonly #replays = new SingleFlight<CredentialsWithIdentity<Creds>>();
   #generation: string | undefined;
   #identity: string | undefined;
   // Bounded by account commits per activation; eviction is unsafe against out-of-order stale reports.
@@ -354,8 +383,8 @@ export class CredentialSource<Creds> {
    * `getCredentials()` read, never this accessor. Direct callers compose custom authorities for the
    * raw cache constructor.
    * @returns The last-seen connection generation; `undefined` (principal unknown) until a fetch
-   * succeeds, and from a reported expiry until a fetch started after the report adopts an identity
-   * not reported dead.
+   * succeeds, and from a reported — or account-refused — expiry until a fetch started after the
+   * report adopts an identity not reported dead.
    */
   authority(): string | undefined {
     return this.#generation;
@@ -364,35 +393,157 @@ export class CredentialSource<Creds> {
   /**
    * Runs a provider operation and reports confirmed expiry.
    * @param operation Provider call using current credentials.
+   * @param options `replayable` marks the operation safe to execute twice: a credential rejection
+   * is retried once with credentials refreshed through the `refreshCredentials` channel, and only
+   * a rejection of those — the freshest the account can mint — reports expiry. The flag requires
+   * the channel and throws without one, so a derived-bearer port that forgot the wiring fails at
+   * first use instead of reporting a routine stale-bearer rejection as grant death.
    * @returns The provider operation result.
    */
-  async run<T>(operation: (credentials: Creds) => Promise<T>): Promise<T> {
-    const { creds, identity } = await this.#current();
+  async run<T>(
+    operation: (credentials: Creds) => Promise<T>,
+    options: { replayable?: boolean } = {},
+  ): Promise<T> {
+    const { refreshCredentials } = this.#options;
+    if (options.replayable && refreshCredentials === undefined) {
+      throw new Error("A replayable operation requires a refreshCredentials channel.");
+    }
+    const first = await this.#current();
     try {
-      return await operation(creds);
+      return await operation(first.creds);
     } catch (error) {
       if (!this.#options.isAuthError(error)) throw error;
-      // A newer fetch adopted a live grant: this failure is stale, so that grant is neither
-      // reported dead nor its cache authority dropped. An adopted identity that is itself dead is
-      // no successor — then this failure is the freshest evidence, however old its read.
-      if (identity !== this.#identity
-        && this.#identity !== undefined && !this.#dead.has(this.#identity)) {
-        throw new Error("This account's credentials changed during the operation; retry it.",
-          { cause: error });
+      if (!options.replayable || refreshCredentials === undefined
+        || this.#dead.has(first.identity)) {
+        return this.#report(first.identity, error);
       }
-      // Drop the in-flight fetch: it was started against the credentials just reported dead, and
-      // leaving it would hand them to the next caller anyway. The generation goes with it, or a
-      // cache hit under the dead grant's partition could serve the next principal stale data.
-      this.#fetches.forget(CREDENTIALS_FLIGHT);
-      this.#generation = undefined;
-      this.#dead.add(identity);
-      this.#clearFence++;
-      await this.#note(identity);
-      throw new Error(this.#options.expiredMessage, { cause: error });
+      // A reconnect adopted since this read already decides the outcome — don't spend the
+      // channel, or hand its failures, on a superseded read.
+      if (this.#moved(first.generation)) throw this.#changed(error);
+      const second = await this.#refreshed(first, refreshCredentials);
+      // A parallel replay already had this mint's grant adjudicated dead — don't replay it.
+      if (this.#dead.has(second.identity)) {
+        return this.#adjudicate(second.identity, error);
+      }
+      // An authority adopted during the refresh is newer than this read and stays; the caller
+      // re-enters like any other mid-operation replacement.
+      if (this.#moved(first.generation)) throw this.#changed(error);
+      // A generation moved in the refresh result means a reconnect: replaying would act under a
+      // principal the caller never fetched. The crossing stales any authority not adopted past
+      // it — unknown included, or a pending read could restore the pre-reconnect partition.
+      if (second.generation !== first.generation) {
+        this.#supersede();
+        throw this.#changed(error);
+      }
+      try {
+        return await operation(second.creds);
+      } catch (replayError) {
+        if (!this.#options.isAuthError(replayError)) throw replayError;
+        return this.#adjudicate(second.identity, replayError);
+      }
     }
   }
 
-  /** @returns One coalesced account credential read. */
+  /**
+   * Resolves a confirmed credential rejection: rethrown as retryable when a newer fetch already
+   * adopted a live grant, adjudicated with the account otherwise.
+   * @param identity Credential identity used by the failed call.
+   * @param cause Provider rejection being resolved.
+   */
+  async #report(identity: string, cause: unknown): Promise<never> {
+    // A newer fetch adopted a live grant: this failure is stale, so that grant is neither
+    // reported dead nor its cache authority dropped. The shortcut needs evidence the source
+    // stands behind — an adopted identity that is itself dead, or one whose authority was
+    // dropped, is no successor; then the account adjudicates.
+    if (this.#generation !== undefined && identity !== this.#identity
+      && this.#identity !== undefined && !this.#dead.has(this.#identity)) {
+      throw this.#changed(cause);
+    }
+    return this.#adjudicate(identity, cause);
+  }
+
+  /**
+   * Reports a rejection to the account and resolves it by the verdict: a refused report is
+   * retryable, anything else is expiry. Replay paths call this directly — their identity is
+   * just-minted, so the snapshot cannot be newer than it and only the account adjudicates.
+   * @param identity Credential identity used by the failed call.
+   * @param cause Provider rejection being resolved.
+   */
+  async #adjudicate(identity: string, cause: unknown): Promise<never> {
+    const accepted = await this.#note(identity);
+    // Ask first, then clear and fence in one synchronous transition — a read resolving during the
+    // answer would slip an adoption between a clear and a later fence. Either way the answer goes,
+    // the authority drops: dead, its partition could serve the next principal stale data on a hit;
+    // superseded, this snapshot no longer vouches for the current principal.
+    if (accepted === false) {
+      this.#supersede();
+      throw this.#changed(cause);
+    }
+    this.#supersede(identity);
+    throw new Error(this.#options.expiredMessage, { cause });
+  }
+
+  /** @returns The retryable error for credentials replaced mid-operation. */
+  #changed(cause: unknown): Error {
+    return new Error("This account's credentials changed during the operation; retry it.",
+      { cause });
+  }
+
+  /**
+   * @param generation Connection generation of a caller's read.
+   * @returns Whether the adopted authority moved past that read — a reconnect adopted since it.
+   * An unknown authority has not: it cannot outrank the read's own fetch.
+   */
+  #moved(generation: string): boolean {
+    return this.#generation !== undefined && this.#generation !== generation;
+  }
+
+  /**
+   * Drops the cache authority and fences out account reads started before now — the in-flight one
+   * included — so neither can overwrite what this source just learned.
+   * @param dead Identity to stop adopting after its confirmed expiry.
+   */
+  #supersede(dead?: string): void {
+    if (dead !== undefined) this.#dead.add(dead);
+    this.#generation = undefined;
+    this.#clearFence++;
+    this.#fetches.forget(CREDENTIALS_FLIGHT);
+  }
+
+  /**
+   * Mints past a provider-rejected read through the refresh channel. The refresh flows through
+   * this source so the replay's identity — what a second rejection reports — is the one actually
+   * retried, but the result is only observed, never adopted: plain reads stay the snapshot's only
+   * writer, so a mint cannot race the authority. Coalesced per rejected read, never per identity —
+   * a run holding differently-rejected credentials must convey its own, or it would replay ones
+   * another caller already saw rejected.
+   * @param rejected The read whose credentials the provider rejected.
+   * @param refreshCredentials The configured refresh channel.
+   * @returns Credentials minted past the rejected read.
+   */
+  async #refreshed(
+    rejected: CredentialsWithIdentity<Creds>,
+    refreshCredentials: NonNullable<CredentialSourceOptions<Creds>["refreshCredentials"]>,
+  ): Promise<CredentialsWithIdentity<Creds>> {
+    try {
+      return await this.#replays.run(rejected, () => refreshCredentials(rejected));
+    } catch (error) {
+      if (isExpiredError(error)) {
+        // The channel confirming expiry is the account's own verdict — unless a reconnect was
+        // adopted meanwhile, where the verdict concerns a replaced grant and the caller re-enters.
+        if (this.#moved(rejected.generation)) throw this.#changed(error);
+        // Take the death fences, so a read still in flight cannot restore the dead authority.
+        this.#supersede(rejected.identity);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Runs one coalesced account credential read, adopting its identity and cache authority unless
+   * fenced out.
+   * @returns The fetched credentials.
+   */
   async #current(): Promise<CredentialsWithIdentity<Creds>> {
     const fence = this.#clearFence;
     let current: CredentialsWithIdentity<Creds>;
@@ -407,7 +558,9 @@ export class CredentialSource<Creds> {
     }
     // Dual guard, neither subsumes the other: the fence blocks fetches started before an expiry
     // report (a straggler can carry any old identity, not just a marked one), the dead set blocks
-    // the grants the account keeps serving after their reports.
+    // the grants the account keeps serving after their reports. The fence holds even against a
+    // read resolving a reconnect: generations are opaque and equality-only, so a fenced response
+    // cannot prove itself newest — authority stays the last unfenced fetch.
     if (fence === this.#clearFence && !this.#dead.has(current.identity)) {
       this.#generation = current.generation;
       this.#identity = current.identity;
@@ -418,15 +571,18 @@ export class CredentialSource<Creds> {
   /**
    * Reports expiry without replacing the provider error.
    * @param identity Credential identity used by the failed call.
+   * @returns The account's verdict, or `undefined` when it was unreachable — read as accepted, so
+   * an outage cannot mask a dead grant as retryable.
    */
-  async #note(identity: string): Promise<void> {
+  async #note(identity: string): Promise<boolean | undefined> {
     try {
-      await this.#options.account().noteCredentialsExpired(identity);
+      return await this.#options.account().noteCredentialsExpired(identity);
     } catch (error) {
       this.#logger.error("failed to report credential expiry", {
         event: "credentials.expiry.report.failed",
         error,
       });
+      return undefined;
     }
   }
 }
