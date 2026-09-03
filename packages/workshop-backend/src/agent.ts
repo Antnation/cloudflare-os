@@ -658,9 +658,11 @@ export interface AgentHooks {
    * the binding — the gatekeeper simulates the resource until the creation is approved — so the
    * turn does NOT end. `created: false` is a fixable rejection (unknown vendor, type not
    * creatable, no usable account, missing authorization); the agent retries in-turn.
+   * `initiator` names whose connected accounts create the resource -- the turn's initiator, not
+   * the workspace owner, so a collaborator-driven turn uses (and enumerates) their own accounts.
    */
-  createExternalResource(chatId: number, input: CreateExternalResourceInput)
-      : Promise<CreateExternalResourceResult>;
+  createExternalResource(chatId: number, input: CreateExternalResourceInput,
+      initiator: AiChatAuthorInfo): Promise<CreateExternalResourceResult>;
 
   /**
    * Blueprint hooks for the agent.
@@ -3328,7 +3330,7 @@ export async function runAgent(
             return toolResult(message, { output: message });
           }
 
-          let result = await hooks.createExternalResource(chatId, input);
+          let result = await hooks.createExternalResource(chatId, input, initiator);
           if (!result.created) {
             // Fixable rejection: recorded as the string output, no binding was made.
             return toolResult(result.message, { output: result.message });

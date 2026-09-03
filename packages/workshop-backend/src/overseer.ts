@@ -8887,8 +8887,8 @@ class OverseerImpl implements AgentHooks {
   // provider-side creation is an ordinary pending action (captured for this chat, so its card
   // lands in the transcript at the step barrier). `created: false` is a fixable rejection — the
   // agent should adjust and retry in the same turn.
-  async createExternalResource(chatId: number, input: CreateExternalResourceInput)
-      : Promise<CreateExternalResourceResult> {
+  async createExternalResource(chatId: number, input: CreateExternalResourceInput,
+      initiator: AiChatAuthorInfo): Promise<CreateExternalResourceResult> {
     // The agent loop already validated the binding name against the chat's scope; re-validate
     // its shape here defensively.
     validateBindingName(input.bindingName);
@@ -8912,12 +8912,16 @@ class OverseerImpl implements AgentHooks {
             creatable.map(r => `${r.title} (${r.urlPattern})`).join(", ") + `.` };
     }
 
-    // Mint the provisional gatekeeper class through the user DO (the admin-check chokepoint).
-    // Its failures are agent-readable by contract: no usable account, ambiguous accounts,
-    // missing authorization.
+    // Mint the provisional gatekeeper class through the *initiator's* user DO (the admin-check
+    // chokepoint) -- connected accounts are per-user, so a collaborator-driven turn creates the
+    // resource under (and enumerates) the collaborator's accounts, not the owner's. The same
+    // initiator.id resolution as listAvailableBlueprints. Its failures are agent-readable by
+    // contract: no usable account, ambiguous accounts, missing authorization.
     let minted;
     try {
-      minted = await this.#ownerUserStub().createResourceGatekeeper(
+      let userStub = wrapDoStubForTelemetry(
+          this.users.get(this.users.idFromName(initiator.id)), this.logger);
+      minted = await userStub.createResourceGatekeeper(
           input.vendorId, input.accountId, input.resourceUrlPattern, {title: input.title});
     } catch (error) {
       return { created: false, message: `Cannot create the resource: ${stringifyError(error)}` };
