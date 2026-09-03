@@ -335,11 +335,11 @@ export class CredentialCoordinator<Creds> {                  // lives in the Use
 export class CredentialSource<Creds> {          // held by User entrypoint / facet / verifier
   constructor(opts: {
     account: () => AccountCredentialStub<Creds>;   // { getCredentials(): Promise<CredentialsWithIdentity<Creds>>;
-                                 //   noteCredentialsExpired(identity): Promise<boolean> — whether
-                                 //   identity is still the account's current one, never whether
-                                 //   notification succeeded (delivery is the latch's, §4.4);
-                                 //   explicit false = superseded, resolved as the retry message
-                                 //   with the authority dropped to unknown }
+                                 //   noteCredentialsExpired(identity): Promise<ExpiryVerdict> —
+                                 //   "accepted" | "superseded": an adjudication of identity, never
+                                 //   of notification delivery (that is the latch's, §4.4); an
+                                 //   explicit "superseded" resolves as the retry message with the
+                                 //   authority dropped to unknown, anything else reads "accepted" }
     refreshCredentials?(rejected: CredentialsWithIdentity<Creds>):
       Promise<CredentialsWithIdentity<Creds>>;     // §4.13: mints past a provider rejection.
                                  // REQUIRED by `replayable` runs, which throw without it — an
@@ -445,8 +445,9 @@ identity before awaiting it. With `replayable`, one refresh-and-replay through t
 `refreshCredentials` channel precedes everything below (§4.13) — the flag without a channel throws
 at the call. When `isAuthError(e)` is true and that captured identity is still the
 last one a fetch adopted, it calls `account().noteCredentialsExpired(identity)` — whose answer is
-authoritative: an explicit `false` means a newer credential superseded the report, and `run`
-throws the fixed retry message with the authority dropped to unknown instead — and on acceptance
+authoritative: an explicit `"superseded"` means a newer credential replaced the reported one, and
+`run` throws the fixed retry message with the authority dropped to unknown instead — and on
+`"accepted"`
 throws `new Error(expiredMessage, { cause: e })`, adding that identity to a dead set (per-activation and
 never evicted: growth is bounded by account commits, and stale failures mark identities out of
 commit order, so no eviction order is safe): the account keeps the grant until reconnect, so a
@@ -1633,7 +1634,7 @@ notification delivery, whose latch deliberately stays unset on a failed callback
 re-notifies (returning that failure would mask a dead grant as superseded) — asked first, with the
 clear and fences landing as one synchronous
 transition after the answer, so a read resolving mid-adjudication cannot outlive the verdict —
-and an explicit `false` — superseded — resolves as the fixed retry message with the authority
+and an explicit `"superseded"` resolves as the fixed retry message with the authority
 dropped to unknown, because a snapshot the account just called stale cannot vouch for the current
 principal on a cache hit (§4.10). The deliberate costs: a stale mint may spend one provider call
 before the account's verdict lands; the rejected authority serves hits for the one round-trip the
@@ -2006,13 +2007,13 @@ Public loopback-RPC methods and their sequencing:
   RPC (the transport strips the class), since the source drops its cache authority on it; verify
   preservation at the first port. Any other refresh error rethrows with credentials intact. **The
   projection is not optional — see below.**
-- `noteCredentialsExpired(identity)` — returns `false` without notifying unless `identity` matches
-  the coordinator's current one (a stale notifier lost the race to a reconnect); on a match,
-  delegates to `notifyCredentialsExpiredOnce` with `vendorId = spec.id` and returns `true`
-  regardless of the notification's outcome. The boolean adjudicates identity only: the latch
-  deliberately stays unset on a failed callback so a later expiry re-notifies, and returning that
-  failure would make the source resolve a dead grant as superseded — an endless retry the user is
-  never told about.
+- `noteCredentialsExpired(identity)` — answers `"superseded"` without notifying unless `identity`
+  matches the coordinator's current one (a stale notifier lost the race to a reconnect); on a
+  match, delegates to `notifyCredentialsExpiredOnce` with `vendorId = spec.id` and answers
+  `"accepted"` regardless of the notification's outcome. The verdict adjudicates identity only:
+  the latch deliberately stays unset on a failed callback so a later expiry re-notifies, and
+  returning that failure would make the source resolve a dead grant as superseded — an endless
+  retry the user is never told about.
 - `revoke()` — clears `"attemptGeneration"`, `deleteAlarm()` and `deleteAll()` **before** the first
   await, then best-effort `strategy.revoke` on the grant it captured (failures log `error` with
   event `oauth.grant.revoke.failed`). Destroying local state after awaiting the provider would let
@@ -2086,9 +2087,10 @@ expiry was unreportable (§4.13). How the design notes above resolved:
 - **Expiry gates first.** Unchanged (`google.ts:555`); it is the channel implementation's
   obligation.
 - **`AccountCredentialStub` stays unwidened.** The channel lives on `CredentialSourceOptions`.
-  `noteCredentialsExpired` did change shape — `Promise<void>` → `Promise<boolean>`, the account's
-  authoritative answer on whether the reported identity is still current — but that is a return on
-  an existing required method, not the optional method a proxy stub cannot presence-check.
+  `noteCredentialsExpired` did change shape — `Promise<void>` → `Promise<ExpiryVerdict>`
+  (`"accepted" | "superseded"`), the account's authoritative verdict on the reported identity —
+  but that is a return on an existing required method, not the optional method a proxy stub cannot
+  presence-check.
 - **Interaction with the fencing row (§4.8).** Still open. One constraint discovered here narrows
   it: the source refuses a replay whose refresh crossed a connection generation (a reconnect —
   possibly a different principal) and rethrows as "changed during the operation", and it coalesces
@@ -2352,8 +2354,8 @@ Each step leaves the tree building; tests land with the module they cover. Nothi
    a rejection under a grant already reported dead — or a refresh resolving to one — reports
    without minting or replaying; the account's `noteCredentialsExpired` answer decides — asked
    before any state moves, so an identity adopted while the answer was pending never outlives the
-   verdict, and an explicit `false` resolves as the retry message with the authority dropped to
-   unknown; and distinct rejected reads refresh separately while overlapping refreshes for one
+   verdict, and an explicit `"superseded"` resolves as the retry message with the authority
+   dropped to unknown; and distinct rejected reads refresh separately while overlapping refreshes for one
    read coalesce — one that settles first releases the flight, and a later rejection re-enters the
    channel, whose account RPC dedupes against the rejected credentials.
 6. **`actions` (§4.8).** Node tests: sequential IDs; staged→pending transitions; the default
@@ -2452,10 +2454,10 @@ Each step leaves the tree building; tests land with the module they cover. Nothi
     dispatched through the queue (interleaving asserted against a concurrent apply), bound with
     `retainApplied: true` so its record survives apply, and firing `afterResolve("reverted")`;
     the facet-base assert rejects (named config error) a revert hook whose actions don't retain;
-    a stale-identity `noteCredentialsExpired` after a reconnect returns `false` without notifying,
-    and a current-identity one returns `true` even when the Workshop callback fails (the latch
-    stays unset for a later re-notify; the boolean adjudicates identity only) — both through the
-    real account RPC; with the
+    a stale-identity `noteCredentialsExpired` after a reconnect answers `"superseded"` without
+    notifying, and a current-identity one answers `"accepted"` even when the Workshop callback
+    fails (the latch stays unset for a later re-notify; the verdict adjudicates identity only) —
+    both through the real account RPC; with the
     hook absent, `revertAction` throws not-implemented; strategy-B observer denial. This suite is
     also the proof that decorated subclasses of the kit's generic bases survive the
     `capnweb-validate` transform.

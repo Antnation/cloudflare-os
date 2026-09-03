@@ -7,6 +7,7 @@ import {
   type CredentialsKv,
   type CredentialSourceOptions,
   type CredentialsWithIdentity,
+  type ExpiryVerdict,
 } from "../src/credentials";
 import { fakeKv } from "./fake-kv";
 
@@ -485,7 +486,7 @@ describe("CredentialSource", () => {
   function source(overrides: Partial<CredentialSourceOptions<Creds>> = {}) {
     const getCredentials =
       vi.fn(async () => ({ creds: live, identity: "id-a", generation: "gen-a" }));
-    const noteCredentialsExpired = vi.fn(async (_identity: string) => true);
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "accepted" as const);
     const instance = new CredentialSource<Creds>({
       account: () => ({ getCredentials, noteCredentialsExpired }),
       isAuthError: error => error instanceof Error && error.message === "401",
@@ -518,7 +519,7 @@ describe("CredentialSource", () => {
     const instance = new CredentialSource<Creds>({
       account: () => ({
         getCredentials: async () => ({ creds: live, identity, generation }),
-        noteCredentialsExpired: async () => true,
+        noteCredentialsExpired: async () => "accepted" as const,
       }),
       isAuthError: error => error instanceof Error && error.message === "401",
       expiredMessage: "Reconnect the account.",
@@ -564,7 +565,7 @@ describe("CredentialSource", () => {
     refresh: (rejected: CredentialsWithIdentity<Creds>) => Promise<CredentialsWithIdentity<Creds>>,
   ) {
     const refreshCredentials = vi.fn(refresh);
-    const noteCredentialsExpired = vi.fn(async (_identity: string) => true);
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "accepted" as const);
     const getCredentials =
       vi.fn(async () => ({ creds: live, identity: "id-a", generation: "gen-a" }));
     const instance = new CredentialSource<Creds>({
@@ -639,7 +640,7 @@ describe("CredentialSource", () => {
   it("resolves a report the account refuses as superseded into a retry", async () => {
     // Another source instance over the same account refreshed past id-a; this snapshot cannot see
     // that, so the account's answer is what keeps the caller off a false reconnect prompt.
-    const noteCredentialsExpired = vi.fn(async (_identity: string) => false);
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "superseded" as const);
     const instance = new CredentialSource<Creds>({
       account: () => ({
         getCredentials: async () => ({ creds: live, identity: "id-a", generation: "gen-a" }),
@@ -691,11 +692,11 @@ describe("CredentialSource", () => {
   });
 
   it.each([
-    { verdict: true, message: "Reconnect the account." },
-    { verdict: false, message: "credentials changed" },
-  ])("clears an authority adopted while the expiry answer was pending (verdict $verdict)",
+    { verdict: "accepted", message: "Reconnect the account." },
+    { verdict: "superseded", message: "credentials changed" },
+  ] as const)("clears an authority adopted while the expiry answer was pending (verdict $verdict)",
     async ({ verdict, message }) => {
-      const answer = Promise.withResolvers<boolean>();
+      const answer = Promise.withResolvers<ExpiryVerdict>();
       const noteCredentialsExpired = vi.fn((_identity: string) => answer.promise);
       const instance = new CredentialSource<Creds>({
         account: () => ({
@@ -721,9 +722,9 @@ describe("CredentialSource", () => {
 
   it("reports a rejection served by a fenced read once the authority is unknown", async () => {
     const reads: Array<(value: CredentialsWithIdentity<Creds>) => void> = [];
-    const answer = Promise.withResolvers<boolean>();
+    const answer = Promise.withResolvers<ExpiryVerdict>();
     const noteCredentialsExpired = vi.fn(async (identity: string) =>
-      identity === "id-a" ? answer.promise : true);
+      identity === "id-a" ? answer.promise : "accepted" as const);
     const instance = new CredentialSource<Creds>({
       account: () => ({
         getCredentials: vi.fn(() =>
@@ -743,7 +744,7 @@ describe("CredentialSource", () => {
     // to the caller, never adopted.
     const second = instance.run(async () => { throw new Error("401"); });
     await vi.waitFor(() => expect(reads).toHaveLength(2));
-    answer.resolve(false);
+    answer.resolve("superseded");
     await expect(first).rejects.toThrow("credentials changed");
     reads[1]({ creds: fresh, identity: "id-b", generation: "gen-b" });
 
@@ -761,7 +762,7 @@ describe("CredentialSource", () => {
       account: () => ({
         getCredentials: vi.fn(() =>
           new Promise<CredentialsWithIdentity<Creds>>(resolve => { reads.push(resolve); })),
-        noteCredentialsExpired: async () => false,
+        noteCredentialsExpired: async () => "superseded" as const,
       }),
       refreshCredentials,
       isAuthError: error => error instanceof Error && error.message === "401",
@@ -803,7 +804,7 @@ describe("CredentialSource", () => {
     const instance = new CredentialSource<Creds>({
       account: () => ({
         getCredentials: async () => reads.shift()!,
-        noteCredentialsExpired: async () => true,
+        noteCredentialsExpired: async () => "accepted" as const,
       }),
       refreshCredentials,
       isAuthError: error => error instanceof Error && error.message === "401",
@@ -841,7 +842,7 @@ describe("CredentialSource", () => {
 
   it("treats a replay failure under superseded credentials as stale, not expiry", async () => {
     let current = { creds: live, identity: "id-a", generation: "gen-a" };
-    const noteCredentialsExpired = vi.fn(async (_identity: string) => false);
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "superseded" as const);
     const instance = new CredentialSource<Creds>({
       account: () => ({ getCredentials: async () => current, noteCredentialsExpired }),
       refreshCredentials: async () => ({ creds: fresh, identity: "id-b", generation: "gen-a" }),
@@ -918,7 +919,7 @@ describe("CredentialSource", () => {
       { token: "bearer-2", expiresAt: live.expiresAt },
     ];
     let reads = 0;
-    const noteCredentialsExpired = vi.fn(async (_identity: string) => true);
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "accepted" as const);
     const refreshCredentials = vi.fn(async (rejected: CredentialsWithIdentity<Creds>) => ({
       creds: { token: `minted-${rejected.creds.token}`, expiresAt: live.expiresAt },
       identity: "id-a",
@@ -964,7 +965,7 @@ describe("CredentialSource", () => {
     const getCredentials = vi.fn(() => new Promise<CredentialsWithIdentity<Creds>>(resolve => {
       reads.push(resolve);
     }));
-    const noteCredentialsExpired = vi.fn(async (_identity: string) => true);
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "accepted" as const);
     const refreshGate = Promise.withResolvers<CredentialsWithIdentity<Creds>>();
     const instance = new CredentialSource<Creds>({
       account: () => ({ getCredentials, noteCredentialsExpired }),
@@ -1040,7 +1041,7 @@ describe("CredentialSource", () => {
     const getCredentials = vi.fn(() => new Promise<CredentialsWithIdentity<Creds>>(resolve => {
       reads.push(resolve);
     }));
-    const noteCredentialsExpired = vi.fn(async (_identity: string) => false);
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "superseded" as const);
     const refreshGate = Promise.withResolvers<CredentialsWithIdentity<Creds>>();
     const instance = new CredentialSource<Creds>({
       account: () => ({ getCredentials, noteCredentialsExpired }),
@@ -1086,7 +1087,7 @@ describe("CredentialSource", () => {
     const refreshStarted = Promise.withResolvers<void>();
     const refreshGate = Promise.withResolvers<CredentialsWithIdentity<Creds>>();
     let current = { creds: live, identity: "id-a", generation: "gen-a" };
-    const noteCredentialsExpired = vi.fn(async (_identity: string) => true);
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "accepted" as const);
     const instance = new CredentialSource<Creds>({
       account: () => ({ getCredentials: async () => current, noteCredentialsExpired }),
       refreshCredentials: () => {
@@ -1122,7 +1123,7 @@ describe("CredentialSource", () => {
     const refreshStarted = Promise.withResolvers<void>();
     const refreshGate = Promise.withResolvers<never>();
     let current = { creds: live, identity: "id-a", generation: "gen-a" };
-    const noteCredentialsExpired = vi.fn(async (_identity: string) => true);
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "accepted" as const);
     const instance = new CredentialSource<Creds>({
       account: () => ({ getCredentials: async () => current, noteCredentialsExpired }),
       refreshCredentials: () => {
@@ -1156,7 +1157,7 @@ describe("CredentialSource", () => {
     const refreshStarted = Promise.withResolvers<void>();
     const refreshGate = Promise.withResolvers<CredentialsWithIdentity<Creds>>();
     let current = { creds: live, identity: "id-a", generation: "gen-a" };
-    const noteCredentialsExpired = vi.fn(async (_identity: string) => false);
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "superseded" as const);
     const instance = new CredentialSource<Creds>({
       account: () => ({ getCredentials: async () => current, noteCredentialsExpired }),
       refreshCredentials: () => {
@@ -1193,7 +1194,7 @@ describe("CredentialSource", () => {
     const getCredentials = vi.fn(() => new Promise<CredentialsWithIdentity<Creds>>(resolve => {
       reads.push(resolve);
     }));
-    const noteCredentialsExpired = vi.fn(async (_identity: string) => true);
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "accepted" as const);
     const instance = new CredentialSource<Creds>({
       account: () => ({ getCredentials, noteCredentialsExpired }),
       isAuthError: error => error instanceof Error && error.message === "401",
@@ -1227,7 +1228,7 @@ describe("CredentialSource", () => {
     const getCredentials = vi.fn(() => new Promise<CredentialsWithIdentity<Creds>>(resolve => {
       reads.push(resolve);
     }));
-    const noteCredentialsExpired = vi.fn(async (_identity: string) => true);
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "accepted" as const);
     const instance = new CredentialSource<Creds>({
       account: () => ({ getCredentials, noteCredentialsExpired }),
       refreshCredentials: async () => { throw new CredentialsExpiredError("invalid_grant"); },
@@ -1258,7 +1259,7 @@ describe("CredentialSource", () => {
   it("treats an auth failure under superseded credentials as stale, not expiry", async () => {
     let identity = "id-a";
     let generation = "gen-a";
-    const noteCredentialsExpired = vi.fn(async (_identity: string) => true);
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "accepted" as const);
     const instance = new CredentialSource<Creds>({
       account: () => ({
         getCredentials: async () => ({ creds: live, identity, generation }),
@@ -1313,7 +1314,7 @@ describe("CredentialSource", () => {
       fetches.push(resolve);
     }));
     const instance = new CredentialSource<Creds>({
-      account: () => ({ getCredentials, noteCredentialsExpired: async () => true }),
+      account: () => ({ getCredentials, noteCredentialsExpired: async () => "accepted" as const }),
       isAuthError: error => error instanceof Error && error.message === "401",
       expiredMessage: "Reconnect the account.",
     });
@@ -1359,7 +1360,7 @@ describe("CredentialSource", () => {
       fetches.push(resolve);
     }));
     const instance = new CredentialSource<Creds>({
-      account: () => ({ getCredentials, noteCredentialsExpired: async () => true }),
+      account: () => ({ getCredentials, noteCredentialsExpired: async () => "accepted" as const }),
       isAuthError: error => error instanceof Error && error.message === "401",
       expiredMessage: "Reconnect the account.",
     });
@@ -1401,7 +1402,7 @@ describe("CredentialSource", () => {
           if (failure) throw failure;
           return { creds: live, identity: "id-a", generation: "gen-a" };
         },
-        noteCredentialsExpired: async () => true,
+        noteCredentialsExpired: async () => "accepted" as const,
       }),
       isAuthError: error => error instanceof Error && error.message === "401",
       expiredMessage: "Reconnect the account.",
@@ -1430,7 +1431,7 @@ describe("CredentialSource", () => {
       return fetch.promise;
     });
     const instance = new CredentialSource<Creds>({
-      account: () => ({ getCredentials, noteCredentialsExpired: async () => true }),
+      account: () => ({ getCredentials, noteCredentialsExpired: async () => "accepted" as const }),
       isAuthError: error => error instanceof Error && error.message === "401",
       expiredMessage: "Reconnect the account.",
     });
@@ -1463,7 +1464,7 @@ describe("CredentialSource", () => {
       fetches.push(resolve);
     }));
     const instance = new CredentialSource<Creds>({
-      account: () => ({ getCredentials, noteCredentialsExpired: async () => true }),
+      account: () => ({ getCredentials, noteCredentialsExpired: async () => "accepted" as const }),
       isAuthError: error => error instanceof Error && error.message === "401",
       expiredMessage: "Reconnect the account.",
     });
@@ -1502,7 +1503,7 @@ describe("CredentialSource", () => {
     const getCredentials = vi.fn(() => new Promise<CredentialsWithIdentity<Creds>>(resolve => {
       fetches.push(resolve);
     }));
-    const noteCredentialsExpired = vi.fn(async (_identity: string) => true);
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "accepted" as const);
     const instance = new CredentialSource<Creds>({
       account: () => ({ getCredentials, noteCredentialsExpired }),
       isAuthError: error => error instanceof Error && error.message === "401",
@@ -1540,7 +1541,7 @@ describe("CredentialSource", () => {
       fetches.push(resolve);
     }));
     const instance = new CredentialSource<Creds>({
-      account: () => ({ getCredentials, noteCredentialsExpired: async () => true }),
+      account: () => ({ getCredentials, noteCredentialsExpired: async () => "accepted" as const }),
       isAuthError: error => error instanceof Error && error.message === "401",
       expiredMessage: "Reconnect the account.",
     });

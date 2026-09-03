@@ -279,17 +279,19 @@ export type AccountCredentialStub<Creds> = {
    */
   getCredentials(): Promise<CredentialsWithIdentity<Creds>>;
   /**
-   * Reports expiry and answers whether the report was accepted.
+   * Reports expiry and answers with the account's verdict on the reported identity.
    * @param identity Credential identity used by the failed call.
-   * @returns Whether `identity` is still the account's current one — an adjudication of identity,
-   * never of notification delivery, which the account owns end to end. `false` means a newer
-   * credential superseded it and the failure was stale; the source resolves that as retryable and
-   * drops its now-stale authority until the next read. Anything else — including a transport that
-   * drops return values — reads as accepted, so a dead grant is never masked as retryable by a
-   * lost answer.
+   * @returns An adjudication of identity, never of notification delivery, which the account owns
+   * end to end. `"superseded"` means a newer credential replaced it and the failure was stale; the
+   * source resolves that as retryable and drops its now-stale authority until the next read.
+   * Anything else — including a transport that drops return values — reads as `"accepted"`, so a
+   * dead grant is never masked as retryable by a lost answer.
    */
-  noteCredentialsExpired(identity: string): Promise<boolean>;
+  noteCredentialsExpired(identity: string): Promise<ExpiryVerdict>;
 };
+
+/** The account's verdict on a reported expiry: latched for its current identity, or refused. */
+export type ExpiryVerdict = "accepted" | "superseded";
 
 /** `CredentialSource` keeps one flight -- the account's current credentials -- so it needs one key. */
 const CREDENTIALS_FLIGHT = "credentials";
@@ -470,12 +472,12 @@ export class CredentialSource<Creds> {
    * @param cause Provider rejection being resolved.
    */
   async #adjudicate(identity: string, cause: unknown): Promise<never> {
-    const accepted = await this.#note(identity);
+    const verdict = await this.#note(identity);
     // Ask first, then clear and fence in one synchronous transition — a read resolving during the
     // answer would slip an adoption between a clear and a later fence. Either way the answer goes,
     // the authority drops: dead, its partition could serve the next principal stale data on a hit;
     // superseded, this snapshot no longer vouches for the current principal.
-    if (accepted === false) {
+    if (verdict === "superseded") {
       this.#supersede();
       throw this.#changed(cause);
     }
@@ -574,7 +576,7 @@ export class CredentialSource<Creds> {
    * @returns The account's verdict, or `undefined` when it was unreachable — read as accepted, so
    * an outage cannot mask a dead grant as retryable.
    */
-  async #note(identity: string): Promise<boolean | undefined> {
+  async #note(identity: string): Promise<ExpiryVerdict | undefined> {
     try {
       return await this.#options.account().noteCredentialsExpired(identity);
     } catch (error) {
