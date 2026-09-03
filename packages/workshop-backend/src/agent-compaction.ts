@@ -393,6 +393,13 @@ export function buildCompactionState(
         } else if (call.toolName === "createWorktree" && call.output !== undefined) {
           chatBindings.set(call.input.bindingName,
               {type: "workpiece", id: call.output.worktreeId});
+        } else if (call.toolName === "createExternalResource" &&
+                   typeof call.output === "object") {
+          // A string output is a fixable rejection with no binding; only the structured success
+          // output binds (mirrors replay's re-establishment from the recorded output). Rejections
+          // carry no `error`, so the continue above does not filter them.
+          chatBindings.set(call.input.bindingName,
+              {type: "workpiece", id: call.output.gatekeeperId});
         }
       }
     } else if (message.type === "agentCallback") {

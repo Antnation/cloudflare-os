@@ -7812,6 +7812,14 @@ class OverseerImpl implements AgentHooks {
             if (call.output && !nameByTarget.has(call.output.worktreeId)) {
               nameByTarget.set(call.output.worktreeId, call.input.bindingName);
             }
+          } else if (call.toolName === "createExternalResource") {
+            // The name is taken even on rejection (matches chatScopeNames' overclaiming); only a
+            // structured (success) output actually bound the resource — a string is a rejection.
+            taken.add(call.input.bindingName);
+            if (typeof call.output === "object" &&
+                !nameByTarget.has(call.output.gatekeeperId)) {
+              nameByTarget.set(call.output.gatekeeperId, call.input.bindingName);
+            }
           }
         }
       } else if (msg.type === "connectionRequest") {
