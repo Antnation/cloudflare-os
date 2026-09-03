@@ -577,6 +577,21 @@ describe("CredentialSource", () => {
     return { instance, getCredentials, refreshCredentials, noteCredentialsExpired };
   }
 
+  /** Starts a run whose 401 stalls until released, resolving once the operation has entered. */
+  async function stalledRun(
+    instance: CredentialSource<Creds>, options: { replayable?: boolean } = {},
+  ) {
+    const entered = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    const run = instance.run(async () => {
+      entered.resolve();
+      await gate.promise;
+      throw new Error("401");
+    }, options);
+    await entered.promise;
+    return { run, release: gate.resolve };
+  }
+
   it("replays a replayable operation once with credentials refreshed past the rejection", async () => {
     // A derived bearer minted from the same grant: identity does not move on a legitimate refresh.
     const { instance, refreshCredentials, noteCredentialsExpired } = replayableSource(
@@ -794,29 +809,20 @@ describe("CredentialSource", () => {
   });
 
   it("skips the refresh when a reconnect was adopted before the rejection resolved", async () => {
-    const started = Promise.withResolvers<void>();
-    const gate = Promise.withResolvers<void>();
     const reads = [
       { creds: live, identity: "id-a", generation: "gen-a" },
       { creds: fresh, identity: "id-b", generation: "gen-b" },
     ];
     const refreshCredentials = vi.fn(async () => reads[1]);
-    const instance = new CredentialSource<Creds>({
+    const { instance } = source({
       account: () => ({
         getCredentials: async () => reads.shift()!,
         noteCredentialsExpired: async () => "accepted" as const,
       }),
       refreshCredentials,
-      isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
     });
 
-    const run = instance.run(async () => {
-      started.resolve();
-      await gate.promise;
-      throw new Error("401");
-    }, { replayable: true });
-    await started.promise;
+    const stalled = await stalledRun(instance, { replayable: true });
 
     // A plain read adopts a reconnect while the operation is still in flight.
     expect(await instance.get()).toEqual(fresh);
@@ -824,8 +830,8 @@ describe("CredentialSource", () => {
 
     // The outcome is already decided: no mint is spent on the superseded read, and a refresh
     // failure or stall cannot reach a caller who only needs to re-enter.
-    gate.resolve();
-    await expect(run).rejects.toThrow("credentials changed");
+    stalled.release();
+    await expect(stalled.run).rejects.toThrow("credentials changed");
     expect(refreshCredentials).not.toHaveBeenCalled();
     expect(instance.authority()).toBe("gen-b");
   });
@@ -1225,6 +1231,179 @@ describe("CredentialSource", () => {
     await expect(call).rejects.toThrow("credentials changed during the operation");
     expect(noteCredentialsExpired).toHaveBeenCalledTimes(1);
     expect(instance.authority()).toBe("gen-c");
+  });
+
+  it("refuses a delayed mint from a generation another refresh saw crossed", async () => {
+    const current = { creds: live, identity: "id-a", generation: "gen-a" };
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "accepted" as const);
+    const crossing = Promise.withResolvers<CredentialsWithIdentity<Creds>>();
+    const delayed = Promise.withResolvers<CredentialsWithIdentity<Creds>>();
+    const firstMint = Promise.withResolvers<void>();
+    const secondMint = Promise.withResolvers<void>();
+    let mints = 0;
+    const refreshCredentials = (): Promise<CredentialsWithIdentity<Creds>> => {
+      mints += 1;
+      if (mints === 1) {
+        firstMint.resolve();
+        return crossing.promise;
+      }
+      secondMint.resolve();
+      return delayed.promise;
+    };
+    const { instance } = source({
+      // Fresh read objects, so the sequential runs hold distinct reads with distinct flights.
+      account: () => ({ getCredentials: async () => ({ ...current }), noteCredentialsExpired }),
+      refreshCredentials,
+    });
+
+    const operation = vi.fn(async () => { throw new Error("401"); });
+    const one = instance.run(operation, { replayable: true });
+    await firstMint.promise;
+    const two = instance.run(operation, { replayable: true });
+    await secondMint.promise;
+
+    // The first refresh observes the reconnect's crossing: gen-a is now proven superseded.
+    crossing.resolve({ creds: fresh, identity: "id-b", generation: "gen-b" });
+    await expect(one).rejects.toThrow("credentials changed during the operation");
+
+    // The second read's mint ran before the reconnect and its response arrives after the crossing
+    // was observed: it must never be replayed, even with the authority already unknown.
+    delayed.resolve({ creds: fresh, identity: "id-c", generation: "gen-a" });
+    await expect(two).rejects.toThrow("credentials changed during the operation");
+    expect(operation).toHaveBeenCalledTimes(2);
+    expect(noteCredentialsExpired).not.toHaveBeenCalled();
+  });
+
+  it("records a crossing carried by a dead mint instead of adjudicating past it", async () => {
+    let current = { creds: live, identity: "id-a", generation: "gen-a" };
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "accepted" as const);
+    let mints = 0;
+    const refreshCredentials = vi.fn(async (): Promise<CredentialsWithIdentity<Creds>> => {
+      mints += 1;
+      if (mints === 1) throw new CredentialsExpiredError("invalid_grant");
+      return { creds: fresh, identity: "id-b", generation: "gen-b" };
+    });
+    const { instance } = source({
+      account: () => ({ getCredentials: async () => ({ ...current }), noteCredentialsExpired }),
+      refreshCredentials,
+    });
+
+    // Two runs hold distinct gen-a reads whose operations stall.
+    const one = await stalledRun(instance, { replayable: true });
+    const two = await stalledRun(instance, { replayable: true });
+
+    // The authority clears with no crossing ever observed — a rotated grant dies — and the
+    // reconnect's own grant then dies too, all under same-generation reads.
+    current = { creds: live, identity: "id-a2", generation: "gen-a" };
+    await expect(instance.run(async () => { throw new Error("401"); }, { replayable: true }))
+      .rejects.toThrow("invalid_grant");
+    current = { creds: live, identity: "id-b", generation: "gen-b" };
+    await expect(instance.run(async () => { throw new Error("401"); }, { replayable: true }))
+      .rejects.toThrow("Reconnect the account.");
+    expect(noteCredentialsExpired).toHaveBeenCalledTimes(1);
+    expect(instance.authority()).toBeUndefined();
+
+    // The first stalled run's mint is a dead identity on a newer generation: the crossing is
+    // recorded and the read refused — never adjudicated against the dead set.
+    one.release();
+    await expect(one.run).rejects.toThrow("credentials changed during the operation");
+    expect(noteCredentialsExpired).toHaveBeenCalledTimes(1);
+
+    // The recorded crossing refuses the second gen-a read before it can spend the channel.
+    two.release();
+    await expect(two.run).rejects.toThrow("credentials changed during the operation");
+    expect(refreshCredentials).toHaveBeenCalledTimes(3);
+  });
+
+  it("records a crossing observed by a plain read, surviving a later authority clear", async () => {
+    let current = { creds: live, identity: "id-a", generation: "gen-a" };
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "accepted" as const);
+    const refreshCredentials = vi.fn(
+      async () => ({ creds: fresh, identity: "id-d", generation: "gen-a" }));
+    const { instance } = source({
+      account: () => ({ getCredentials: async () => ({ ...current }), noteCredentialsExpired }),
+      refreshCredentials,
+    });
+
+    const stalled = await stalledRun(instance, { replayable: true });
+
+    // A plain read adopts the reconnect — the crossing evidence — before the new grant itself
+    // dies and clears the authority.
+    current = { creds: live, identity: "id-c", generation: "gen-b" };
+    expect(await instance.get()).toEqual(live);
+    await expect(instance.run(async () => { throw new Error("401"); }))
+      .rejects.toThrow("Reconnect the account.");
+    expect(instance.authority()).toBeUndefined();
+
+    // The stalled gen-a read is refused on the recorded crossing without spending the channel.
+    stalled.release();
+    await expect(stalled.run).rejects.toThrow("credentials changed during the operation");
+    expect(refreshCredentials).not.toHaveBeenCalled();
+  });
+
+  it("records the crossing when an adoption lands mid-refresh, for the next delayed mint", async () => {
+    let current = { creds: live, identity: "id-a", generation: "gen-a" };
+    const noteCredentialsExpired = vi.fn(async (identity: string) =>
+      identity === "id-a" ? ("superseded" as const) : ("accepted" as const));
+    const mint = Promise.withResolvers<CredentialsWithIdentity<Creds>>();
+    const refreshCredentials = vi.fn(() => mint.promise);
+    const { instance } = source({
+      account: () => ({ getCredentials: async () => ({ ...current }), noteCredentialsExpired }),
+      refreshCredentials,
+    });
+
+    // Two runs hold distinct gen-a reads; the first enters its refresh, the second stays stalled.
+    const one = await stalledRun(instance, { replayable: true });
+    const two = await stalledRun(instance, { replayable: true });
+    one.release();
+    await vi.waitFor(() => expect(refreshCredentials).toHaveBeenCalled());
+
+    // A refused report clears the authority (no death), so the reconnect's adoption replaces an
+    // unknown authority and the adoption site has no crossing to record.
+    await expect(instance.run(async () => { throw new Error("401"); }))
+      .rejects.toThrow("credentials changed during the operation");
+    current = { creds: live, identity: "id-b", generation: "gen-b" };
+    expect(await instance.get()).toEqual(live);
+
+    // The first run's mint resolves under the adopted reconnect: refused, and the crossing of its
+    // generation is recorded here — nowhere else observed it.
+    mint.resolve({ creds: fresh, identity: "id-c", generation: "gen-a" });
+    await expect(one.run).rejects.toThrow("credentials changed during the operation");
+
+    // The reconnect's grant dies and clears the authority; only the recorded crossing now proves
+    // the second stalled gen-a read superseded, keeping its delayed mint unreplayed.
+    await expect(instance.run(async () => { throw new Error("401"); }))
+      .rejects.toThrow("Reconnect the account.");
+    expect(instance.authority()).toBeUndefined();
+    two.release();
+    await expect(two.run).rejects.toThrow("credentials changed during the operation");
+    expect(refreshCredentials).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a channelless rejection once its generation is seen crossed", async () => {
+    let current = { creds: live, identity: "id-a", generation: "gen-a" };
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "accepted" as const);
+    const { instance } = source({
+      account: () => ({ getCredentials: async () => ({ ...current }), noteCredentialsExpired }),
+    });
+
+    const stalled = await stalledRun(instance);
+
+    // A plain read adopts the reconnect — recording the crossing — before the new grant itself
+    // dies and clears the authority.
+    current = { creds: live, identity: "id-b", generation: "gen-b" };
+    expect(await instance.get()).toEqual(live);
+    await expect(instance.run(async () => { throw new Error("401"); }))
+      .rejects.toThrow("Reconnect the account.");
+    expect(noteCredentialsExpired).toHaveBeenCalledWith("id-b");
+    expect(instance.authority()).toBeUndefined();
+
+    // The stalled gen-a read is provably superseded: resolved as retryable, never adjudicated —
+    // an "accepted" verdict here would bury a stale identity in the dead set and prompt a
+    // reconnect right after one succeeded.
+    stalled.release();
+    await expect(stalled.run).rejects.toThrow("credentials changed during the operation");
+    expect(noteCredentialsExpired).toHaveBeenCalledTimes(1);
   });
 
   it("resolves a replay the account refuses as superseded into a retry", async () => {
@@ -1635,16 +1814,17 @@ describe("CredentialSource", () => {
       await reading.promise;
     }
 
-    // Grant B is adopted and dies, then every stale operation reports its own identity dead.
+    // Grant B — a same-generation rotation, so no crossing proves the stale reads superseded —
+    // is adopted and dies, then every stale operation reports its own identity dead.
     const callB = instance.run(async () => { throw new Error("401"); });
-    fetches[9]?.({ creds: live, identity: "id-b", generation: "gen-b" });
+    fetches[9]?.({ creds: live, identity: "id-b", generation: "gen-a" });
     await expect(callB).rejects.toThrow("Reconnect the account.");
     for (const gate of gates) gate.resolve();
     for (const failure of stale) await expect(failure).rejects.toThrow("Reconnect the account.");
 
     // The stale reports land after B's in mark order; none may push B back into adoption.
     const refetch = instance.get();
-    fetches[10]?.({ creds: live, identity: "id-b", generation: "gen-b" });
+    fetches[10]?.({ creds: live, identity: "id-b", generation: "gen-a" });
     expect(await refetch).toEqual(live);
     expect(instance.authority()).toBeUndefined();
   });

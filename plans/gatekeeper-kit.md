@@ -357,8 +357,10 @@ export class CredentialSource<Creds> {          // held by User entrypoint / fac
     opts?: { replayable?: boolean }): Promise<T>;  // hands the call its creds, captures their
                                  // identity; an auth failure under an identity a refetch has since
                                  // superseded with a live successor is stale — rethrown as retry,
-                                 // not reported as expiry. No live successor, no retry: a mismatch
-                                 // alone can mean the read was fenced out, and its failure reports.
+                                 // not reported as expiry — as is a read proven superseded (its
+                                 // generation crossed, or a newer one adopted), even after that
+                                 // successor dies. Neither proof, no retry: a mismatch alone can
+                                 // mean the read was fenced out, and its failure reports.
                                  // `replayable`: one refresh and replay through the source before
                                  // any of that, throwing without the channel (§4.13)
   authority(): string | undefined;  // the connection generation of the last fetch, synchronously —
@@ -465,6 +467,10 @@ partition, so `run` reports nothing, clears nothing, and throws a fixed retry me
 bare identity mismatch is not enough: a fetch fenced out by the report still hands its credentials
 to its caller without adopting them, and when those fail too, nothing live succeeded them — the
 failure is fresh evidence and reports as expiry, or a later refetch would re-adopt the dead grant.
+A recorded crossing is enough: a read whose generation was observed crossed — or outranked by the
+adopted authority — is proven superseded even after the successor itself dies and the authority
+clears, so its failure resolves as the retry message instead of spending an adjudication on an
+identity the account has already replaced.
 A replay's second rejection skips the identity gate entirely: it reports the identity the channel
 minted — which a rotating mint moves past the snapshot — and the account alone adjudicates it
 (§4.13); gating it locally would suppress the report a rotated dead grant needs. The generation
@@ -1622,16 +1628,30 @@ writer — rejection handling only clears it — so a mint cannot race the autho
 interleaving fences previously specified here (refresh adoption, its read fence, client-side
 identity succession) went with the second writer that required them. What remains is hard-signal
 only: `replayable` without a channel throws at the call; a reconnect adopted at any point after
-the read supersedes it, and every downstream failure of a superseded read — the refresh's,
+the read — or the read's generation observed crossed by any refresh — supersedes it, and every
+downstream failure of a superseded read — the refresh's,
 expiry or infrastructure alike, the replay's second rejection, even a delayed response carrying
 a dead mint — resolves as the retry message before another RPC is spent, or its answer trusted,
-on the read's behalf (one adopted before the refresh even starts skips the channel entirely —
+on the read's behalf (one superseded before the refresh even starts skips the channel entirely —
 its failures have nothing to tell a caller who only needs to re-enter); a refresh resolving to a
 grant already reported dead reports instead of replaying; a crossing observed in the result
 stales any authority
 not adopted past it, so one unknown or still on the rejected generation drops with a fence (a
 pending read could otherwise restore the pre-reconnect partition) while one adopted meanwhile
-stays; a channel-confirmed
+stays — and the crossed generation is recorded wherever a crossing is observed: by a refresh
+result (checked before the dead shortcut — a dead mint carries the same evidence), by the
+post-refresh supersession refusal itself (an adoption landing mid-refresh preempts the result's
+own recording), or by a plain
+read's adoption replacing a different defined generation (a set beside the dead identities,
+bounded by reconnects per activation), since clearing the authority alone would destroy the
+evidence a delayed old-generation mint held by another in-flight read is refused on. One window
+is accepted rather than tracked: an adoption from an unknown authority proves nothing about
+generations it never saw, so a read predating two grant deaths straddling a reconnect can still
+replay a delayed same-generation mint — one uncached result under the caller's own fetched
+principal, every failure path terminating truthfully (lag, not poisoning); closing it would need
+adoption-order tracking — a per-source monotonic clock, disproportionate to the corner and prone
+to over-refusing reads adopted after the reconnect but captured before the observation lands. A
+channel-confirmed
 expiry under an unmoved generation takes the death fences. Identity succession is the account's to adjudicate: `noteCredentialsExpired` answers
 whether the reported identity is still its current one — an adjudication of identity, never of
 notification delivery, whose latch deliberately stays unset on a failed callback so a later expiry
@@ -2349,15 +2369,22 @@ Each step leaves the tree building; tests land with the module they cover. Nothi
    refreshes through the channel and replays once, and a second rejection reports the replayed
    identity (a first non-auth failure propagates with the channel uncalled); the flag without a
    channel throws before the read; the refresh result is observed, never adopted — plain reads
-   stay the snapshot's only writer; a reconnect adopted after the read resolves every downstream
+   stay the snapshot's only writer; a reconnect adopted after the read — or its generation seen
+   crossed by another run's refresh — resolves every downstream
    failure as the retry message — a refresh failure of any kind, a delayed response carrying a
    dead mint, the replay's second rejection — with no ask spent and the live authority kept
-   (adopted before the refresh starts, without calling the channel); a crossing in the result
+   (superseded before the refresh starts, without calling the channel); a crossing in the result
    fences, dropping an authority unknown or still on the rejected generation while one adopted
-   meanwhile stays; a channel-confirmed expiry under an unmoved generation takes the death fences
+   meanwhile stays, and marks the crossed generation — recorded from the refresh result before
+   the dead shortcut (a dead mint carries the same evidence), by the post-refresh supersession
+   refusal itself, and at a plain read's adoption over
+   a different defined generation — so a delayed old-generation mint held by another run is
+   refused unreplayed; a channel-confirmed expiry under an unmoved generation
+   takes the death fences
    against a read still in flight;
    a rejection under a grant already reported dead — or a refresh resolving to one — reports
-   without minting or replaying; the account's `noteCredentialsExpired` answer decides — asked
+   without minting or replaying, unless the read is itself proven superseded, which resolves as
+   the retry message first; the account's `noteCredentialsExpired` answer decides — asked
    before any state moves, so an identity adopted while the answer was pending never outlives the
    verdict, and an explicit `"superseded"` resolves as the retry message with the authority
    dropped to unknown; and distinct rejected reads refresh separately while overlapping refreshes for one

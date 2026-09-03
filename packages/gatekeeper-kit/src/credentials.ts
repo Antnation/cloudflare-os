@@ -361,6 +361,8 @@ export class CredentialSource<Creds> {
   #identity: string | undefined;
   // Bounded by account commits per activation; eviction is unsafe against out-of-order stale reports.
   readonly #dead = new Set<string>();
+  // Generations proven superseded by an observed crossing; bounded by reconnects per activation.
+  readonly #crossed = new Set<string>();
   #clearFence = 0;
 
   /**
@@ -417,7 +419,7 @@ export class CredentialSource<Creds> {
       if (!this.#options.isAuthError(error)) throw error;
       if (!options.replayable || refreshCredentials === undefined
         || this.#dead.has(first.identity)) {
-        return this.#report(first.identity, error);
+        return this.#report(first, error);
       }
       // A reconnect adopted since this read already decides the outcome — don't spend the
       // channel, or hand its failures, on a superseded read.
@@ -425,18 +427,26 @@ export class CredentialSource<Creds> {
       const second = await this.#refreshed(first, refreshCredentials);
       // An authority adopted during the refresh is newer than this read and stays; the caller
       // re-enters like any other mid-operation replacement. Before the dead shortcut, or a
-      // delayed dead-mint response would have a superseded read adjudicated against it.
-      if (this.#moved(first.generation)) throw this.#changed(error);
-      // A parallel replay already had this mint's grant adjudicated dead — don't replay it.
-      if (this.#dead.has(second.identity)) {
-        return this.#adjudicate(second.identity, error);
+      // delayed dead-mint response would have a superseded read adjudicated against it. The
+      // proof is recorded: an adoption landing mid-refresh preempts the crossing the result
+      // would record below, and another read's delayed mint must still find the evidence.
+      if (this.#moved(first.generation)) {
+        this.#crossed.add(first.generation);
+        throw this.#changed(error);
       }
       // A generation moved in the refresh result means a reconnect: replaying would act under a
-      // principal the caller never fetched. The crossing stales any authority not adopted past
-      // it — unknown included, or a pending read could restore the pre-reconnect partition.
+      // principal the caller never fetched. Recorded and checked before the dead shortcut — a
+      // dead mint carries the same evidence — and the crossing stales any authority not adopted
+      // past it, unknown included, or a pending read could restore the pre-reconnect partition.
       if (second.generation !== first.generation) {
+        this.#crossed.add(first.generation);
         this.#supersede();
         throw this.#changed(error);
+      }
+      // A parallel replay already had this same-generation mint's grant adjudicated dead — don't
+      // replay it.
+      if (this.#dead.has(second.identity)) {
+        return this.#adjudicate(second.identity, error);
       }
       try {
         return await operation(second.creds);
@@ -451,21 +461,25 @@ export class CredentialSource<Creds> {
   }
 
   /**
-   * Resolves a confirmed credential rejection: rethrown as retryable when a newer fetch already
-   * adopted a live grant, adjudicated with the account otherwise.
-   * @param identity Credential identity used by the failed call.
+   * Resolves a confirmed credential rejection: rethrown as retryable when the read is proven
+   * superseded or a newer fetch already adopted a live grant, adjudicated with the account
+   * otherwise.
+   * @param read The read whose credentials the provider rejected.
    * @param cause Provider rejection being resolved.
    */
-  async #report(identity: string, cause: unknown): Promise<never> {
+  async #report(read: CredentialsWithIdentity<Creds>, cause: unknown): Promise<never> {
+    // A read proven superseded — its generation crossed, or a newer one adopted — is stale even
+    // after the successor itself dies and the authority clears: no ask is spent on its behalf.
+    if (this.#moved(read.generation)) throw this.#changed(cause);
     // A newer fetch adopted a live grant: this failure is stale, so that grant is neither
     // reported dead nor its cache authority dropped. The shortcut needs evidence the source
     // stands behind — an adopted identity that is itself dead, or one whose authority was
     // dropped, is no successor; then the account adjudicates.
-    if (this.#generation !== undefined && identity !== this.#identity
+    if (this.#generation !== undefined && read.identity !== this.#identity
       && this.#identity !== undefined && !this.#dead.has(this.#identity)) {
       throw this.#changed(cause);
     }
-    return this.#adjudicate(identity, cause);
+    return this.#adjudicate(read.identity, cause);
   }
 
   /**
@@ -498,11 +512,22 @@ export class CredentialSource<Creds> {
 
   /**
    * @param generation Connection generation of a caller's read.
-   * @returns Whether the adopted authority moved past that read — a reconnect adopted since it.
-   * An unknown authority has not: it cannot outrank the read's own fetch.
+   * @returns Whether that read is proven superseded — a newer generation adopted since it, or its
+   * own observed crossed by a refresh. The crossed set is knowledge, not absence.
    */
   #moved(generation: string): boolean {
-    return this.#generation !== undefined && this.#generation !== generation;
+    return this.#crossed.has(generation) || this.#adoptedOther(generation) !== undefined;
+  }
+
+  /**
+   * @param generation Connection generation to compare with the adopted authority.
+   * @returns The adopted generation when the two differ — an observed crossing — or `undefined`
+   * when they match or the authority is unknown, which alone is no evidence: it cannot outrank
+   * the read's own fetch.
+   */
+  #adoptedOther(generation: string): string | undefined {
+    const adopted = this.#generation;
+    return adopted !== undefined && adopted !== generation ? adopted : undefined;
   }
 
   /**
@@ -568,6 +593,10 @@ export class CredentialSource<Creds> {
     // read resolving a reconnect: generations are opaque and equality-only, so a fenced response
     // cannot prove itself newest — authority stays the last unfenced fetch.
     if (fence === this.#clearFence && !this.#dead.has(current.identity)) {
+      // An adoption replacing a different generation observed a crossing: record it, so the
+      // evidence outlives a later authority clear.
+      const crossed = this.#adoptedOther(current.generation);
+      if (crossed !== undefined) this.#crossed.add(crossed);
       this.#generation = current.generation;
       this.#identity = current.identity;
     }
