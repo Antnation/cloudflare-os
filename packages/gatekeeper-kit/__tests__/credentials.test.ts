@@ -858,11 +858,10 @@ describe("CredentialSource", () => {
       throw new Error("401");
     }, { replayable: true })).rejects.toThrow("credentials changed during the operation");
 
-    // A replayed mint is the freshest local knowledge, so the account adjudicates: its refusal
-    // resolves as retryable, and the stale snapshot's authority goes to unknown — a cache bypass
-    // until the next read, never a hit for a principal it cannot vouch for.
-    expect(noteCredentialsExpired).toHaveBeenCalledWith("id-b");
-    expect(instance.authority()).toBeUndefined();
+    // The mint the replay used was superseded by the adopted reconnect: the account's only
+    // possible verdict is already known, so no ask is spent and the live authority stands.
+    expect(noteCredentialsExpired).not.toHaveBeenCalled();
+    expect(instance.authority()).toBe("gen-c");
   });
 
   it("coalesces concurrent replays of one rejected read", async () => {
@@ -1036,7 +1035,7 @@ describe("CredentialSource", () => {
     expect(refreshCredentials).not.toHaveBeenCalled();
   });
 
-  it("resolves a replay rejection after an adopted reconnect on the account's answer", async () => {
+  it("skips the ask for a replay rejection after an adopted reconnect", async () => {
     const reads: Array<(read: CredentialsWithIdentity<Creds>) => void> = [];
     const getCredentials = vi.fn(() => new Promise<CredentialsWithIdentity<Creds>>(resolve => {
       reads.push(resolve);
@@ -1074,13 +1073,13 @@ describe("CredentialSource", () => {
     expect(await straggler).toEqual(live);
     expect(instance.authority()).toBe("gen-b");
 
-    // The replay's rejection names the replayed mint; the account refuses it as superseded, so
-    // the caller re-enters, and the authority — stale by the account's own answer — bypasses
-    // until the next read re-establishes the reconnect's partition.
+    // The replay's rejection concerns a mint the reconnect superseded: the only verdict the
+    // account could return is already known, so the caller re-enters without an ask and the
+    // reconnect's live authority stands.
     replayGate.resolve();
     await expect(call).rejects.toThrow("credentials changed during the operation");
-    expect(noteCredentialsExpired).toHaveBeenCalledWith("id-b");
-    expect(instance.authority()).toBeUndefined();
+    expect(noteCredentialsExpired).not.toHaveBeenCalled();
+    expect(instance.authority()).toBe("gen-b");
   });
 
   it("stands down a refresh overtaken by a reconnect adoption", async () => {
@@ -1151,6 +1150,81 @@ describe("CredentialSource", () => {
     await expect(call).rejects.toThrow("credentials changed during the operation");
     expect(instance.authority()).toBe("gen-b");
     expect(noteCredentialsExpired).not.toHaveBeenCalled();
+  });
+
+  it("treats a refresh failure overtaken by a reconnect as superseded, not infrastructure", async () => {
+    const refreshStarted = Promise.withResolvers<void>();
+    const refreshGate = Promise.withResolvers<never>();
+    let current = { creds: live, identity: "id-a", generation: "gen-a" };
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "accepted" as const);
+    const instance = new CredentialSource<Creds>({
+      account: () => ({ getCredentials: async () => current, noteCredentialsExpired }),
+      refreshCredentials: () => {
+        refreshStarted.resolve();
+        return refreshGate.promise;
+      },
+      isAuthError: error => error instanceof Error && error.message === "401",
+      expiredMessage: "Reconnect the account.",
+    });
+
+    const firstAttempt = Promise.withResolvers<void>();
+    const call = instance.run(async () => {
+      firstAttempt.resolve();
+      throw new Error("401");
+    }, { replayable: true });
+    await firstAttempt.promise;
+    await refreshStarted.promise;
+
+    current = { creds: live, identity: "id-c", generation: "gen-b" };
+    expect(await instance.get()).toEqual(live);
+
+    // The mint was for a grant the reconnect replaced; its infrastructure trouble is not this
+    // caller's outcome — the retry reads fresh and surfaces any real outage itself.
+    refreshGate.reject(new Error("mint transport lost"));
+    await expect(call).rejects.toThrow("credentials changed during the operation");
+    expect(instance.authority()).toBe("gen-b");
+    expect(noteCredentialsExpired).not.toHaveBeenCalled();
+  });
+
+  it("keeps a reconnect's authority when a delayed refresh returns a dead mint", async () => {
+    let current = { creds: live, identity: "id-a", generation: "gen-a" };
+    const noteCredentialsExpired = vi.fn(async (_identity: string) => "accepted" as const);
+    const secondRefresh = Promise.withResolvers<void>();
+    const lateRefresh = Promise.withResolvers<CredentialsWithIdentity<Creds>>();
+    let mints = 0;
+    const refreshCredentials = (): Promise<CredentialsWithIdentity<Creds>> => {
+      mints += 1;
+      if (mints === 1) {
+        return Promise.resolve({ creds: fresh, identity: "id-b", generation: "gen-a" });
+      }
+      secondRefresh.resolve();
+      return lateRefresh.promise;
+    };
+    const instance = new CredentialSource<Creds>({
+      account: () => ({ getCredentials: async () => current, noteCredentialsExpired }),
+      refreshCredentials,
+      isAuthError: error => error instanceof Error && error.message === "401",
+      expiredMessage: "Reconnect the account.",
+    });
+
+    // A first run has the mint id-b adjudicated dead.
+    await expect(instance.run(async () => { throw new Error("401"); }, { replayable: true }))
+      .rejects.toThrow("Reconnect the account.");
+    expect(noteCredentialsExpired).toHaveBeenCalledWith("id-b");
+
+    // A second run's refresh response is still in flight when a reconnect lands and is adopted.
+    const call = instance.run(async () => { throw new Error("401"); }, { replayable: true });
+    await secondRefresh.promise;
+    current = { creds: live, identity: "id-c", generation: "gen-c" };
+    expect(await instance.get()).toEqual(live);
+    expect(instance.authority()).toBe("gen-c");
+
+    // The delayed response carries the dead mint, but the read it answers is superseded: the
+    // dead shortcut must not adjudicate it against the live successor.
+    lateRefresh.resolve({ creds: fresh, identity: "id-b", generation: "gen-a" });
+    await expect(call).rejects.toThrow("credentials changed during the operation");
+    expect(noteCredentialsExpired).toHaveBeenCalledTimes(1);
+    expect(instance.authority()).toBe("gen-c");
   });
 
   it("resolves a replay the account refuses as superseded into a retry", async () => {

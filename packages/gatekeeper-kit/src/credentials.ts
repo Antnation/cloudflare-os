@@ -423,13 +423,14 @@ export class CredentialSource<Creds> {
       // channel, or hand its failures, on a superseded read.
       if (this.#moved(first.generation)) throw this.#changed(error);
       const second = await this.#refreshed(first, refreshCredentials);
+      // An authority adopted during the refresh is newer than this read and stays; the caller
+      // re-enters like any other mid-operation replacement. Before the dead shortcut, or a
+      // delayed dead-mint response would have a superseded read adjudicated against it.
+      if (this.#moved(first.generation)) throw this.#changed(error);
       // A parallel replay already had this mint's grant adjudicated dead — don't replay it.
       if (this.#dead.has(second.identity)) {
         return this.#adjudicate(second.identity, error);
       }
-      // An authority adopted during the refresh is newer than this read and stays; the caller
-      // re-enters like any other mid-operation replacement.
-      if (this.#moved(first.generation)) throw this.#changed(error);
       // A generation moved in the refresh result means a reconnect: replaying would act under a
       // principal the caller never fetched. The crossing stales any authority not adopted past
       // it — unknown included, or a pending read could restore the pre-reconnect partition.
@@ -441,6 +442,9 @@ export class CredentialSource<Creds> {
         return await operation(second.creds);
       } catch (replayError) {
         if (!this.#options.isAuthError(replayError)) throw replayError;
+        // A reconnect adopted during the replay supersedes it: the account's verdict on the old
+        // mint could only be "superseded", so skip the ask rather than risk losing its answer.
+        if (this.#moved(first.generation)) throw this.#changed(replayError);
         return this.#adjudicate(second.identity, replayError);
       }
     }
@@ -466,8 +470,9 @@ export class CredentialSource<Creds> {
 
   /**
    * Reports a rejection to the account and resolves it by the verdict: a refused report is
-   * retryable, anything else is expiry. Replay paths call this directly — their identity is
-   * just-minted, so the snapshot cannot be newer than it and only the account adjudicates.
+   * retryable, anything else is expiry. Replay paths call this directly once an adopted reconnect
+   * is ruled out — their identity is just-minted, so no snapshot outranks it by identity and only
+   * the account adjudicates.
    * @param identity Credential identity used by the failed call.
    * @param cause Provider rejection being resolved.
    */
@@ -530,13 +535,12 @@ export class CredentialSource<Creds> {
     try {
       return await this.#replays.run(rejected, () => refreshCredentials(rejected));
     } catch (error) {
-      if (isExpiredError(error)) {
-        // The channel confirming expiry is the account's own verdict — unless a reconnect was
-        // adopted meanwhile, where the verdict concerns a replaced grant and the caller re-enters.
-        if (this.#moved(rejected.generation)) throw this.#changed(error);
-        // Take the death fences, so a read still in flight cannot restore the dead authority.
-        this.#supersede(rejected.identity);
-      }
+      // A reconnect adopted meanwhile supersedes this read — every failure of its refresh,
+      // confirmed expiry included, concerns a replaced grant, and the caller re-enters.
+      if (this.#moved(rejected.generation)) throw this.#changed(error);
+      // The channel confirming expiry is the account's own verdict: take the death fences, so a
+      // read still in flight cannot restore the dead authority.
+      if (isExpiredError(error)) this.#supersede(rejected.identity);
       throw error;
     }
   }
