@@ -776,9 +776,12 @@ export interface Gatekeeper<Session> extends DurableObject {
    * resource" action to the given approval queue. The Overseer calls this exactly once,
    * immediately after adding the workpiece, with a queue scoped to it and attributed to the
    * creating agent's chat (so the approval card lands there). Implementations must be idempotent
-   * (a retried call must not queue a second creation) and must ensure the creation is the FIRST
-   * pending action, so in-order approval applies it before any queued edits. Only gatekeepers
-   * reachable via createResource() need implement this.
+   * (a retried call must not queue a second creation) and must queue the creation FIRST.
+   *
+   * Ordering is the gatekeeper's responsibility: the platform applies auto-approvals in order,
+   * but a manual approval can target any pending action, so the gatekeeper must itself reject
+   * applyAction() of any action that depends on the resource existing until the creation has
+   * been applied. Only gatekeepers reachable via createResource() need implement this.
    */
   submitCreationAction?(approvalQueue: RpcStub<ApprovalQueue>): Promise<void>;
 

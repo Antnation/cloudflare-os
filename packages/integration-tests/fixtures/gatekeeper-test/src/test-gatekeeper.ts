@@ -488,6 +488,15 @@ export class TestGatekeeper
   }
 
   async applyAction(action: number): Promise<void> {
+    // The in-order guard the submitCreationAction contract requires: manual approval can target
+    // any pending action, so the gatekeeper itself must refuse to apply anything that depends on
+    // the thing existing until the creation has been applied.
+    const creationActionId = this.ctx.storage.kv.get<number>("creationActionId");
+    if (creationActionId !== undefined && action !== creationActionId &&
+        this.ctx.storage.kv.get<string>("createdUrl") === undefined) {
+      throw new Error(
+          "The test thing does not exist yet: approve its creation action before this one.");
+    }
     await control(this.ctx.exports).applyAction(this.ctx.props.label, action);
     if (action === this.ctx.storage.kv.get<number>("creationActionId")) {
       // The thing now "exists": describe() flips from the provisional URL to the real one.

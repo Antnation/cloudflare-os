@@ -5338,10 +5338,18 @@ class OverseerImpl implements AgentHooks {
     if (gatekeeperRecord?.provisional) {
       try {
         let description = await gatekeeper.describe();
-        if (description.url !== gatekeeperRecord.resourceUrl) {
+        // Re-read after the await: a concurrent removeGatekeeper during the describe() would
+        // otherwise be resurrected by putting the stale record back.
+        gatekeeperRecord = this.storage.gatekeepers.get(record.gatekeeperId);
+        if (gatekeeperRecord?.provisional && description.url !== gatekeeperRecord.resourceUrl) {
           gatekeeperRecord.resourceTitle = description.title;
           gatekeeperRecord.resourceUrl = description.url;
           gatekeeperRecord.hasSlashCommands = description.hasSlashCommands;
+          // Blueprint export's suggestValue reads creationSpec.resourceUrl; retire the
+          // provisional URL there too or exported blueprints would suggest a dead resource.
+          if (gatekeeperRecord.creationSpec?.type === "gatekeeper") {
+            gatekeeperRecord.creationSpec.resourceUrl = description.url;
+          }
           delete gatekeeperRecord.provisional;
           this.storage.gatekeepers.put(gatekeeperRecord);
         }

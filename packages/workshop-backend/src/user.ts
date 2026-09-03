@@ -1729,17 +1729,6 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       account = candidates[0];
     }
 
-    let config = await readAdminConfig(this.env);
-    let vendorIdLower = account.vendorId.toLowerCase();
-    if (config.disabledGatekeepers.includes(vendorIdLower)) {
-      throw new Error(
-          `The "${account.vendorId}" gatekeeper is disabled on this deployment by an administrator.`);
-    }
-    if (isResourceDisabled(config, vendorIdLower, resourceUrlPattern)) {
-      throw new Error(
-          `This resource type is disabled on this deployment by an administrator.`);
-    }
-
     // No stub-side probe for the optional method: RPC stubs cannot reliably report whether an
     // optional method exists (see the note on GatekeeperUser's singleton section), so we view the
     // stub through the Required<Pick<...>> shape. The caller gates on SupportedResource.creatable;
@@ -1748,6 +1737,22 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let {class: cls, resource, resourceUrl} =
         await (account.account as unknown as ResourceCreatorStub)
             .createResource(resourceUrlPattern, options);
+
+    // Check the admin disable-set against the pattern the vendor actually resolved, after the
+    // RPC, exactly like getGatekeeperClassFor -- the vendor is the authority on which resource
+    // type a request maps to. (createResource mints only the class and a provisional URL; the
+    // provider-side creation is a separate pending action, so nothing external happened yet.)
+    let config = await readAdminConfig(this.env);
+    let vendorIdLower = account.vendorId.toLowerCase();
+    if (config.disabledGatekeepers.includes(vendorIdLower)) {
+      throw new Error(
+          `The "${account.vendorId}" gatekeeper is disabled on this deployment by an administrator.`);
+    }
+    if (isResourceDisabled(config, vendorIdLower, resource.urlPattern)) {
+      throw new Error(
+          `The "${resource.title}" resource is disabled on this deployment by an administrator.`);
+    }
+
     return {class: cls, vendorId: account.vendorId, typeUrlPattern: resource.urlPattern,
             resourceUrl};
   }
