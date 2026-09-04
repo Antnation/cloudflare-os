@@ -480,6 +480,210 @@ describe("CredentialCoordinator", () => {
     expect(() => coordinator(makeKv(), undefined, ["accessToken", "credentials:identity"]))
       .toThrow('Legacy key "credentials:identity" is one the coordinator owns.');
   });
+
+  describe("snapshot", () => {
+    it("returns a coherent triple of the stored credentials", async () => {
+      const instance = coordinator(makeKv());
+      instance.connect(live);
+
+      const read = await instance.snapshot(async () => live);
+      expect(read).toEqual({
+        creds: live,
+        identity: instance.identity(),
+        generation: instance.connectionGeneration(),
+      });
+      expect(read.identity).toMatch(/^[0-9a-f]{64}$/);
+    });
+
+    it("keeps the triple coherent against a connect landing mid-refresh", async () => {
+      const instance = coordinator(makeKv());
+      instance.connect(stale);
+      const { promise, resolve } = Promise.withResolvers<Creds>();
+
+      const reading = instance.snapshot(() => promise);
+      instance.connect({ token: "reconnected", expiresAt: live.expiresAt });
+      const identity = instance.identity();
+      const generation = instance.connectionGeneration();
+      resolve({ token: "refreshed", expiresAt: live.expiresAt });
+
+      // The reconnect won the refresh; the triple must be its credentials under its identity and
+      // generation, never the refresh result under the reconnect's fence.
+      expect(await reading).toEqual({
+        creds: { token: "reconnected", expiresAt: live.expiresAt },
+        identity,
+        generation,
+      });
+    });
+
+    it("notifies the Workshop before rethrowing a confirmed expiry of the stored grant", async () => {
+      const instance = coordinator(makeKv());
+      instance.connect(stale);
+      const notify = vi.fn(async () => {});
+
+      await expect(instance.snapshot(async () => {
+        throw new CredentialsExpiredError("invalid_grant");
+      }, { notify })).rejects.toThrow("invalid_grant");
+      expect(notify).toHaveBeenCalledOnce();
+
+      // A notify that throws is logged account-side; the caller still gets the expiry verdict.
+      const logged = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        await expect(instance.snapshot(async () => {
+          throw new CredentialsExpiredError("invalid_grant");
+        }, { notify: async () => { throw new Error("workshop unreachable"); } }))
+          .rejects.toThrow("invalid_grant");
+      } finally {
+        logged.mockRestore();
+      }
+    });
+
+    it("never notifies for a disconnect", async () => {
+      const notify = vi.fn(async () => {});
+      // Nothing stored: reading a disconnected account is not grant death.
+      await expect(coordinator(makeKv()).snapshot(async () => live, { notify }))
+        .rejects.toThrow(CredentialsExpiredError);
+
+      // A revoke mid-refresh is the user's own action; announcing expiry would misattribute it.
+      const instance = coordinator(makeKv());
+      instance.connect(stale);
+      const { promise, resolve } = Promise.withResolvers<Creds>();
+      const reading = instance.snapshot(() => promise, { notify });
+      instance.clear();
+      resolve({ token: "refreshed", expiresAt: live.expiresAt });
+      await expect(reading).rejects.toThrow(CredentialsExpiredError);
+
+      expect(notify).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("adjudicateRejection", () => {
+    const notifyless = { notify: async () => {} };
+
+    it("answers superseded for an identity that is no longer current, before any heal", async () => {
+      const instance = coordinator(makeKv());
+      instance.connect(live);
+      const refresh = vi.fn(async () => live);
+      const notify = vi.fn(async () => {});
+
+      await expect(instance.adjudicateRejection("someone-elses-fence", { refresh, notify }))
+        .resolves.toBe("superseded");
+      expect(refresh).not.toHaveBeenCalled();
+      expect(notify).not.toHaveBeenCalled();
+    });
+
+    it('never matches "" against a never-connected account', async () => {
+      // A never-connected read carries identity ""; the account's own identity() is also "". An
+      // equality gate alone would heal — or expire — an account that was never connected.
+      const notify = vi.fn(async () => {});
+      await expect(coordinator(makeKv()).adjudicateRejection("", { notify }))
+        .resolves.toBe("superseded");
+      expect(notify).not.toHaveBeenCalled();
+    });
+
+    it("expires a current identity on a grant-death provider, notifying first", async () => {
+      const instance = coordinator(makeKv());
+      instance.connect(live);
+      const order: string[] = [];
+      const notify = vi.fn(async () => { order.push("notify"); });
+
+      const verdict = await instance.adjudicateRejection(instance.identity(), { notify });
+      order.push("verdict");
+      expect(verdict).toBe("expired");
+      expect(order).toEqual(["notify", "verdict"]);
+      expect(instance.stored()).toEqual(live);
+    });
+
+    it("heals a current rejected identity and answers superseded", async () => {
+      const instance = coordinator(makeKv());
+      instance.connect(stale);
+      const notify = vi.fn(async () => {});
+      const refresh = vi.fn(async () => ({ token: "minted", expiresAt: live.expiresAt }));
+
+      await expect(instance.adjudicateRejection(instance.identity(), { refresh, notify }))
+        .resolves.toBe("superseded");
+      expect(instance.stored()?.token).toBe("minted");
+      expect(notify).not.toHaveBeenCalled();
+    });
+
+    it("expires the grant when the heal confirms its death, keeping the verdict past a failed notify", async () => {
+      const instance = coordinator(makeKv());
+      instance.connect(stale);
+      const refresh = async (): Promise<Creds> => {
+        throw new CredentialsExpiredError("invalid_grant");
+      };
+      const notify = vi.fn(async () => {});
+
+      await expect(instance.adjudicateRejection(instance.identity(), { refresh, notify }))
+        .resolves.toBe("expired");
+      expect(notify).toHaveBeenCalledOnce();
+
+      // A throwing notify is the account's own trouble, never a different verdict.
+      const logged = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        await expect(instance.adjudicateRejection(instance.identity(), {
+          refresh, notify: async () => { throw new Error("workshop unreachable"); },
+        })).resolves.toBe("expired");
+      } finally {
+        logged.mockRestore();
+      }
+    });
+
+    it("answers unavailable when the heal fails for non-credential reasons", async () => {
+      const instance = coordinator(makeKv());
+      instance.connect(stale);
+      const notify = vi.fn(async () => {});
+      const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        await expect(instance.adjudicateRejection(instance.identity(), {
+          refresh: async () => { throw new Error("502 from token endpoint"); },
+          notify,
+        })).resolves.toBe("unavailable");
+      } finally {
+        logged.mockRestore();
+      }
+
+      // Nothing adjudicated: the grant is intact and no expiry was announced.
+      expect(instance.stored()).toEqual(stale);
+      expect(notify).not.toHaveBeenCalled();
+    });
+
+    it("lets a reconnect racing the heal win as superseded, even when the mint dies", async () => {
+      const instance = coordinator(makeKv());
+      instance.connect(stale);
+      const rejected = instance.identity();
+      const notify = vi.fn(async () => {});
+      const mint = Promise.withResolvers<Creds>();
+
+      const adjudicating = instance.adjudicateRejection(rejected, {
+        refresh: () => mint.promise, notify,
+      });
+      instance.connect({ token: "reconnected", expiresAt: live.expiresAt });
+      mint.reject(new CredentialsExpiredError("invalid_grant"));
+
+      // The dead mint belonged to the grant the reconnect replaced; expiring now would retire the
+      // grant the user just connected.
+      await expect(adjudicating).resolves.toBe("superseded");
+      expect(notify).not.toHaveBeenCalled();
+      expect(instance.stored()?.token).toBe("reconnected");
+    });
+
+    it("collapses concurrent heals of one identity onto one mint", async () => {
+      const instance = coordinator(makeKv());
+      instance.connect(stale);
+      const rejected = instance.identity();
+      const mint = Promise.withResolvers<Creds>();
+      const refresh = vi.fn(() => mint.promise);
+
+      const verdicts = Promise.all([
+        instance.adjudicateRejection(rejected, { refresh, ...notifyless }),
+        instance.adjudicateRejection(rejected, { refresh, ...notifyless }),
+      ]);
+      mint.resolve({ token: "minted", expiresAt: live.expiresAt });
+
+      expect(await verdicts).toEqual(["superseded", "superseded"]);
+      expect(refresh).toHaveBeenCalledOnce();
+    });
+  });
 });
 
 describe("CredentialSource", () => {

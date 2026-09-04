@@ -32,6 +32,28 @@ function isExpiredError(error: unknown): boolean {
   return error instanceof Error && error.name === "CredentialsExpiredError";
 }
 
+/**
+ * The account's adjudication of a reported credential rejection.
+ * - `"expired"` — the grant is dead; the account has notified the Workshop.
+ * - `"superseded"` — the rejected identity is no longer current: already replaced, or just healed
+ *   past. The failure was stale, so the caller retries or re-enters.
+ * - `"unavailable"` — the heal failed for non-credential reasons; nothing was adjudicated, and the
+ *   consumer surfaces the caller's original provider error.
+ */
+export type RejectionVerdict = "expired" | "superseded" | "unavailable";
+
+/** Awaits a Workshop notification, logging a failure rather than masking the verdict with it. */
+async function notified(notify: () => Promise<void>): Promise<void> {
+  try {
+    await notify();
+  } catch (error) {
+    logger.warn("failed to notify credential expiry", {
+      event: "credentials.expiry.notify.failed",
+      error,
+    });
+  }
+}
+
 // Shared storage layout for kit-managed credentials.
 const CREDENTIALS_KEY = "credentials";
 const IDENTITY_KEY = `${CREDENTIALS_KEY}:identity`;
@@ -262,6 +284,86 @@ export class CredentialCoordinator<Creds> {
     const latest = this.stored();
     if (latest !== undefined) return latest;
     throw new CredentialsExpiredError("This account was disconnected while refreshing.", { cause });
+  }
+
+  /**
+   * Reads the credential triple the account RPC surface serves: current credentials, their
+   * identity fence, and their connection generation. The three reads are synchronous after the
+   * refresh settles — no await between them — so a `connect()` landing at the await boundary
+   * cannot tear the triple apart. That atomicity is why the helper lives on the coordinator; a
+   * hand-written `getCredentials` owns it itself.
+   * @param refresh Provider refresh operation.
+   * @param options `notify` announces confirmed grant death to the Workshop before the rethrow.
+   * @returns Current credentials with their identity and connection generation.
+   * @throws `CredentialsExpiredError` on confirmed expiry, after awaiting `notify` when the dead
+   * grant is still stored — a disconnect is a user action, not grant death, and never notifies.
+   */
+  async snapshot(
+    refresh: (current: Creds) => Promise<Creds>,
+    options: { notify?: () => Promise<void> } = {},
+  ): Promise<CredentialsWithIdentity<Creds>> {
+    try {
+      await this.fresh(refresh);
+    } catch (error) {
+      if (isExpiredError(error) && this.stored() !== undefined && options.notify !== undefined) {
+        await notified(options.notify);
+      }
+      throw error;
+    }
+    const creds = this.stored();
+    if (creds === undefined) throw new CredentialsExpiredError("This account is not connected.");
+    return { creds, identity: this.identity(), generation: this.connectionGeneration() };
+  }
+
+  /**
+   * Adjudicates a consumer-reported credential rejection, healing past a rejected-but-current
+   * credential inside the ask. The verdict adjudicates the identity, never notification delivery,
+   * which the account owns end to end. Invariants a hand-written implementation owns instead:
+   * the moved-past gate (`""` never matches), the heal fenced on the rejected identity, and
+   * honest verdicts — `"expired"` only for provider-confirmed grant death.
+   *
+   * No durable mint latch guards a dead grant: a repeat report costs one provider call that
+   * answers `invalid_grant` again — the same verdict — and Workshop notification is already
+   * deduped by `notifyCredentialsExpiredOnce`'s latch. A port that measures mint spam adds a
+   * cooldown inside its `refresh` callback.
+   * @param identity Credential identity the consumer saw rejected.
+   * @param options `refresh` mints past a stale credential (grant-death providers leave it unset);
+   * `notify` announces confirmed grant death to the Workshop.
+   * @returns The verdict on the rejected identity.
+   */
+  async adjudicateRejection(
+    identity: string,
+    options: { refresh?: (current: Creds) => Promise<Creds>; notify: () => Promise<void> },
+  ): Promise<RejectionVerdict> {
+    // Moved-past gate: a rejected identity no longer current was already replaced, and "" — a
+    // never-connected read — must not match a never-connected account's own "".
+    if (identity === "" || identity !== this.identity()) return "superseded";
+    // A grant-death provider has no mint to heal with: the rejection is the grant's death.
+    if (options.refresh === undefined) {
+      await notified(options.notify);
+      return "expired";
+    }
+    try {
+      // Fence-keyed, so concurrent heals of one identity collapse onto one provider mint.
+      await this.rotate(options.refresh);
+      // The commit rotated the fence — or a reconnect overtook the mint. Either way the rejected
+      // identity is no longer current.
+      return "superseded";
+    } catch (error) {
+      if (isExpiredError(error)) {
+        // A reconnect landing while the mint failed replaced the rejected grant; it wins.
+        if (this.identity() !== identity) return "superseded";
+        await notified(options.notify);
+        return "expired";
+      }
+      // Non-credential mint failure: nothing adjudicated, credentials intact. The consumer
+      // surfaces the caller's original provider error; the token endpoint's lives in this log.
+      logger.error("credential rejection heal failed", {
+        event: "credentials.rejection.heal.failed",
+        error,
+      });
+      return "unavailable";
+    }
   }
 }
 
