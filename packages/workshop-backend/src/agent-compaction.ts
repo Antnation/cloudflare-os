@@ -1,4 +1,5 @@
-import {SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT, type AiChatMessage, type AiModelConfig}
+import {SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT, isCreatedResourceSuccess, type AiChatMessage,
+        type AiModelConfig}
   from "@gadgets/workshop-shared/api";
 import {composeCodeChange, type CodeChange} from "@gadgets/workshop-shared/code-change";
 import type {Api, Message, Model} from "@earendil-works/pi-ai";
@@ -394,10 +395,8 @@ export function buildCompactionState(
           chatBindings.set(call.input.bindingName,
               {type: "workpiece", id: call.output.worktreeId});
         } else if (call.toolName === "createExternalResource" &&
-                   typeof call.output === "object") {
-          // A string output is a fixable rejection with no binding; only the structured success
-          // output binds (mirrors replay's re-establishment from the recorded output). Rejections
-          // carry no `error`, so the continue above does not filter them.
+                   isCreatedResourceSuccess(call.output)) {
+          // Mirrors replay's re-establishment of the binding from the recorded output.
           chatBindings.set(call.input.bindingName,
               {type: "workpiece", id: call.output.gatekeeperId});
         }

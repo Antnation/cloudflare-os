@@ -1,6 +1,6 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, actionChangeTime } from '@gadgets/workshop-shared/api';
+import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, isCreatedResourceSuccess, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, actionChangeTime } from '@gadgets/workshop-shared/api';
 import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange, diffFiles,
   transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
@@ -2490,11 +2490,11 @@ class OverseerImpl implements AgentHooks {
         // Keep the gatekeeper iff its creation action was actually applied: `provisional` clears
         // on the post-apply describe refresh, but that refresh is best-effort, so accept an
         // approved action as proof too -- reaping on `provisional` alone could sever a real
-        // provider resource. (The full-log scan runs only on this rare stuck-provisional path.)
+        // provider resource. (The scan runs only on this rare stuck-provisional path; the index
+        // yields just the resolved type-"action" records, skipping observations.)
         let created = !record.provisional ||
-            [...this.storage.actions.list()].some(action =>
-                action.gatekeeperId === record.id && action.type === "action" &&
-                action.state === "approved");
+            Iterator.from(this.storage.actions.byHistoryFilter.get("action")).some(action =>
+                action.gatekeeperId === record.id && action.state === "approved");
         if (created) {
           delete record.pending;
           this.storage.gatekeepers.put(record);
@@ -7890,10 +7890,9 @@ class OverseerImpl implements AgentHooks {
               nameByTarget.set(call.output.worktreeId, call.input.bindingName);
             }
           } else if (call.toolName === "createExternalResource") {
-            // The name is taken even on rejection (matches chatScopeNames' overclaiming); only a
-            // structured (success) output actually bound the resource — a string is a rejection.
+            // The name is taken even on rejection (matches chatScopeNames' overclaiming).
             taken.add(call.input.bindingName);
-            if (typeof call.output === "object" &&
+            if (isCreatedResourceSuccess(call.output) &&
                 !nameByTarget.has(call.output.gatekeeperId)) {
               nameByTarget.set(call.output.gatekeeperId, call.input.bindingName);
             }
@@ -8573,10 +8572,11 @@ class OverseerImpl implements AgentHooks {
       // Clear the crash-orphan marker of any gatekeeper whose createExternalResource call this
       // message records: the log now backs the creation (see GatekeeperRecord.pending). Same
       // synchronous step as the message write, so the log and the registry can never disagree.
-      // A string output is a fixable rejection -- no gatekeeper survived it to unstamp.
+      // A rejected creation left no gatekeeper to unstamp.
       if (msg.type === "message") {
         for (let call of msg.toolCalls ?? []) {
-          if (call.toolName === "createExternalResource" && typeof call.output === "object") {
+          if (call.toolName === "createExternalResource" &&
+              isCreatedResourceSuccess(call.output)) {
             let gatekeeper = this.storage.gatekeepers.get(call.output.gatekeeperId);
             if (gatekeeper?.pending?.chatId === chatId) {
               delete gatekeeper.pending;
@@ -8994,10 +8994,6 @@ class OverseerImpl implements AgentHooks {
   // agent should adjust and retry in the same turn.
   async createExternalResource(chatId: number, input: CreateExternalResourceInput,
       initiator: AiChatAuthorInfo): Promise<CreateExternalResourceResult> {
-    // The agent loop already validated the binding name against the chat's scope; re-validate
-    // its shape here defensively.
-    validateBindingName(input.bindingName);
-
     let vendors = await this.#listGatekeeperVendorsCached();
     let vendor = vendors.find(v => v.id === input.vendorId);
     if (!vendor) {

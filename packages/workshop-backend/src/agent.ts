@@ -1,4 +1,4 @@
-import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, AiChatStreamEvent, BlueprintOutput, ChatGadgetPin, ChatCodeBase, WorkpieceId, type ActionState, type AiModelConfig, isTextLikeAttachmentMimeType, validateBindingName } from '@gadgets/workshop-shared/api';
+import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, AiChatStreamEvent, BlueprintOutput, ChatGadgetPin, ChatCodeBase, WorkpieceId, type ActionState, type AiModelConfig, isCreatedResourceSuccess, isTextLikeAttachmentMimeType, validateBindingName } from '@gadgets/workshop-shared/api';
 import { applyCodeChange, codeChangeSerializedSize, replaceSpanChange, type CodeContent,
   type CodeChange, type FileChange } from '@gadgets/workshop-shared/code-change';
 import { PDF_MIME_TYPE, modelApiSupportsPdfAttachments } from './chat-attachment-pdf';
@@ -1981,20 +1981,19 @@ export async function runAgent(
                   break;
                 case "createExternalResource": {
                   // Like createGadget: a creation tool can't re-run, so replay re-establishes
-                  // the binding from the recorded output. A string output is a fixable
-                  // rejection — no binding was made.
+                  // the binding from the recorded output.
                   if (toolCall.output === undefined) {
                     throw new Error(
                         "createExternalResource tool call in log is missing its result");
                   }
-                  if (typeof toolCall.output === "string") {
-                    toolOutput = {text: toolCall.output};
-                  } else {
+                  if (isCreatedResourceSuccess(toolCall.output)) {
                     chatBindings.set(toolCall.input.bindingName,
                         {type: "workpiece", id: toolCall.output.gatekeeperId});
                     createdResourceBindings.set(
                         toolCall.output.gatekeeperId, toolCall.input.bindingName);
                     toolOutput = {text: jsonToolResultText(toolCall.output)};
+                  } else {
+                    toolOutput = {text: toolCall.output};
                   }
                   break;
                 }

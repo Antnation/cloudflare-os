@@ -3263,8 +3263,22 @@ export type AiToolCall = {
    * instead of re-creating, like createGadget. A string output is a fixable rejection returned
    * to the model (no binding was made), like requestConnection's output.
    */
-  output?: {gatekeeperId: WorkpieceId, resourceUrl: string, message: string} | string;
+  output?: CreatedResourceOutput | string;
 });
+
+/** Success output of a createExternalResource call (see the AiToolCall member). */
+export type CreatedResourceOutput = {gatekeeperId: WorkpieceId, resourceUrl: string, message: string};
+
+/**
+ * True iff a createExternalResource output is the structured success shape — the only shape under
+ * which a binding was made. A string output is a fixable rejection; it is not an error (no
+ * `error` is set on the call), so error-based filters do not catch it. Every consumer that scans
+ * recorded tool calls must gate on this, not on `output !== undefined`.
+ */
+export function isCreatedResourceSuccess(output: CreatedResourceOutput | string | undefined)
+    : output is CreatedResourceOutput {
+  return typeof output === "object";
+}
 
 // TODO: Extend AiToolCall for code-mode tool calls.
 // - Includes inline audit logs from the action.
