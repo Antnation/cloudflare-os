@@ -1,6 +1,6 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, isCreatedResourceSuccess, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, actionChangeTime } from '@gadgets/workshop-shared/api';
+import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, type CreatedResourceOutput, isCreatedResourceSuccess, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, actionChangeTime } from '@gadgets/workshop-shared/api';
 import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange, diffFiles,
   transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
@@ -30,7 +30,7 @@ import {
   getAiGatewayLogCost,
   type AiGatewayLogRoute,
 } from "./ai-gateway";
-import { AgentGadgetInfo, AgentHooks, AiChatAgentContext, CHAT_CHANGE_MESSAGE_BUDGET, ChatBindingEntry, SeedBindingInfo, runAgent, makeStorableArgs, summarizeArgs, type AgentStepChange, type AiChatMessageBodyWithModelData, type CompactionCheckpoint, type CreateExternalResourceInput, type CreateExternalResourceResult, type StoredAssistantMessage, type WorktreeTurnAccess } from "./agent";
+import { AgentGadgetInfo, AgentHooks, AiChatAgentContext, CHAT_CHANGE_MESSAGE_BUDGET, ChatBindingEntry, SeedBindingInfo, runAgent, makeStorableArgs, summarizeArgs, type AgentStepChange, type AiChatMessageBodyWithModelData, type CompactionCheckpoint, type CreateExternalResourceInput, type StoredAssistantMessage, type WorktreeTurnAccess } from "./agent";
 import { WorktreeSessionImpl } from "./worktree-session";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
 import { deploymentOutputForBlueprint, FormatOffer, listFormatOffers, readAdminConfig } from "./admin-config";
@@ -300,6 +300,13 @@ type GatekeeperRecord = {
   // merge/revert to compare against). Distinct from `provisional`, which means "URL not real
   // yet" and outlives the barrier.
   pending?: {chatId: number};
+
+  // Present on a createExternalResource mint: the agent's env name for the resource (stamped at
+  // the mint) and the creation action's id (stamped by submitAction on the first queued action --
+  // the vendor queues the creation first, and this makes that ordering the definition). Never
+  // cleared; drives the post-apply describe refresh, the crash reap's keep check, and the
+  // decision nudges.
+  creation?: {bindingName: string, actionId?: number};
 
   // Records how this gatekeeper was originally created, enabling blueprint metadata derivation.
   creationSpec?: GatekeeperCreationSpec;
@@ -2489,13 +2496,11 @@ class OverseerImpl implements AgentHooks {
       try {
         // Keep the gatekeeper iff its creation action was actually applied: `provisional` clears
         // on the post-apply describe refresh, but that refresh is best-effort, so accept an
-        // approved action as proof too -- reaping on `provisional` alone could sever a real
-        // provider resource. (The scan runs only on this rare stuck-provisional path; the index
-        // yields the type-"action" records, pending included, skipping observations and hooks --
-        // the state check below is load-bearing.)
-        let created = !record.provisional ||
-            Iterator.from(this.storage.actions.byHistoryFilter.get("action")).some(action =>
-                action.gatekeeperId === record.id && action.state === "approved");
+        // approved creation action as proof too -- reaping on `provisional` alone could sever a
+        // real provider resource.
+        let creationId = record.creation?.actionId;
+        let created = !record.provisional || (creationId !== undefined &&
+            this.storage.actions.get(creationId)?.state === "approved");
         if (created) {
           delete record.pending;
           this.storage.gatekeepers.put(record);
@@ -5313,20 +5318,21 @@ class OverseerImpl implements AgentHooks {
     });
 
     // A gatekeeper minted by createExternalResource was described with a provisional URL; once
-    // the creation action is applied, describe() reports the real resource, so refresh the
-    // denormalized copy and retire the marker. Guarded on the URL actually changing (the record
-    // still holds the provisional description here) because the applied action need not be the
-    // creation: an invalidated edit bypasses the gatekeeper's in-order rule, and clearing on it
-    // would strand the provisional description forever. Best-effort: on failure the marker stays
-    // set and the next applied action retries.
+    // its creation action is approved (this action, or an earlier one whose refresh failed),
+    // describe() reports the real resource, so refresh the denormalized copy and retire the
+    // marker. The point read keeps an invalidated edit that applies before the creation from
+    // clearing the marker early. Best-effort: on failure the marker stays set and the next
+    // applied action retries.
     let gatekeeperRecord = this.storage.gatekeepers.get(record.gatekeeperId);
-    if (gatekeeperRecord?.provisional) {
+    let creationId = gatekeeperRecord?.creation?.actionId;
+    if (gatekeeperRecord?.provisional && creationId !== undefined &&
+        this.storage.actions.get(creationId)?.state === "approved") {
       try {
         let description = await gatekeeper.describe();
         // Re-read after the await: a concurrent removeGatekeeper during the describe() would
         // otherwise be resurrected by putting the stale record back.
         gatekeeperRecord = this.storage.gatekeepers.get(record.gatekeeperId);
-        if (gatekeeperRecord?.provisional && description.url !== gatekeeperRecord.resourceUrl) {
+        if (gatekeeperRecord?.provisional) {
           gatekeeperRecord.resourceTitle = description.title;
           gatekeeperRecord.resourceUrl = description.url;
           gatekeeperRecord.hasSlashCommands = description.hasSlashCommands;
@@ -5345,6 +5351,27 @@ class OverseerImpl implements AgentHooks {
         });
       }
     }
+
+    if (record.id === creationId && record.caller.from === "agent" &&
+        gatekeeperRecord !== undefined) {
+      this.nudgeCreationDecision(record.caller.chatId, gatekeeperRecord, "approved", resolvedBy);
+    }
+  }
+
+  // Record the user's verdict on a created resource in its chat's log: the creation tool's
+  // recorded result permanently says the resource doesn't exist yet, so the model only learns
+  // the decision from this durable nudge (replayed as a user message, invisible in the UI).
+  nudgeCreationDecision(chatId: number, gatekeeper: GatekeeperRecord,
+                        decision: "approved" | "rejected", author: AiChatAuthorInfo) {
+    if (gatekeeper.creation === undefined) return;
+    if (this.storage.chatMeta.get(chatId) === undefined) return;  // Chat since deleted.
+    let name = `env.${gatekeeper.creation.bindingName}`;
+    let text = decision === "approved"
+        ? `The user approved the creation of ${name}.` + (gatekeeper.provisional ? `` :
+            ` The resource now exists at ${gatekeeper.resourceUrl}.`)
+        : `The user rejected the creation of ${name}; it will not be created at the provider. ` +
+            `Do not retry; wait for the user to tell you how to proceed.`;
+    this.addChatMessages(chatId, author, [{type: "agentNudge", text}]);
   }
 
   // Apply all currently-eligible pending actions of the given gatekeeper, in ascending id order.
@@ -5931,6 +5958,12 @@ class OverseerImpl implements AgentHooks {
     this.storage.transaction(() => {
       if (description.pushedCommits !== undefined && description.pushedCommits.length > 0) {
         this.gitCache.markPushClosure(gatekeeperId, actionId, description.pushedCommits);
+      }
+      // The first action queued against a createExternalResource mint IS the creation; stamp
+      // its identity in the same durable step as the action itself.
+      if (gatekeeper?.creation !== undefined && gatekeeper.creation.actionId === undefined) {
+        gatekeeper.creation.actionId = actionId;
+        this.storage.gatekeepers.put(gatekeeper);
       }
       this.storage.actions.put(record);
     });
@@ -8626,21 +8659,6 @@ class OverseerImpl implements AgentHooks {
         `${keyString(chatId)}.${keyString(sequence)}`)?.message;
   }
 
-  getActionState(actionId: number)
-      : {gatekeeperId: WorkpieceId, state: ActionState, resourceUrl?: string} | undefined {
-    let action = this.storage.actions.get(actionId);
-    // Observations and hooks share the record space but are stamped "approved" at creation;
-    // only type-"action" records carry a real user decision.
-    if (action?.type !== "action") return undefined;
-    let gatekeeper = action.state === "approved"
-        ? this.storage.gatekeepers.get(action.gatekeeperId) : undefined;
-    return {
-      gatekeeperId: action.gatekeeperId,
-      state: action.state,
-      resourceUrl: gatekeeper?.provisional ? undefined : gatekeeper?.resourceUrl,
-    };
-  }
-
   // Adds an inference cost (in dollars) to a chat's running total and the workspace-wide total.
   #addChatCost(chatId: number, cost: number) {
     let meta = this.storage.chatMeta.get(chatId);
@@ -8997,24 +9015,23 @@ class OverseerImpl implements AgentHooks {
   // lands in the transcript at the step barrier). `created: false` is a fixable rejection — the
   // agent should adjust and retry in the same turn.
   async createExternalResource(chatId: number, input: CreateExternalResourceInput,
-      initiator: AiChatAuthorInfo): Promise<CreateExternalResourceResult> {
+      initiator: AiChatAuthorInfo): Promise<CreatedResourceOutput | string> {
     let vendors = await this.#listGatekeeperVendorsCached();
     let vendor = vendors.find(v => v.id === input.vendorId);
     if (!vendor) {
-      return { created: false, message:
-          `Cannot create a resource: unknown vendor "${input.vendorId}". ` +
-          `Available vendors: ${vendors.map(v => v.id).join(", ") || "(none)"}.` };
+      return `Cannot create a resource: unknown vendor "${input.vendorId}". ` +
+          `Available vendors: ${vendors.map(v => v.id).join(", ") || "(none)"}.`;
     }
 
     let resource = vendor.supportedResources.find(
         r => r.urlPattern === input.resourceUrlPattern);
     if (!resource?.creatable) {
       let creatable = vendor.supportedResources.filter(r => r.creatable);
-      return { created: false, message: creatable.length === 0
+      return creatable.length === 0
           ? `"${vendor.description.displayName}" does not support creating new resources.`
           : `Cannot create a resource of type "${input.resourceUrlPattern}". ` +
             `"${vendor.description.displayName}" can create: ` +
-            creatable.map(r => `${r.title} (${r.urlPattern})`).join(", ") + `.` };
+            creatable.map(r => `${r.title} (${r.urlPattern})`).join(", ") + `.`;
     }
 
     // Mint the provisional gatekeeper class through the *initiator's* user DO (the admin-check
@@ -9029,7 +9046,7 @@ class OverseerImpl implements AgentHooks {
       minted = await userStub.createResourceGatekeeper(
           input.vendorId, input.accountId, input.resourceUrlPattern, {title: input.title});
     } catch (error) {
-      return { created: false, message: `Cannot create the resource: ${stringifyError(error)}` };
+      return `Cannot create the resource: ${stringifyError(error)}`;
     }
 
     let client = await this.addGatekeeper(minted.class, {
@@ -9041,12 +9058,14 @@ class OverseerImpl implements AgentHooks {
     let gatekeeperId = await client.getId();
 
     // Mark the record provisional so the post-apply describe refresh (applyPendingAction) knows
-    // to re-denormalize once the resource really exists, and pending so a mid-step crash before
-    // the tool call reaches the log leaves a reapable orphan rather than a live duplicate (see
-    // GatekeeperRecord.pending). (addGatekeeper just created the record.)
+    // to re-denormalize once the resource really exists, pending so a mid-step crash before the
+    // tool call reaches the log leaves a reapable orphan rather than a live duplicate (see
+    // GatekeeperRecord.pending), and stamp the creation identity for the decision nudges.
+    // (addGatekeeper just created the record.)
     let record = this.storage.gatekeepers.get(gatekeeperId)!;
     record.provisional = true;
     record.pending = {chatId};
+    record.creation = {bindingName: input.bindingName};
     this.storage.gatekeepers.put(record);
 
     // Have the facet queue its creation action, attributed to this chat so the approval card is
@@ -9064,14 +9083,14 @@ class OverseerImpl implements AgentHooks {
       // The facet may have queued its action durably before the RPC failed; settle it with the
       // gatekeeper or the pending record would be unresolvable (its facet is gone). Any
       // awaitDecision latch it set must unwind with it -- the settled action can never be
-      // decided, and suspending the turn would hide {created: false} from the model.
+      // decided, and suspending the turn would hide the rejection from the model.
       this.#rejectPendingActionsAndRemoveGatekeeper(gatekeeperId);
       let captured = this.#capturedActions.get(chatId);
       if (captured) captured.awaitDecision = awaitDecisionBefore;
-      return { created: false, message: `Cannot create the resource: ${stringifyError(error)}` };
+      return `Cannot create the resource: ${stringifyError(error)}`;
     }
 
-    return { created: true, gatekeeperId, resourceUrl: minted.resourceUrl, message:
+    return { gatekeeperId, resourceUrl: minted.resourceUrl, message:
         `Created "${input.title}" (${resource.title}), available as env.${input.bindingName} ` +
         `in executeCode immediately — use describeBinding to learn its API. The resource ` +
         `does not exist at ${vendor.description.displayName} yet: the user must approve the ` +
@@ -11470,17 +11489,34 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // can't leave the action rejected with the gatekeeper but still "pending" in storage.
     let profile = await this.#getClientProfile();
 
-    await gatekeeper.rejectAction(action.action);
+    // Rejecting a creation dooms the gatekeeper's other queued actions (in-order application
+    // means they could only ever apply after a creation that now never will), so settle them too
+    // rather than stranding cards the user would have to reject one by one.
+    let record = this.impl.storage.gatekeepers.get(action.gatekeeperId);
+    let rejectsCreation = record?.creation?.actionId === id;
+    let doomed = rejectsCreation
+        ? Array.from(this.impl.storage.actions.pendingByGatekeeper.get(action.gatekeeperId))
+            .filter((a): a is ActionRecord & {type: "action"} =>
+                a.type === "action" && a.id !== id)
+        : [];
 
-    action.state = "rejected";
-    action.appliedAt = new Date();
-    action.resolvedBy = profile;
-    // A rejected push's pending-push marks are removed in the same durable step as the state
-    // change (nothing was transmitted, so nothing became proven). No-op for pushless actions.
-    this.impl.storage.transaction(() => {
-      this.impl.gitCache.clearPushMarks(action.id);
-      this.impl.storage.actions.put(action);
-    });
+    for (let target of [action, ...doomed]) {
+      await gatekeeper.rejectAction(target.action);
+
+      target.state = "rejected";
+      target.appliedAt = new Date();
+      target.resolvedBy = profile;
+      // A rejected push's pending-push marks are removed in the same durable step as the state
+      // change (nothing was transmitted, so nothing became proven). No-op for pushless actions.
+      this.impl.storage.transaction(() => {
+        this.impl.gitCache.clearPushMarks(target.id);
+        this.impl.storage.actions.put(target);
+      });
+    }
+
+    if (rejectsCreation && action.caller.from === "agent") {
+      this.impl.nudgeCreationDecision(action.caller.chatId, record!, "rejected", profile);
+    }
 
     // Deny leaves the turn ended, like denyConnectionRequest. The rejected record also prevents a
     // sibling approval from resuming this turn.

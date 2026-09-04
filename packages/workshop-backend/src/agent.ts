@@ -1,4 +1,4 @@
-import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, AiChatStreamEvent, BlueprintOutput, ChatGadgetPin, ChatCodeBase, WorkpieceId, type ActionState, type AiModelConfig, isCreatedResourceSuccess, isTextLikeAttachmentMimeType, validateBindingName } from '@gadgets/workshop-shared/api';
+import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, AiChatStreamEvent, BlueprintOutput, ChatGadgetPin, ChatCodeBase, WorkpieceId, type AiModelConfig, type CreatedResourceOutput, isCreatedResourceSuccess, isTextLikeAttachmentMimeType, validateBindingName } from '@gadgets/workshop-shared/api';
 import { applyCodeChange, codeChangeSerializedSize, replaceSpanChange, type CodeContent,
   type CodeChange, type FileChange } from '@gadgets/workshop-shared/code-change';
 import { PDF_MIME_TYPE, modelApiSupportsPdfAttachments } from './chat-attachment-pdf';
@@ -396,15 +396,6 @@ export type CreateExternalResourceInput = {
 };
 
 /**
- * Result of the createExternalResource hook. On success, the minted gatekeeper workpiece and its
- * provisional resourceUrl; `created: false` is a fixable rejection (not an error) so the agent
- * can retry within the same turn. Either way `message` is the text shown to the model.
- */
-export type CreateExternalResourceResult =
-    | {created: true, gatekeeperId: WorkpieceId, resourceUrl: string, message: string}
-    | {created: false, message: string};
-
-/**
  * Methods of OverseerImpl that runAgent() needs to call, extracted as an interface to avoid cyclic
  * dependencies.
  * TODO(cleanup): This is getting a bit large, and there's a lot of state that is passed into the
@@ -588,15 +579,6 @@ export interface AgentHooks {
   getChatModelData(chatId: number, sequence: number): StoredAssistantMessage | undefined;
 
   /**
-   * Current resolution of an action record, plus its gatekeeper's live resource URL (absent while
-   * the resource is still provisional, or the gatekeeper is gone). Replay uses this to tell the
-   * model how a createExternalResource creation was decided — the recorded tool result
-   * permanently says the resource doesn't exist yet.
-   */
-  getActionState(actionId: number)
-      : {gatekeeperId: WorkpieceId, state: ActionState, resourceUrl?: string} | undefined;
-
-  /**
    * Record an observation in the Overseer audit log on behalf of a built-in agent tool
    * (i.e. one that isn't backed by a gatekeeper, like `webFetch`). Used to track which
    * external influencers may have tainted the agent's session.
@@ -665,13 +647,14 @@ export interface AgentHooks {
    * addGatekeeper), and submits the creation action attributed to this chat (its card is spliced
    * via consumeCapturedActions like any action). Unlike requestConnection, no user action gates
    * the binding — the gatekeeper simulates the resource until the creation is approved — so the
-   * turn does NOT end. `created: false` is a fixable rejection (unknown vendor, type not
-   * creatable, no usable account, missing authorization); the agent retries in-turn.
+   * turn does NOT end. A string result is a fixable rejection (unknown vendor, type not
+   * creatable, no usable account, missing authorization); the agent retries in-turn. Either
+   * shape is recorded verbatim as the tool call's output (see isCreatedResourceSuccess).
    * `initiator` names whose connected accounts create the resource -- the turn's initiator, not
    * the workspace owner, so a collaborator-driven turn uses (and enumerates) their own accounts.
    */
   createExternalResource(chatId: number, input: CreateExternalResourceInput,
-      initiator: AiChatAuthorInfo): Promise<CreateExternalResourceResult>;
+      initiator: AiChatAuthorInfo): Promise<CreatedResourceOutput | string>;
 
   /**
    * Blueprint hooks for the agent.
@@ -1380,15 +1363,6 @@ export async function runAgent(
   // tool-call message).
   let pendingReplayEdits: ReplayPendingEdit[] = [];
 
-  // Gatekeepers minted by createExternalResource in this chat, id → env name. Their recorded
-  // tool results permanently claim the resource doesn't exist yet, so when a created
-  // gatekeeper's first action card (its creation) replays, the user's decision is injected as
-  // a message (cf. the connectionRequest state replay).
-  let createdResourceBindings = new Map<WorkpieceId, string>();
-  // The earliest still-undecided creation card; holds the compaction boundary behind it
-  // (findProtectedFromSequence), since compacting the card away would orphan the injection.
-  let pendingCreationSequence: number | undefined;
-
   // Track which files have been read in this session, per workpiece by filename. Edits
   // aren't allowed before reading. The value is the commit an unpinned read observed
   // (AiToolCall.observedCommit), or undefined for reads served from the session content;
@@ -1992,8 +1966,6 @@ export async function runAgent(
                   if (isCreatedResourceSuccess(toolCall.output)) {
                     chatBindings.set(toolCall.input.bindingName,
                         {type: "workpiece", id: toolCall.output.gatekeeperId});
-                    createdResourceBindings.set(
-                        toolCall.output.gatekeeperId, toolCall.input.bindingName);
                     toolOutput = {text: jsonToolResultText(toolCall.output)};
                   } else {
                     toolOutput = {text: toolCall.output};
@@ -2275,44 +2247,11 @@ export async function runAgent(
         break;
       }
 
-      case "action": {
-        // A created gatekeeper's first action card is its creation; inject the user's decision
-        // so the recorded tool result's "does not exist yet" stops being the model's last word.
-        // First-encounter delete keeps later edit-action cards silent; a fresh replay re-derives
-        // the map, so a decision made after this turn is injected next time.
-        if (createdResourceBindings.size === 0) break;
-        let info = hooks.getActionState(msg.actionId);
-        if (info === undefined) break;
-        let name = createdResourceBindings.get(info.gatekeeperId);
-        if (name === undefined) break;
-        createdResourceBindings.delete(info.gatekeeperId);
-        if (info.state === "approved") {
-          modelMessages.push({
-            role: "user",
-            content: `The user approved the creation of env.${name}.` +
-                (info.resourceUrl !== undefined
-                    ? ` The resource now exists at ${info.resourceUrl}.` : ``),
-            timestamp: msgTimestamp,
-          });
-        } else if (info.state === "rejected") {
-          modelMessages.push({
-            role: "user",
-            content: `The user rejected the creation of env.${name}; it will not be created ` +
-                `at the provider. Do not retry; wait for the user to tell you how to proceed.`,
-            timestamp: msgTimestamp,
-          });
-        } else {
-          // Still undecided: nothing to inject yet, so keep this card out of compaction until
-          // the decision lands (once injected, the summary absorbs it — the projection is built
-          // from these same model messages).
-          pendingCreationSequence ??= msg.sequence;
-        }
-        break;
-      }
-
+      case "action":
       case "useGadget":
       case "error":
-        // No need to tell the agent about this.
+        // No need to tell the agent about this. (A creation action's decision reaches the model
+        // as a durable agentNudge appended when the user decides — see nudgeCreationDecision.)
         break;
 
       default:
@@ -2627,7 +2566,7 @@ export async function runAgent(
   if (compactionTurn || shouldCompactChat(contextTokens, inputBudget)) {
     let compactedTo = findCompactionBoundary(
         projection, inputBudget, contextTokens,
-        checkpoint?.compactedTo, findProtectedFromSequence(chatMessages, pendingCreationSequence));
+        checkpoint?.compactedTo, findProtectedFromSequence(chatMessages));
     compactedTo = protectRetainedReverts(compactedTo, chatMessages, checkpoint?.compactedTo);
     if (compactedTo !== undefined) {
       emitStreamEvent({type: "compacting"});
@@ -3383,21 +3322,19 @@ export async function runAgent(
             return toolResult(message, { output: message });
           }
 
-          let result = await hooks.createExternalResource(chatId, input, initiator);
-          if (!result.created) {
+          let output = await hooks.createExternalResource(chatId, input, initiator);
+          if (!isCreatedResourceSuccess(output)) {
             // Fixable rejection: recorded as the string output, no binding was made.
-            return toolResult(result.message, { output: result.message });
+            return toolResult(output, { output });
           }
 
           // The binding is live immediately — no user gate (contrast requestConnection). The
           // creation action's card rides the step's captured actions like any other action.
-          chatBindings.set(input.bindingName, {type: "workpiece", id: result.gatekeeperId});
+          chatBindings.set(input.bindingName, {type: "workpiece", id: output.gatekeeperId});
 
           // Persist the full result as the tool's recorded output: replay can't re-run a
           // creation tool, so it re-establishes the binding (and the exact text the model saw)
           // from this recorded value instead.
-          let output = {gatekeeperId: result.gatekeeperId, resourceUrl: result.resourceUrl,
-                        message: result.message};
           return toolResult(jsonToolResultText(output), {output} as Partial<AiToolCall>);
         } catch (error) {
           toolCallNotes.set(toolCallId, { error: toolErrorText(error) });
