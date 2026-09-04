@@ -383,8 +383,14 @@ export class CredentialCoordinator<Creds> {
       return "superseded";
     } catch (error) {
       // A reconnect landing while the mint failed replaced the rejected grant; it wins whatever
-      // the mint died of.
-      if (this.identity() !== identity) return "superseded";
+      // the mint died of — logged, since this branch is the mint error's only account-side trace.
+      if (this.identity() !== identity) {
+        logger.warn("credential rejection heal overtaken", {
+          event: "credentials.rejection.heal.overtaken",
+          error,
+        });
+        return "superseded";
+      }
       if (isCredentialsExpired(error)) {
         await notified(options.notify);
         return "expired";
