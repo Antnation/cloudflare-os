@@ -183,6 +183,19 @@ describe("compaction boundary", () => {
     expect(findProtectedFromSequence(pending)).toBe(1);
   });
 
+  // An undecided createExternalResource card anchors the decision injection, so the boundary
+  // stays behind it from the start of the turn that created it.
+  it("protects a pending creation action card", () => {
+    let messages: AiChatMessage[] = [
+      message(0, user, "hi"),
+      message(1, user, "create a doc"),
+      record(2, agent, {type: "action", actionId: 7}),
+      message(3, user, "continue"),
+    ];
+    expect(findProtectedFromSequence(messages, 2)).toBe(1);
+    expect(findProtectedFromSequence(messages)).toBeUndefined();
+  });
+
   it("keeps complete recent turns within the 30 percent target", () => {
     let messages = [
       message(0, user, "a".repeat(40_000)),

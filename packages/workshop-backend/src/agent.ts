@@ -1385,6 +1385,9 @@ export async function runAgent(
   // gatekeeper's first action card (its creation) replays, the user's decision is injected as
   // a message (cf. the connectionRequest state replay).
   let createdResourceBindings = new Map<WorkpieceId, string>();
+  // The earliest still-undecided creation card; holds the compaction boundary behind it
+  // (findProtectedFromSequence), since compacting the card away would orphan the injection.
+  let pendingCreationSequence: number | undefined;
 
   // Track which files have been read in this session, per workpiece by filename. Edits
   // aren't allowed before reading. The value is the commit an unpinned read observed
@@ -2298,6 +2301,11 @@ export async function runAgent(
                 `at the provider. Do not retry; wait for the user to tell you how to proceed.`,
             timestamp: msgTimestamp,
           });
+        } else {
+          // Still undecided: nothing to inject yet, so keep this card out of compaction until
+          // the decision lands (once injected, the summary absorbs it — the projection is built
+          // from these same model messages).
+          pendingCreationSequence ??= msg.sequence;
         }
         break;
       }
@@ -2619,7 +2627,7 @@ export async function runAgent(
   if (compactionTurn || shouldCompactChat(contextTokens, inputBudget)) {
     let compactedTo = findCompactionBoundary(
         projection, inputBudget, contextTokens,
-        checkpoint?.compactedTo, findProtectedFromSequence(chatMessages));
+        checkpoint?.compactedTo, findProtectedFromSequence(chatMessages, pendingCreationSequence));
     compactedTo = protectRetainedReverts(compactedTo, chatMessages, checkpoint?.compactedTo);
     if (compactedTo !== undefined) {
       emitStreamEvent({type: "compacting"});

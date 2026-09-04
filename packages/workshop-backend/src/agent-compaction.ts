@@ -201,12 +201,17 @@ export function legacyChatBaseVersion(
 /**
  * Earliest turn a checkpoint cannot absorb, or undefined if none. A pending connection request
  * carries live accept/deny state that only its own message can answer, so the boundary stays behind
- * it. Provisional gadget creations and binding additions need no such protection: the checkpoint
- * records them, and the registry rows they name are untouched by compaction.
+ * it. The same holds for an undecided createExternalResource action: its card is where the replay
+ * injects the user's eventual decision, so the caller passes the card's sequence
+ * (`pendingCreationSequence`, located during replay) until the decision lands. Provisional gadget
+ * creations and binding additions need no such protection: the checkpoint records them, and the
+ * registry rows they name are untouched by compaction.
  */
-export function findProtectedFromSequence(messages: AiChatMessage[]): number | undefined {
-  let protectedIndex = messages.findIndex(
-      message => message.type === "connectionRequest" && message.state === "pending");
+export function findProtectedFromSequence(
+    messages: AiChatMessage[], pendingCreationSequence?: number): number | undefined {
+  let protectedIndex = messages.findIndex(message =>
+      (message.type === "connectionRequest" && message.state === "pending") ||
+      (pendingCreationSequence !== undefined && message.sequence >= pendingCreationSequence));
   if (protectedIndex < 0) return undefined;
 
   // Protect from the start of the turn that raised it, so the tail keeps the exchange explaining
