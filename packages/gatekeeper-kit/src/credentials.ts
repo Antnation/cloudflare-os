@@ -359,6 +359,9 @@ export class CredentialSource<Creds> {
   readonly #replays = new SingleFlight<CredentialsWithIdentity<Creds>>();
   #generation: string | undefined;
   #identity: string | undefined;
+  // Generation of the last unfenced adoption. Never cleared: crossings must stay recordable
+  // across the authority clears that precede exactly the adoptions that observe them.
+  #seen: string | undefined;
   // Bounded by account commits per activation; eviction is unsafe against out-of-order stale reports.
   readonly #dead = new Set<string>();
   // Generations proven superseded by an observed crossing; bounded by reconnects per activation.
@@ -491,11 +494,14 @@ export class CredentialSource<Creds> {
    * @param cause Provider rejection being resolved.
    */
   async #adjudicate(identity: string, cause: unknown): Promise<never> {
+    // Drop at the ask: the rejection already proves this snapshot cannot vouch, whichever way
+    // the answer goes — dead, its partition could serve the next principal stale data on a hit;
+    // superseded, it no longer vouches for the current principal — so cache-first readers bypass
+    // during the round trip instead of serving the rejected partition. Drop again on the answer:
+    // the account keeps serving the grant until an accepted verdict, so a read landing meanwhile
+    // may re-adopt it, and the death mark itself must wait for the account's word.
+    this.#supersede();
     const verdict = await this.#note(identity);
-    // Ask first, then clear and fence in one synchronous transition — a read resolving during the
-    // answer would slip an adoption between a clear and a later fence. Either way the answer goes,
-    // the authority drops: dead, its partition could serve the next principal stale data on a hit;
-    // superseded, this snapshot no longer vouches for the current principal.
     if (verdict === "superseded") {
       this.#supersede();
       throw this.#changed(cause);
@@ -513,21 +519,13 @@ export class CredentialSource<Creds> {
   /**
    * @param generation Connection generation of a caller's read.
    * @returns Whether that read is proven superseded — a newer generation adopted since it, or its
-   * own observed crossed by a refresh. The crossed set is knowledge, not absence.
+   * own observed crossed. An unknown authority alone is no proof (it cannot outrank the read's
+   * own fetch), and neither is the last-seen generation: a fenced read can be newer than it, so
+   * `#seen` only ever records, never refuses.
    */
   #moved(generation: string): boolean {
-    return this.#crossed.has(generation) || this.#adoptedOther(generation) !== undefined;
-  }
-
-  /**
-   * @param generation Connection generation to compare with the adopted authority.
-   * @returns The adopted generation when the two differ — an observed crossing — or `undefined`
-   * when they match or the authority is unknown, which alone is no evidence: it cannot outrank
-   * the read's own fetch.
-   */
-  #adoptedOther(generation: string): string | undefined {
-    const adopted = this.#generation;
-    return adopted !== undefined && adopted !== generation ? adopted : undefined;
+    return this.#crossed.has(generation)
+      || (this.#generation !== undefined && this.#generation !== generation);
   }
 
   /**
@@ -593,10 +591,13 @@ export class CredentialSource<Creds> {
     // read resolving a reconnect: generations are opaque and equality-only, so a fenced response
     // cannot prove itself newest — authority stays the last unfenced fetch.
     if (fence === this.#clearFence && !this.#dead.has(current.identity)) {
-      // An adoption replacing a different generation observed a crossing: record it, so the
-      // evidence outlives a later authority clear.
-      const crossed = this.#adoptedOther(current.generation);
-      if (crossed !== undefined) this.#crossed.add(crossed);
+      // Unfenced adoptions serialize, so adopting past a different last-seen generation is an
+      // observed crossing. Compared against #seen, not the authority: a clear between the two
+      // adoptions would otherwise take the evidence with it.
+      if (this.#seen !== undefined && this.#seen !== current.generation) {
+        this.#crossed.add(this.#seen);
+      }
+      this.#seen = current.generation;
       this.#generation = current.generation;
       this.#identity = current.identity;
     }

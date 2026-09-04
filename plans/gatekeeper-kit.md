@@ -1642,32 +1642,35 @@ stays — and the crossed generation is recorded wherever a crossing is observed
 result (checked before the dead shortcut — a dead mint carries the same evidence), by the
 post-refresh supersession refusal itself (an adoption landing mid-refresh preempts the result's
 own recording), or by a plain
-read's adoption replacing a different defined generation (a set beside the dead identities,
+read's adoption replacing a different last-seen generation (a set beside the dead identities,
 bounded by reconnects per activation), since clearing the authority alone would destroy the
-evidence a delayed old-generation mint held by another in-flight read is refused on. One window
-is accepted rather than tracked: an adoption from an unknown authority proves nothing about
-generations it never saw, so a read predating two grant deaths straddling a reconnect can still
-replay a delayed same-generation mint — one uncached result under the caller's own fetched
-principal, every failure path terminating truthfully (lag, not poisoning); closing it would need
-adoption-order tracking — a per-source monotonic clock, disproportionate to the corner and prone
-to over-refusing reads adopted after the reconnect but captured before the observation lands. A
+evidence a delayed old-generation mint held by another in-flight read is refused on. The
+comparison rides the last-seen generation, not the clearable authority: unfenced adoptions
+serialize, so it is ordered, and it survives the clears that precede exactly the adoptions that
+observe crossings — an adoption from an unknown authority still records what it superseded, so
+two clears straddling a reconnect no longer reopen the window. Last-seen only records, never
+refuses: consulting it from the supersession check would over-refuse, since a fenced read can be
+newer than it. What remains accepted: a generation no unfenced adoption ever carried leaves no
+record beyond the refusal sites, so reads fenced out at their own fetch can, in a corner of that
+corner, still replay a delayed same-generation mint — lag under the caller's own fetched
+principal, not poisoning, and closing it would take the adoption-order tracking already judged
+disproportionate. A
 channel-confirmed
 expiry under an unmoved generation takes the death fences. Identity succession is the account's to adjudicate: `noteCredentialsExpired` answers
 whether the reported identity is still its current one — an adjudication of identity, never of
 notification delivery, whose latch deliberately stays unset on a failed callback so a later expiry
-re-notifies (returning that failure would mask a dead grant as superseded) — asked first, with the
-clear and fences landing as one synchronous
-transition after the answer, so a read resolving mid-adjudication cannot outlive the verdict —
-and an explicit `"superseded"` resolves as the fixed retry message with the authority
-dropped to unknown, because a snapshot the account just called stale cannot vouch for the current
-principal on a cache hit (§4.10). The deliberate costs: a stale mint may spend one provider call
-before the account's verdict lands; the rejected authority serves hits for the one round-trip the
-answer takes (it served them right up to the rejection anyway — fencing before the ask was
-considered and rejected: mid-ask reads re-adopt the grant the account still serves, forcing a
-second post-answer transition regardless, and the bypass converts bounded stale hits into a storm
-of guaranteed 401 misses); and any adjudicated rejection
-costs a cache-bypass window until the next read re-establishes the partition — never a lasting
-authority the source cannot stand behind.
+re-notifies (returning that failure would mask a dead grant as superseded). The rejected
+authority drops at the ask: the rejection already proves the snapshot cannot vouch whichever way
+the answer goes — dead, its partition could serve the next principal stale data on a hit;
+superseded, it no longer vouches for the current principal (§4.10) — so cache-first readers
+bypass during the round trip instead of serving the rejected partition. It drops again with the
+fences at the verdict, because a read landing mid-ask re-adopts the grant the account still
+serves — the second drop is why that re-adoption cannot outlive the answer, and the death mark
+itself waits for an accepted one. An explicit `"superseded"` resolves as the fixed retry message
+with the authority left unknown. The deliberate costs: a stale mint may spend one provider call
+before the account's verdict lands; cache-first readers miss for the round trips the answer
+takes; and any adjudicated rejection costs a cache-bypass window until the next read
+re-establishes the partition — never a lasting authority the source cannot stand behind.
 Replays coalesce per rejected read, never per identity — an identity-keyed flight would replay to
 one caller credentials another already saw rejected, expiring a still-refreshable grant. The
 coalescing covers overlapping attempts only: the flight releases when the mint settles, so a run
@@ -2378,15 +2381,18 @@ Each step leaves the tree building; tests land with the module they cover. Nothi
    meanwhile stays, and marks the crossed generation — recorded from the refresh result before
    the dead shortcut (a dead mint carries the same evidence), by the post-refresh supersession
    refusal itself, and at a plain read's adoption over
-   a different defined generation — so a delayed old-generation mint held by another run is
+   a different last-seen generation (retained across authority clears, so an adoption from an
+   unknown authority still records) — so a delayed old-generation mint held by another run is
    refused unreplayed; a channel-confirmed expiry under an unmoved generation
    takes the death fences
    against a read still in flight;
    a rejection under a grant already reported dead — or a refresh resolving to one — reports
    without minting or replaying, unless the read is itself proven superseded, which resolves as
-   the retry message first; the account's `noteCredentialsExpired` answer decides — asked
-   before any state moves, so an identity adopted while the answer was pending never outlives the
-   verdict, and an explicit `"superseded"` resolves as the retry message with the authority
+   the retry message first; the account's `noteCredentialsExpired` answer decides — the rejected
+   authority drops at the ask (cache-first readers bypass during the round trip instead of
+   serving the rejected partition) and drops again at the verdict, so an identity adopted while
+   the answer was pending never outlives it, with the death mark waiting for an accepted answer,
+   and an explicit `"superseded"` resolves as the retry message with the authority
    dropped to unknown; and distinct rejected reads refresh separately while overlapping refreshes for one
    read coalesce — one that settles first releases the flight, and a later rejection re-enters the
    channel, whose account RPC dedupes against the rejected credentials.
