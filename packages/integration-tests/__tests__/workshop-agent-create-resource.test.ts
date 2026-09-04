@@ -102,7 +102,7 @@ const model = scriptedChatCompletions([
   },
   { text: "The doomed thing is gone." },
 ]);
-const network = new NetworkInterceptor([model.handler]);
+const network = new NetworkInterceptor({ handlers: [model.handler] });
 
 beforeAll(async () => {
   network.install();
