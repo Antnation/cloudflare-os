@@ -1934,7 +1934,7 @@ export interface AuthStrategy<Creds, E extends KitEnv = KitEnv> {
   obtain(ctx: { env: E; baseUrl: string; payload: unknown; metadata: AttemptMetadata;
     kv }): Promise<Creds>;
   refresh?(creds: Creds, ctx: { env: E }): Promise<Creds>;   // CredentialsExpiredError on grant death only
-  healRejection?(creds: Creds, ctx: { env: E }): Promise<Creds>;  // mints past a rejected-but-current
+  heal?(creds: Creds, ctx: { env: E }): Promise<Creds>;  // mints past a rejected-but-current
                                              // bearer (adjudicateRejection's refresh, §5.6); absent = grant death
   revoke?(creds: Creds, ctx: { env: E }): Promise<void>;
   isAuthError(error: unknown): boolean;      // runtime API classification (CredentialSource.run)
@@ -1979,7 +1979,7 @@ export function oauth2<Creds, E extends KitEnv = KitEnv>(config: {
   pkce?: boolean;                                        // S256; verifier lives in the strategy's kv view, keyed by state
   exchange(ctx: { code: string; redirectUri: string; client: { id: string; secret: string };
     env: E; codeVerifier?: string; requestedScopes?: string[] }): Promise<Creds>;
-  refresh?; healRejection?; revoke?; isAuthError; expiredMessage; expiresAt?; refreshSkewMs?;
+  refresh?; heal?; revoke?; isAuthError; expiredMessage; expiresAt?; refreshSkewMs?;
   legacyKeys?: readonly string[];
   upgradeStoredCredentials?;
 }): AuthStrategy<Creds, E>;
@@ -2088,11 +2088,11 @@ Public loopback-RPC methods and their sequencing:
   projection is not optional — see below.**
 - `reportCredentialsRejected(identity)` — delegates to
   `coordinator.adjudicateRejection(identity, { refresh, notify })` with the same `notify` and
-  `refresh = strategy.healRejection` (§5.2), the *explicit* rejection-heal callback. Presence of
+  `refresh = strategy.heal` (§5.2), the *explicit* rejection-heal callback. Presence of
   `strategy.refresh` must not be the discriminator: it is the proactive expiry refresh, and a
   provider can define it while a 401 on a current, unexpired bearer still means grant death
   (supabase) — inferring would spend a doomed mint to answer what the grant-death path answers
-  directly. A derived-bearer strategy whose heal *is* its refresh wires `healRejection: refresh`
+  directly. A derived-bearer strategy whose heal *is* its refresh wires `heal: refresh`
   deliberately; grant-death providers leave it unset. The
   moved-past gate answers `"superseded"` without notifying (a stale reporter lost the race to a
   reconnect or a sibling's heal); a current identity heals through the fence-keyed `rotate()` or,

@@ -199,7 +199,9 @@ export class CredentialCoordinator<Creds> {
   }
 
   /**
-   * Publishes credentials behind a new identity fence.
+   * Publishes credentials behind a new identity fence. Fence first: a torn write may only lie
+   * toward `"superseded"` (one doomed retry), never leave a stale identity fronting fresh
+   * credentials, where the identity match gating `"expired"` would falsely retire a live grant.
    * @param credentials Credentials to store.
    */
   #commit(credentials: Creds): void {
