@@ -1931,6 +1931,8 @@ export interface AuthStrategy<Creds, E extends KitEnv = KitEnv> {
   obtain(ctx: { env: E; baseUrl: string; payload: unknown; metadata: AttemptMetadata;
     kv }): Promise<Creds>;
   refresh?(creds: Creds, ctx: { env: E }): Promise<Creds>;   // CredentialsExpiredError on grant death only
+  healRejection?(creds: Creds, ctx: { env: E }): Promise<Creds>;  // mints past a rejected-but-current
+                                             // bearer (adjudicateRejection's refresh, §5.6); absent = grant death
   revoke?(creds: Creds, ctx: { env: E }): Promise<void>;
   isAuthError(error: unknown): boolean;      // runtime API classification (CredentialSource.run)
   expiredMessage: string;
@@ -2082,8 +2084,13 @@ Public loopback-RPC methods and their sequencing:
   preservation at the first port. Any other refresh error rethrows with credentials intact. **The
   projection is not optional — see below.**
 - `reportCredentialsRejected(identity)` — delegates to
-  `coordinator.adjudicateRejection(identity, { refresh, notify })` with the same `notify` and, for
-  derived-bearer providers, `refresh = strategy.refresh` (grant-death providers pass none): the
+  `coordinator.adjudicateRejection(identity, { refresh, notify })` with the same `notify` and
+  `refresh = strategy.healRejection` (§5.2), the *explicit* rejection-heal callback. Presence of
+  `strategy.refresh` must not be the discriminator: it is the proactive expiry refresh, and a
+  provider can define it while a 401 on a current, unexpired bearer still means grant death
+  (supabase) — inferring would spend a doomed mint to answer what the grant-death path answers
+  directly. A derived-bearer strategy whose heal *is* its refresh wires `healRejection: refresh`
+  deliberately; grant-death providers leave it unset. The
   moved-past gate answers `"superseded"` without notifying (a stale reporter lost the race to a
   reconnect or a sibling's heal); a current identity heals through the fence-keyed `rotate()` or,
   on confirmed death, notifies via `notifyCredentialsExpiredOnce` with `vendorId = spec.id` and
@@ -2154,27 +2161,18 @@ staleness contract moved to `adjudicateRejection`'s doc):
 
 The composition the original deferral assumed —
 `run(creds => withAuthRetry(...))` — routed the refresh around the reporter, so a rotating grant's
-expiry was unreportable (§4.13). How the design notes above resolved:
+expiry was unreportable (§4.13). The kernels of its design notes that survive the collapse, in
+the protocol's current vocabulary:
 
-- **Required method → presence-gated local option.** An optional method on the RPC stub cannot be
+- **Presence over required surface.** An optional method on an RPC stub cannot be
   presence-checked (stubs are proxies that answer every property), and a required one is dead
-  surface for the five grant-death providers. A local option is both checkable and omittable:
-  absent, `replayable` throws at the call — for a derived-bearer port an unwired channel would
-  report a routine stale-bearer rejection as grant death, so the misconfiguration surfaces at
-  first use instead of in production; grant-death providers simply do not pass the flag. The
-  remaining trust point is documented on the option: a wired channel that re-serves a rejected
-  cached bearer retires a healthy grant, and the source cannot verify freshness for generic creds.
-- **`staleBearer` → the whole rejected read.** `refreshCredentials(rejected)` receives
-  `{ creds, identity, generation }`: the creds for google-style redundant-mint skipping
-  (`google.ts:556`), the identity for the account's grant gate. The "identity is unobtainable"
-  objection applied to the withAuthRetry wiring; the source holds it and passes it itself.
-- **Expiry gates first.** Unchanged (`google.ts:555`); it is the channel implementation's
-  obligation.
-- **`AccountCredentialStub` stays unwidened.** The channel lives on `CredentialSourceOptions`.
-  `noteCredentialsExpired` did change shape — `Promise<void>` → `Promise<ExpiryVerdict>`
-  (`"accepted" | "superseded"`), the account's authoritative verdict on the reported identity —
-  but that is a return on an existing required method, not the optional method a proxy stub cannot
-  presence-check.
+  surface for the five grant-death providers — which is why the heal is a local callback on
+  `adjudicateRejection`, never a stub method. The old safety throw (`replayable` without a wired
+  channel) is gone with the channel: an unwired heal now answers a current-identity rejection
+  `"expired"` honestly, so a grant-death port passing `replayable` is harmless (§4.13).
+- **The port's mint logic stays the port's.** Redundant-mint skipping (`google.ts:556`) and the
+  expiry gate (`google.ts:555`) live inside the port's `refresh` callback; the identity the old
+  channel had to be handed is the report's own argument, adjudicated account-side.
 - **Interaction with the fencing row (§4.8).** Still open. One constraint discovered here narrows
   it, restated in the protocol's current form: the source refuses a retry whose refetch crossed a
   connection generation (a reconnect — possibly a different principal) and rethrows as

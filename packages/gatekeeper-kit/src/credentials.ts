@@ -420,7 +420,10 @@ export type AccountCredentialStub<Creds> = {
    * Reads current credentials, refreshing as needed. `CredentialCoordinator.snapshot` is the
    * reference implementation; a hand-written stub owns the triple's atomicity — no credential
    * change may land between the three reads.
-   * @returns Current credentials, their identity fence, and their connection generation.
+   * @returns Current credentials, their identity fence, and their connection generation. The
+   * identity is never `""` — that value is reserved for a never-connected read and always
+   * adjudicates `"superseded"`, so serving live credentials under it wedges every rejection
+   * as retryable.
    * @throws On confirmed expiry, an error named `CredentialsExpiredError` — the transport may strip
    * the class, so the name is the contract the source drops its cache authority on.
    */
