@@ -1,4 +1,4 @@
-import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, AiChatStreamEvent, BlueprintOutput, ChatGadgetPin, ChatCodeBase, WorkpieceId, type AiModelConfig, isTextLikeAttachmentMimeType, validateBindingName } from '@gadgets/workshop-shared/api';
+import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, AiChatStreamEvent, BlueprintOutput, ChatGadgetPin, ChatCodeBase, WorkpieceId, type ActionState, type AiModelConfig, isTextLikeAttachmentMimeType, validateBindingName } from '@gadgets/workshop-shared/api';
 import { applyCodeChange, codeChangeSerializedSize, replaceSpanChange, type CodeContent,
   type CodeChange, type FileChange } from '@gadgets/workshop-shared/code-change';
 import { PDF_MIME_TYPE, modelApiSupportsPdfAttachments } from './chat-attachment-pdf';
@@ -586,6 +586,15 @@ export interface AgentHooks {
    * falls back to reconstructing the message from the client-visible record.
    */
   getChatModelData(chatId: number, sequence: number): StoredAssistantMessage | undefined;
+
+  /**
+   * Current resolution of an action record, plus its gatekeeper's live resource URL (absent while
+   * the resource is still provisional, or the gatekeeper is gone). Replay uses this to tell the
+   * model how a createExternalResource creation was decided — the recorded tool result
+   * permanently says the resource doesn't exist yet.
+   */
+  getActionState(actionId: number)
+      : {gatekeeperId: WorkpieceId, state: ActionState, resourceUrl?: string} | undefined;
 
   /**
    * Record an observation in the Overseer audit log on behalf of a built-in agent tool
@@ -1371,6 +1380,12 @@ export async function runAgent(
   // tool-call message).
   let pendingReplayEdits: ReplayPendingEdit[] = [];
 
+  // Gatekeepers minted by createExternalResource in this chat, id → env name. Their recorded
+  // tool results permanently claim the resource doesn't exist yet, so when a created
+  // gatekeeper's first action card (its creation) replays, the user's decision is injected as
+  // a message (cf. the connectionRequest state replay).
+  let createdResourceBindings = new Map<WorkpieceId, string>();
+
   // Track which files have been read in this session, per workpiece by filename. Edits
   // aren't allowed before reading. The value is the commit an unpinned read observed
   // (AiToolCall.observedCommit), or undefined for reads served from the session content;
@@ -1977,6 +1992,8 @@ export async function runAgent(
                   } else {
                     chatBindings.set(toolCall.input.bindingName,
                         {type: "workpiece", id: toolCall.output.gatekeeperId});
+                    createdResourceBindings.set(
+                        toolCall.output.gatekeeperId, toolCall.input.bindingName);
                     toolOutput = {text: jsonToolResultText(toolCall.output)};
                   }
                   break;
@@ -2256,7 +2273,36 @@ export async function runAgent(
         break;
       }
 
-      case "action":
+      case "action": {
+        // A created gatekeeper's first action card is its creation; inject the user's decision
+        // so the recorded tool result's "does not exist yet" stops being the model's last word.
+        // First-encounter delete keeps later edit-action cards silent; a fresh replay re-derives
+        // the map, so a decision made after this turn is injected next time.
+        if (createdResourceBindings.size === 0) break;
+        let info = hooks.getActionState(msg.actionId);
+        if (info === undefined) break;
+        let name = createdResourceBindings.get(info.gatekeeperId);
+        if (name === undefined) break;
+        createdResourceBindings.delete(info.gatekeeperId);
+        if (info.state === "approved") {
+          modelMessages.push({
+            role: "user",
+            content: `The user approved the creation of env.${name}.` +
+                (info.resourceUrl !== undefined
+                    ? ` The resource now exists at ${info.resourceUrl}.` : ``),
+            timestamp: msgTimestamp,
+          });
+        } else if (info.state === "rejected") {
+          modelMessages.push({
+            role: "user",
+            content: `The user rejected the creation of env.${name}; it will not be created ` +
+                `at the provider. Do not retry; wait for the user to tell you how to proceed.`,
+            timestamp: msgTimestamp,
+          });
+        }
+        break;
+      }
+
       case "useGadget":
       case "error":
         // No need to tell the agent about this.

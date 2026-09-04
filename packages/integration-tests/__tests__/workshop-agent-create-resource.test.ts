@@ -185,6 +185,16 @@ function toolResultShownToModel(toolCallId: string): string {
   throw new Error(`The model never saw a tool result for ${toolCallId}`);
 }
 
+/** All user-role message contents in the model's most recent request. */
+function userMessagesShownToModel(): string[] {
+  const request = model.requests[model.requests.length - 1] as {
+    messages?: Array<{ role: string; content?: string }>;
+  };
+  return (request.messages ?? [])
+      .filter(message => message.role === "user")
+      .map(message => message.content ?? "");
+}
+
 it("creates a resource the agent can use before the user approves it", async () => {
   using publicApi = connect(harness.url);
   using authenticated = await signUpScriptedUser(publicApi, "createres");
@@ -229,6 +239,12 @@ it("creates a resource the agent can use before the user approves it", async () 
   });
   expect(write.resourceUrl).toContain("/things/created-");
   expect(write.resourceUrl).not.toContain("provisional");
+
+  // Replay told the model about the approval — the recorded tool result permanently says the
+  // resource doesn't exist yet, so without this the model's context never learns it now does.
+  const approval = userMessagesShownToModel().find(message =>
+    message.includes("The user approved the creation of env.NEW_THING"));
+  expect(approval).toContain(write.resourceUrl);
 });
 
 it("kills the binding when the user rejects the creation", async () => {
@@ -247,6 +263,10 @@ it("kills the binding when the user rejects the creation", async () => {
   await waitForAgentSays(workspace, chatId, "The doomed thing is gone.");
   expect(toolResultShownToModel("read-doomed")).toContain("DEAD:");
   expect(toolResultShownToModel("read-doomed")).toMatch(/rejected/);
+
+  // Replay told the model about the rejection too.
+  expect(userMessagesShownToModel().some(message =>
+    message.includes("The user rejected the creation of env.DOOMED"))).toBe(true);
 });
 
 it("settles the queued action when the vendor fails after queueing it", async () => {

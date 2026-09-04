@@ -8625,6 +8625,18 @@ class OverseerImpl implements AgentHooks {
         `${keyString(chatId)}.${keyString(sequence)}`)?.message;
   }
 
+  getActionState(actionId: number)
+      : {gatekeeperId: WorkpieceId, state: ActionState, resourceUrl?: string} | undefined {
+    let action = this.storage.actions.get(actionId);
+    if (!action) return undefined;
+    let gatekeeper = this.storage.gatekeepers.get(action.gatekeeperId);
+    return {
+      gatekeeperId: action.gatekeeperId,
+      state: action.state,
+      resourceUrl: gatekeeper?.provisional ? undefined : gatekeeper?.resourceUrl,
+    };
+  }
+
   // Adds an inference cost (in dollars) to a chat's running total and the workspace-wide total.
   #addChatCost(chatId: number, cost: number) {
     let meta = this.storage.chatMeta.get(chatId);
