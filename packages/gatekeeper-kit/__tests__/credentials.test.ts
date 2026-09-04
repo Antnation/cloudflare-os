@@ -671,6 +671,24 @@ describe("CredentialCoordinator", () => {
       expect(instance.stored()?.token).toBe("reconnected");
     });
 
+    it("lets a reconnect racing the heal win when the mint fails for other reasons", async () => {
+      const instance = coordinator(makeKv());
+      instance.connect(stale);
+      const rejected = instance.identity();
+      const mint = Promise.withResolvers<Creds>();
+
+      const adjudicating = instance.adjudicateRejection(rejected, {
+        refresh: () => mint.promise, ...notifyless,
+      });
+      instance.connect({ token: "reconnected", expiresAt: live.expiresAt });
+      mint.reject(new Error("502 from token endpoint"));
+
+      // The rejected identity is demonstrably superseded; unavailable would hand the caller its
+      // original 401 right after the user reconnected.
+      await expect(adjudicating).resolves.toBe("superseded");
+      expect(instance.stored()?.token).toBe("reconnected");
+    });
+
     it("collapses concurrent heals of one identity onto one mint", async () => {
       const instance = coordinator(makeKv());
       instance.connect(stale);

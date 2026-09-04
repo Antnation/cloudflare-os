@@ -379,9 +379,10 @@ export class CredentialCoordinator<Creds> {
       // identity is no longer current.
       return "superseded";
     } catch (error) {
+      // A reconnect landing while the mint failed replaced the rejected grant; it wins whatever
+      // the mint died of.
+      if (this.identity() !== identity) return "superseded";
       if (isCredentialsExpired(error)) {
-        // A reconnect landing while the mint failed replaced the rejected grant; it wins.
-        if (this.identity() !== identity) return "superseded";
         await notified(options.notify);
         return "expired";
       }
