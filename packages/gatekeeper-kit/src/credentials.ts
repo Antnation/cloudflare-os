@@ -534,9 +534,10 @@ export class CredentialSource<Creds> {
    * concurrent fetch can move mid-operation.
    * @param options `replayable` marks the operation safe to execute twice: a `"superseded"`
    * verdict — the rejected credential was already replaced, or the account just healed past it —
-   * retries the operation once with freshly fetched credentials. Without the flag the same
-   * verdict throws `CredentialsChangedError` and the caller re-enters. The operation runs at
-   * most twice either way.
+   * retries the operation once with freshly fetched credentials, as does a same-generation
+   * successor the source already adopted (no ask spent). Without the flag the same verdict
+   * throws `CredentialsChangedError` and the caller re-enters. The operation runs at most twice
+   * either way.
    * @returns The provider operation result.
    * @throws `CredentialsExpiredError` (carrying the configured `expiredMessage`) on the account's
    * `"expired"` verdict; `CredentialsChangedError` when the rejection was stale and re-entering
@@ -548,14 +549,27 @@ export class CredentialSource<Creds> {
     operation: (credentials: Creds, read: CredentialRead) => Promise<T>,
     options: { replayable?: boolean } = {},
   ): Promise<T> {
-    const first = await this.#current();
+    return this.#attempt(operation, await this.#current(), options.replayable === true);
+  }
+
+  /**
+   * Executes one attempt under one read, resolving a credential rejection by the account's verdict.
+   * @param operation Provider call being attempted.
+   * @param read The read this attempt runs under.
+   * @param retry Whether a superseded rejection may retry — false on the second attempt.
+   * @returns The operation result.
+   */
+  async #attempt<T>(
+    operation: (credentials: Creds, read: CredentialRead) => Promise<T>,
+    read: CredentialsWithIdentity<Creds>,
+    retry: boolean,
+  ): Promise<T> {
     try {
       // A fresh object, never the internal triple: the operation may hold or mutate its read.
-      return await operation(first.creds,
-        { identity: first.identity, generation: first.generation });
+      return await operation(read.creds, { identity: read.identity, generation: read.generation });
     } catch (error) {
       if (!this.#options.isAuthError(error)) throw error;
-      return this.#resolve(operation, first, error, options.replayable === true);
+      return this.#resolve(operation, read, error, retry);
     }
   }
 
@@ -579,6 +593,10 @@ export class CredentialSource<Creds> {
     // dropped, is no successor; then the account adjudicates.
     if (this.#generation !== undefined && read.identity !== this.#identity
       && this.#identity !== undefined && !this.#dead.has(this.#identity)) {
+      // A successor under the read's own generation is a heal of the caller's principal, so a
+      // replayable operation retries under it — no ask spent, the account already moved past. A
+      // moved generation is a reconnect, and stays a re-entry.
+      if (retry && read.generation === this.#generation) return this.#retry(operation, read, cause);
       throw this.#changed(cause);
     }
     const verdict = await this.#verdict(read.identity);
@@ -613,11 +631,11 @@ export class CredentialSource<Creds> {
   }
 
   /**
-   * Retries a superseded rejection once with freshly fetched credentials. The verdict's fence
-   * bump forgot the pre-ask flight, so this is a fresh account read — and the single-threaded
-   * account answers it after the heal's commit.
+   * Retries a rejected operation once with freshly fetched credentials — after a `"superseded"`
+   * verdict, whose fence bump forgot the pre-ask flight so the single-threaded account answers
+   * the refetch after its heal's commit, or under a live successor the source already adopted.
    * @param operation Provider call being retried.
-   * @param first The read whose rejection the account answered `"superseded"`.
+   * @param first The read whose rejection resolved as superseded.
    * @param cause Provider rejection being resolved.
    * @returns The retried operation result.
    */
@@ -638,16 +656,8 @@ export class CredentialSource<Creds> {
     if (this.#dead.has(second.identity)) {
       throw new CredentialsExpiredError(this.#options.expiredMessage, { cause });
     }
-    try {
-      // The retry's own read, freshly constructed: an action fence captured from it names the
-      // credentials this attempt actually runs under.
-      return await operation(second.creds,
-        { identity: second.identity, generation: second.generation });
-    } catch (error) {
-      if (!this.#options.isAuthError(error)) throw error;
-      // At most two attempts: the second rejection is adjudicated but never retried again.
-      return this.#resolve(operation, second, error, false);
-    }
+    // At most two attempts: a second rejection is adjudicated but never retried again.
+    return this.#attempt(operation, second, false);
   }
 
   /** @returns The retryable error for credentials replaced mid-operation. */

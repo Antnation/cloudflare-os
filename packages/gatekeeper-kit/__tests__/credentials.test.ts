@@ -1137,6 +1137,29 @@ describe("CredentialSource", () => {
     expect(getCredentials).toHaveBeenCalledTimes(2);
   });
 
+  it("replays under a successor a sibling's heal already adopted, spending no ask", async () => {
+    const gate = Promise.withResolvers<void>();
+    const { instance, reportCredentialsRejected } = healingSource();
+    const operation = async (creds: Creds) => {
+      if (creds.token !== "live") return creds.token;
+      await gate.promise;
+      throw new Error("401");
+    };
+
+    const slow = instance.run(operation, { replayable: true });
+    // A sibling call heals and adopts the successor before the slow call's 401 lands.
+    expect(await instance.run(async creds => {
+      if (creds.token === "live") throw new Error("401");
+      return creds.token;
+    }, { replayable: true })).toBe("fresh");
+
+    // The stale failure resolves by replay, not by a re-entry the heal was meant to hide — and
+    // the adopted successor already answers the ask the moved-past gate would.
+    gate.resolve();
+    expect(await slow).toBe("fresh");
+    expect(reportCredentialsRejected).toHaveBeenCalledOnce();
+  });
+
   it("skips the ask when a reconnect was adopted before the rejection resolved", async () => {
     const reads = [
       { creds: live, identity: "id-a", generation: "gen-a" },
