@@ -459,6 +459,11 @@ export class TestGatekeeper
       await control(this.ctx.exports).discardAction(this.ctx.props.label, id);
       throw error;
     }
+    // Test knob: this title makes the call reject only after the action was durably queued,
+    // modeling a vendor that fails post-queue (the overseer must settle the orphaned action).
+    if (creation.title === "fail-after-queue") {
+      throw new Error("Simulated post-queue failure.");
+    }
   }
 
   /**

@@ -2502,24 +2502,8 @@ class OverseerImpl implements AgentHooks {
         }
 
         // A crash orphan: its step's message is by construction lost, so nothing in the log
-        // backs the creation (and the resumed turn may have minted a replacement). Reject its
-        // still-pending actions -- appliedAt is required, the byLastChanged resume-replay index
-        // keys on it; clearPushMarks matches rejectAction (a no-op for pushless actions) -- then
-        // remove the workpiece, all in one durable step. Rejecting first empties the queue, so
-        // removeGatekeeper's own push-mark loop is a no-op. No gatekeeper-side rejectAction RPC:
-        // the facet is deleted outright and nothing observes its internal pending state after
-        // removal (matches the submitCreationAction failure path).
-        this.storage.transaction(() => {
-          for (let action of Array.from(
-              this.storage.actions.pendingByGatekeeper.get(record.id))) {
-            if (action.type !== "action") continue;
-            action.state = "rejected";
-            action.appliedAt = new Date();
-            this.gitCache.clearPushMarks(action.id);
-            this.storage.actions.put(action);
-          }
-          this.removeGatekeeper(record.id);
-        });
+        // backs the creation (and the resumed turn may have minted a replacement).
+        this.#rejectPendingActionsAndRemoveGatekeeper(record.id);
       } catch (err) {
         this.logger.warn("failed to reap pending gatekeeper", {
           event: "gatekeeper.pending.reconcile.failed", chatId, error: err,
@@ -5461,6 +5445,26 @@ class OverseerImpl implements AgentHooks {
     }
 
     return new GatekeeperClientImpl<any>(this, id, facet, undefined, joinAs);
+  }
+
+  // Reject a gatekeeper's still-pending actions, then remove it, in one durable step -- so no
+  // pending record survives pointing at a dead gatekeeper (approve/reject would fail forever on
+  // the missing facet). appliedAt is required (the byLastChanged resume-replay index keys on it);
+  // clearPushMarks matches rejectAction (a no-op for pushless actions). Rejecting first empties
+  // the queue, so removeGatekeeper's own push-mark loop is a no-op. No gatekeeper-side
+  // rejectAction RPC: the facet is deleted outright and nothing observes its internal pending
+  // state after removal.
+  #rejectPendingActionsAndRemoveGatekeeper(id: number) {
+    this.storage.transaction(() => {
+      for (let action of Array.from(this.storage.actions.pendingByGatekeeper.get(id))) {
+        if (action.type !== "action") continue;
+        action.state = "rejected";
+        action.appliedAt = new Date();
+        this.gitCache.clearPushMarks(action.id);
+        this.storage.actions.put(action);
+      }
+      this.removeGatekeeper(id);
+    });
   }
 
   // Destroy a gatekeeper (connection) workpiece. Any binding edges pointing at it are severed so
@@ -9044,7 +9048,9 @@ class OverseerImpl implements AgentHooks {
           new ApprovalQueueImpl(this, gatekeeperId, {from: "agent", chatId}));
       await facet.submitCreationAction(queue as unknown as ApprovalQueue);
     } catch (error) {
-      this.removeGatekeeper(gatekeeperId);
+      // The facet may have queued its action durably before the RPC failed; settle it with the
+      // gatekeeper or the pending record would be unresolvable (its facet is gone).
+      this.#rejectPendingActionsAndRemoveGatekeeper(gatekeeperId);
       return { created: false, message: `Cannot create the resource: ${stringifyError(error)}` };
     }
 

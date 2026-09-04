@@ -1,6 +1,7 @@
 // createExternalResource end to end against the fixture gatekeeper: tool → binding → action card
-// → approve → describe refresh, plus the rejection path and replay across turns. (Provider depth
-// is covered by per-vendor suites, e.g. gatekeeper-google's workerd tests.)
+// → approve → describe refresh, plus the rejection path, replay across turns, and a vendor that
+// fails after queueing its creation action. (Provider depth is covered by per-vendor suites,
+// e.g. gatekeeper-google's workerd tests.)
 
 import { afterAll, beforeAll, expect, it } from "vitest";
 import type { RpcStub } from "capnweb";
@@ -101,6 +102,21 @@ const model = scriptedChatCompletions([
     },
   },
   { text: "The doomed thing is gone." },
+  // --- Test 3: the vendor fails after durably queueing its creation action; the overseer must
+  // settle the orphan instead of leaving it pending against a removed gatekeeper.
+  {
+    toolCall: {
+      id: "create-orphan",
+      name: "createExternalResource",
+      arguments: {
+        vendorId: TEST_VENDOR_ID,
+        resourceUrlPattern: RESOURCE_URL_PATTERN,
+        title: "fail-after-queue",
+        bindingName: "ORPHAN",
+      },
+    },
+  },
+  { text: "The creation failed." },
 ]);
 const network = new NetworkInterceptor({ handlers: [model.handler] });
 
@@ -231,5 +247,23 @@ it("kills the binding when the user rejects the creation", async () => {
   await waitForAgentSays(workspace, chatId, "The doomed thing is gone.");
   expect(toolResultShownToModel("read-doomed")).toContain("DEAD:");
   expect(toolResultShownToModel("read-doomed")).toMatch(/rejected/);
+});
+
+it("settles the queued action when the vendor fails after queueing it", async () => {
+  using publicApi = connect(harness.url);
+  using authenticated = await signUpScriptedUser(publicApi, "createfail");
+  using workspace = await authenticated.newGadget();
+  const chatId = await workspace.newChat("Create a failing test thing.", MODEL_ID);
+  await waitForAgentSays(workspace, chatId, "The creation failed.");
+
+  // The tool reported a fixable rejection carrying the vendor's error...
+  expect(toolResultShownToModel("create-orphan")).toContain("Simulated post-queue failure");
+
+  // ...and the action the vendor had already queued was settled with the removed gatekeeper,
+  // not left pending forever (approve/reject would both fail on the missing facet).
+  const actions = (await workspace.listActions({ filter: "all" })).entries;
+  expect(actions.filter(action => action.state === "pending")).toEqual([]);
+  expect(actions.some(action => action.type === "action" && action.state === "rejected"))
+      .toBe(true);
   expect(model.remainingSteps()).toBe(0);
 });
