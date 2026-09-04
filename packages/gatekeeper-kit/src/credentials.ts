@@ -333,6 +333,7 @@ export class CredentialCoordinator<Creds> {
    * @returns Current credentials with their identity and connection generation.
    * @throws `CredentialsExpiredError` on confirmed expiry, after awaiting `notify` when the dead
    * grant is still stored — a disconnect is a user action, not grant death, and never notifies.
+   * A reconnect landing while `notify` is pending replaces the death: the fresh triple is served.
    */
   async snapshot(
     refresh: (current: Creds) => Promise<Creds>,
@@ -341,10 +342,12 @@ export class CredentialCoordinator<Creds> {
     try {
       await this.fresh(refresh);
     } catch (error) {
+      const dead = this.identity();
       if (isCredentialsExpired(error) && this.stored() !== undefined && options.notify !== undefined) {
         await notified(options.notify, this.#logger);
       }
-      throw error;
+      // A reconnect landing mid-notify replaced the dead grant: serve it instead of stale death.
+      if (this.identity() === dead) throw error;
     }
     const creds = this.stored();
     if (creds === undefined) throw new CredentialsExpiredError("This account is not connected.");
@@ -356,7 +359,8 @@ export class CredentialCoordinator<Creds> {
    * credential inside the ask. The verdict adjudicates the identity, never notification delivery,
    * which the account owns end to end. Invariants a hand-written implementation owns instead:
    * the moved-past gate (`""` never matches), the heal fenced on the rejected identity, and
-   * honest verdicts — `"expired"` only for provider-confirmed grant death.
+   * honest verdicts — `"expired"` only for provider-confirmed grant death, re-checked after the
+   * notify await since a reconnect landing mid-notification supersedes it.
    *
    * No durable mint latch guards a dead grant: a repeat report costs one provider call that
    * answers `invalid_grant` again — the same verdict — and Workshop notification is already
@@ -375,10 +379,7 @@ export class CredentialCoordinator<Creds> {
     // never-connected read — must not match a never-connected account's own "".
     if (identity === "" || identity !== this.identity()) return "superseded";
     // A grant-death provider has no mint to heal with: the rejection is the grant's death.
-    if (options.refresh === undefined) {
-      await notified(options.notify, this.#logger);
-      return "expired";
-    }
+    if (options.refresh === undefined) return this.#expired(identity, options.notify);
     try {
       // Fence-keyed, so concurrent heals of one identity collapse onto one provider mint.
       await this.rotate(options.refresh);
@@ -395,10 +396,7 @@ export class CredentialCoordinator<Creds> {
         });
         return "superseded";
       }
-      if (isCredentialsExpired(error)) {
-        await notified(options.notify, this.#logger);
-        return "expired";
-      }
+      if (isCredentialsExpired(error)) return this.#expired(identity, options.notify);
       // Non-credential mint failure: nothing adjudicated, credentials intact. The consumer
       // surfaces the caller's original provider error; the token endpoint's lives in this log.
       this.#logger.error("credential rejection heal failed", {
@@ -407,6 +405,12 @@ export class CredentialCoordinator<Creds> {
       });
       return "unavailable";
     }
+  }
+
+  /** Announces grant death, then re-checks the fence: a reconnect landing mid-notify supersedes. */
+  async #expired(identity: string, notify: () => Promise<void>): Promise<RejectionVerdict> {
+    await notified(notify, this.#logger);
+    return this.identity() === identity ? "expired" : "superseded";
   }
 }
 
@@ -678,6 +682,11 @@ export class CredentialSource<Creds> {
     // A concurrent resolution already had this successor adjudicated dead — don't run under it.
     if (this.#dead.has(second.identity)) {
       throw new CredentialsExpiredError(this.#options.expiredMessage, { cause });
+    }
+    // Retry only under the read the source itself adopted: a fenced-out or since-superseded
+    // refetch is stale evidence that can postdate a reconnect the source already adopted.
+    if (this.#generation !== second.generation || this.#identity !== second.identity) {
+      throw this.#changed(cause);
     }
     // At most two attempts: a second rejection is adjudicated but never retried again.
     return this.#attempt(operation, second, false);

@@ -348,14 +348,18 @@ export class CredentialCoordinator<Creds> {                  // lives in the Use
                                  // triple is atomic against a connect() landing at the await
                                  // boundary — the reason the helper lives here. A confirmed expiry
                                  // of the still-stored grant awaits notify (§4.4's latch) before
-                                 // rethrowing; a disconnect is a user action and never notifies
+                                 // rethrowing — a reconnect landing mid-notify replaces the death
+                                 // and the fresh triple is served; a disconnect is a user action
+                                 // and never notifies
   adjudicateRejection(identity, opts: { refresh?; notify }): Promise<RejectionVerdict>;
                                  // the account's reportCredentialsRejected half. Moved-past gate
                                  // first ("" — never-connected — never matches); no refresh means a
                                  // grant-death provider: notify, "expired". Otherwise heal via
                                  // rotate() — fence-keyed, so concurrent heals share one mint:
                                  // success or overtaken-by-reconnect → "superseded"; confirmed
-                                 // death → notify, "expired"; any other mint failure → logged
+                                 // death → notify, "expired" (the fence re-checked after the
+                                 // notify await: a reconnect landing mid-notification supersedes);
+                                 // any other mint failure → logged
                                  // account-side, "unavailable" (credentials intact). No durable
                                  // dead-grant mint latch: a repeat report costs one doomed provider
                                  // call answering invalid_grant again, and notification is deduped
@@ -496,7 +500,9 @@ pre-ask flight, and the single-threaded account answers after the heal's commit)
 start with) or its identity did not (a lazy account re-served the rejected credentials, whose
 refetch-adopted authority is dropped again so cache-first re-entries bypass rather than serve the
 partition it failed to defend), resolved
-as expiry without a provider call when the successor is already in the dead set, and otherwise a
+as expiry without a provider call when the successor is already in the dead set, refused as
+"changed" when the refetch was not itself adopted (a fenced-out response is stale evidence that
+can postdate a reconnect the source already adopted), and otherwise a
 second execution whose own rejection is adjudicated but never retried — at most two executions.
 `"unavailable"` rethrows the caller's original provider error: nothing was adjudicated, and the
 heal's own failure lives in the account's logs. When a concurrent refetch has since adopted a
@@ -2431,9 +2437,10 @@ Each step leaves the tree building; tests land with the module they cover. Nothi
    `CredentialsExpiredError(expiredMessage)` with the identity marked dead, `"superseded"` throws
    `CredentialsChangedError` or, under `replayable`, refetches and retries once, `"unavailable"`
    (or a malformed or lost answer, which reads `"expired"`) never masks a dead grant as retryable;
-   the retry is refused as "changed" when its refetch crosses a generation or re-serves the
-   rejected identity, resolved as expiry without a provider call when the successor is already
-   dead, and its own rejection is adjudicated but never retried (at most two executions); a live
+   the retry is refused as "changed" when its refetch crosses a generation, re-serves the
+   rejected identity, or was not itself adopted, resolved as expiry without a provider call when
+   the successor is already dead, and its own rejection is adjudicated but never retried (at most
+   two executions); a live
    successor adopted mid-operation resolves the failure as "changed" with no ask spent and the
    live authority kept — before the first ask and at the retry's rejection alike; the rejected
    authority drops at the ask (cache-first readers bypass during the round trip instead of

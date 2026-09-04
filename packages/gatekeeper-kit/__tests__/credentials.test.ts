@@ -541,6 +541,26 @@ describe("CredentialCoordinator", () => {
       }
     });
 
+    it("serves a reconnect that lands mid-notify instead of the stale death", async () => {
+      const instance = coordinator(makeKv());
+      instance.connect(stale);
+      const entered = Promise.withResolvers<void>();
+      const stalled = Promise.withResolvers<void>();
+
+      const reading = instance.snapshot(async () => {
+        throw new CredentialsExpiredError("invalid_grant");
+      }, { notify: () => { entered.resolve(); return stalled.promise; } });
+      await entered.promise;
+      instance.connect(live);
+      stalled.resolve();
+
+      expect(await reading).toEqual({
+        creds: live,
+        identity: instance.identity(),
+        generation: instance.connectionGeneration(),
+      });
+    });
+
     it("never notifies for a disconnect", async () => {
       const notify = vi.fn(async () => {});
       // Nothing stored: reading a disconnected account is not grant death.
@@ -630,6 +650,38 @@ describe("CredentialCoordinator", () => {
       } finally {
         logged.mockRestore();
       }
+    });
+
+    it("supersedes a grant-death verdict when a reconnect lands mid-notify", async () => {
+      const instance = coordinator(makeKv());
+      instance.connect(live);
+      const entered = Promise.withResolvers<void>();
+      const stalled = Promise.withResolvers<void>();
+
+      const verdict = instance.adjudicateRejection(instance.identity(),
+        { notify: () => { entered.resolve(); return stalled.promise; } });
+      await entered.promise;
+      instance.connect({ token: "reconnected", expiresAt: live.expiresAt });
+      stalled.resolve();
+
+      await expect(verdict).resolves.toBe("superseded");
+    });
+
+    it("supersedes a dead mint's verdict when a reconnect lands mid-notify", async () => {
+      const instance = coordinator(makeKv());
+      instance.connect(live);
+      const entered = Promise.withResolvers<void>();
+      const stalled = Promise.withResolvers<void>();
+
+      const verdict = instance.adjudicateRejection(instance.identity(), {
+        refresh: async () => { throw new CredentialsExpiredError("invalid_grant"); },
+        notify: () => { entered.resolve(); return stalled.promise; },
+      });
+      await entered.promise;
+      instance.connect({ token: "reconnected", expiresAt: live.expiresAt });
+      stalled.resolve();
+
+      await expect(verdict).resolves.toBe("superseded");
     });
 
     it("answers unavailable when the heal fails for non-credential reasons", async () => {
@@ -1076,6 +1128,47 @@ describe("CredentialSource", () => {
     // The refetch adopted the very identity the provider rejected, so its vouch is dropped:
     // a cache-first re-entry bypasses instead of serving the partition it failed to defend.
     expect(instance.authority()).toBeUndefined();
+  });
+
+  it("refuses a retry whose fenced-out refetch an adopted reconnect postdates", async () => {
+    // Two runs read one grant and both 401. The first's post-verdict refetch dangles; the second's
+    // verdict fences it out, and the second's own refetch adopts a reconnect. The dangling
+    // response — same generation as the rejected read — must never be executed under.
+    const reads: PromiseWithResolvers<CredentialsWithIdentity<Creds>>[] = [];
+    const getCredentials = vi.fn(() => {
+      const read = Promise.withResolvers<CredentialsWithIdentity<Creds>>();
+      reads.push(read);
+      return read.promise;
+    });
+    const reportCredentialsRejected = vi.fn(async (_identity: string) => "superseded" as const);
+    const instance = new CredentialSource<Creds>({
+      account: () => ({ getCredentials, reportCredentialsRejected }),
+      isAuthError: error => error instanceof Error && error.message === "401",
+      expiredMessage,
+    });
+
+    const gate = Promise.withResolvers<void>();
+    const first = vi.fn(async () => { throw new Error("401"); });
+    const second = vi.fn(async () => { await gate.promise; throw new Error("401"); });
+    const runFirst = instance.run(first, { replayable: true });
+    const runSecond = instance.run(second, { replayable: true });
+    reads[0].resolve({ creds: live, identity: "id-a", generation: "gen-a" });
+
+    // The first run's verdict lands and its refetch dangles before the second run even fails.
+    await vi.waitFor(() => expect(reads).toHaveLength(2));
+    gate.resolve();
+    await vi.waitFor(() => expect(reads).toHaveLength(3));
+
+    // The second run's refetch adopts a reconnect; the dangling one answers under the old
+    // generation. Both re-enter — neither runs under a read the source no longer stands behind.
+    reads[2].resolve({ creds: fresh, identity: "id-c", generation: "gen-c" });
+    await expect(runSecond).rejects.toThrow(CredentialsChangedError);
+    reads[1].resolve({ creds: fresh, identity: "id-b", generation: "gen-a" });
+    await expect(runFirst).rejects.toThrow(CredentialsChangedError);
+
+    expect(first).toHaveBeenCalledOnce();
+    expect(second).toHaveBeenCalledOnce();
+    expect(instance.authority()).toBe("gen-c");
   });
 
   it("never runs the retry under a successor already adjudicated dead", async () => {
