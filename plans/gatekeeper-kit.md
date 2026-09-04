@@ -1666,7 +1666,9 @@ superseded, it no longer vouches for the current principal (§4.10) — so cache
 bypass during the round trip instead of serving the rejected partition. It drops again with the
 fences at the verdict, because a read landing mid-ask re-adopts the grant the account still
 serves — the second drop is why that re-adoption cannot outlive the answer, and the death mark
-itself waits for an accepted one. An explicit `"superseded"` resolves as the fixed retry message
+itself waits for an accepted one. Asks coalesce per identity: the verdict adjudicates the
+identity, not the report, so concurrent reporters of one grant — every replay of a shared dead
+mint — share the account round trip; each still takes its own drops around the shared answer. An explicit `"superseded"` resolves as the fixed retry message
 with the authority left unknown. The deliberate costs: a stale mint may spend one provider call
 before the account's verdict lands; cache-first readers miss for the round trips the answer
 takes; and any adjudicated rejection costs a cache-bypass window until the next read
