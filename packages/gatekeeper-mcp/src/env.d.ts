@@ -5,6 +5,8 @@ declare namespace Cloudflare {
     BASE_URL?: string;
     MCP_ALLOW_INSECURE?: string;
     MCP_CLIENT_NAME?: string;
+    /** Comma-separated endpoints whose accounts become always-available capsules; see ambient.ts. */
+    MCP_AMBIENT_ENDPOINTS?: string;
   }
 
   interface GlobalProps {

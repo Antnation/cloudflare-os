@@ -74,6 +74,7 @@ See `src/types.d.ts` in `@gadgets/mcp-shared` for the base session API.
 | `BASE_URL` | Public base URL of this Worker, for OAuth redirects. |
 | `MCP_CLIENT_NAME` | Client name sent in `initialize` and dynamic client registration. |
 | `MCP_ALLOW_INSECURE` | `"true"` to disable the endpoint checks entirely: permits `http://` **and** private, loopback, link-local, and cloud-metadata hosts, on the endpoint and on every OAuth URL discovered from it. Local dev only. |
+| `MCP_AMBIENT_ENDPOINTS` | Comma-separated endpoint URLs. An account connected to one of these becomes an always-available capsule in every workspace its owner opens (see below). When exactly one is listed, the connect form is prefilled with it. |
 
 There is nothing to configure per server: users supply endpoints, and an administrator's only lever
 is whether this connector is offered at all, in the Gatekeepers admin panel. There is no server
@@ -82,6 +83,23 @@ and use [`gatekeeper-mcp-portal`](../gatekeeper-mcp-portal/README.md).
 
 For local development no credentials are needed. Set `MCP_ALLOW_INSECURE=true` in the repo-root
 `.dev.vars` to connect a server running on localhost.
+
+## Ambient endpoints
+
+A deployment usually has one MCP server it wants every user to have on hand in every chat without
+choosing it as a resource first: the organization's own tool gateway. List it in
+`MCP_AMBIENT_ENDPOINTS` and an account connected to that endpoint declares an agent singleton
+(`AccountDescription.singleton`). The Workshop then installs the whole-server grant into each
+workspace the owner opens as an always-available capsule, named by the usual `MCP_<Name>` binding
+and described to the agent through `getAgentCatalog()` (one entry per tool, marked read-only or
+needs-approval), exactly as the Context Library is provided. Nothing about authority changes: the
+grant is still the user's own OAuth grant to that server, reads are still observations, writes
+still queue for approval, and the server still sees each person as themselves.
+
+Only listed endpoints qualify. A server a user pasted for one chat never follows them into every
+workspace. The Workshop reads the declaration from the account description it stored at connect
+time, so an account connected before the endpoint was listed gains the capsule on its next
+reconnect.
 
 ## How the connect flow works
 

@@ -10,7 +10,10 @@ import { RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import { validateRpc, skipRpcValidation } from "capnweb-validate";
 import { createLogger } from "@gadgets/backend-utils/logger";
 import {
+  boundAgentCatalog,
   stripTrailingSlashes,
+  type AccountDescription,
+  type AgentCatalog,
   type AvatarImage,
   type Gatekeeper,
   type GatekeeperConnectCallback,
@@ -18,6 +21,7 @@ import {
   type GatekeeperUser,
   type GatekeeperUserVerifier,
   type GatekeeperVendor as GatekeeperVendorIface,
+  type ObservationAuthorizer,
   type ResourceConfiguratorFrame,
   type ResourceDescription,
   type SupportedResource,
@@ -63,6 +67,7 @@ import {
   type McpGatekeeperUserProps,
 } from "@gadgets/mcp-shared/user";
 import { connectFormHtml } from "./connect-form.js";
+import { isAmbientEndpoint, suggestedEndpoint } from "./ambient.js";
 import { serverIdFromEndpoint } from "./server-id.js";
 import { mcpResourceFor, mcpResources } from "./resources.js";
 import type { ConfiguratorUIOption } from "@gadgets/configurator-ui";
@@ -112,7 +117,7 @@ export default {
           if (!(await account.isAwaitingSelection(initiationNonce))) {
             return htmlResponse(INVALID_LINK_HTML, 400);
           }
-          return htmlResponse(connectFormHtml(path));
+          return htmlResponse(connectFormHtml(path, undefined, suggestedEndpoint(env)));
         }
         const form = await request.formData();
         return continueConnect(
@@ -136,7 +141,8 @@ async function continueConnect(
   if (endpointUrl !== null) {
     const validated = validateCustomEndpoint(env, endpointUrl);
     if (!validated.ok) {
-      return htmlResponse(connectFormHtml(formPath, validated.reason), 400);
+      return htmlResponse(
+        connectFormHtml(formPath, validated.reason, suggestedEndpoint(env)), 400);
     }
     // `serverName` is a placeholder until the handshake reports the server's own name, and `auth` is
     // a guess that `beginConnect` corrects to `"none"` if the endpoint turns out to be public.
@@ -155,7 +161,7 @@ async function continueConnect(
   } catch (err) {
     logger.warn("connect failed", { event: "connect.failed", error: err });
     return htmlResponse(connectFormHtml(
-      formPath, err instanceof Error ? err.message : String(err)), 502);
+      formPath, err instanceof Error ? err.message : String(err), suggestedEndpoint(env)), 502);
   }
 
   if (outcome.kind === "invalid") return htmlResponse(INVALID_LINK_HTML, 400);
@@ -255,6 +261,34 @@ export class GatekeeperUserImpl
 
   async getSupportedResources(): Promise<SupportedResource[]> {
     return mcpResources(fetchOptions(this.env).allowInsecure === true);
+  }
+
+  /**
+   * Adds the agent-singleton declaration when this account's endpoint is one the deployment lists
+   * in `MCP_AMBIENT_ENDPOINTS` (see `ambient.ts`): the Workshop then installs the whole-server grant
+   * into every workspace the owner opens, as an always-available capsule. It reads the declaration
+   * from the description it stored at connect or reconnect time, so an account connected before the
+   * endpoint was listed gains the capsule on its next reconnect.
+   */
+  async describe(): Promise<AccountDescription> {
+    const description = await super.describe();
+    const server = await this.#account().getServer();
+    if (!isAmbientEndpoint(this.env, server.endpoint)) return description;
+    return {
+      ...description,
+      // Must equal the whole-server facet's `ResourceDescription.tsType`: that facet is what
+      // getSingletonGatekeeperClass installs, and the Workshop names the capsule's session by it.
+      singleton: { tsType: sessionTypeName(server.serverId, server.endpoint) },
+    };
+  }
+
+  /** The whole-server grant, for the Workshop to install as an always-available capsule. */
+  async getSingletonGatekeeperClass(): Promise<DurableObjectClass<Gatekeeper<unknown>>> {
+    const server = await this.#account().getServer();
+    if (!isAmbientEndpoint(this.env, server.endpoint)) {
+      throw new Error(`${server.endpoint} is not an ambient endpoint of this deployment.`);
+    }
+    return (await this.getGatekeeperClassFor(server.endpoint)).class;
   }
 
   async getGatekeeperClassFor(url: string): Promise<{
@@ -442,6 +476,28 @@ export class McpGatekeeperImpl
 
   get serverName(): string {
     return this.ctx.props.serverName;
+  }
+
+  /**
+   * Discovery index for the always-available capsule (see `ambient.ts`): one entry per tool this
+   * grant may call, so the agent sees what the server offers from its system prompt instead of
+   * paging the session's generated types. Listing definitions is an observation of the server, so
+   * it is authorized like any read. Null when the grant currently reaches no tools.
+   */
+  async getAgentCatalog(authorizer: RpcStub<ObservationAuthorizer>): Promise<AgentCatalog | null> {
+    const tools = await this.tools();
+    if (tools.length === 0) return null;
+    await authorizer.authorizeObservation({
+      title: `${this.serverName} tool catalog`,
+      description: `Listed the ${tools.length} tool definition(s) this connection may call on ` +
+        `${hostOf(this.ctx.props.endpoint)}.`,
+    });
+    return boundAgentCatalog(tools.map(({ tool, mode }) => ({
+      id: tool.name,
+      title: tool.title ?? tool.name,
+      description: `${mode === "read" ? "Read-only" : "Needs approval"}. ` +
+        (tool.description?.split(/\r?\n/)[0] ?? ""),
+    })));
   }
 
   async describe(): Promise<ResourceDescription> {
