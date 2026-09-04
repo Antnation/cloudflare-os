@@ -10,6 +10,7 @@ import {
   type CredentialsKv,
   type CredentialSourceOptions,
   type CredentialsWithIdentity,
+  type CredentialRead,
   type RejectionVerdict,
 } from "../src/credentials";
 import { fakeKv } from "./fake-kv";
@@ -791,6 +792,39 @@ describe("CredentialSource", () => {
   it("hands the operation the credentials it fetched", async () => {
     const { instance } = source();
     expect(await instance.run(async creds => creds.token)).toBe("live");
+  });
+
+  it("hands the operation the identity and generation of its own read", async () => {
+    const { instance } = source();
+
+    const read = await instance.run(async (_creds, attempt) => attempt);
+    expect(read).toEqual({ identity: "id-a", generation: "gen-a" });
+  });
+
+  it("hands each attempt a fresh read of its own credentials", async () => {
+    const { instance } = healingSource();
+    const handed: CredentialRead[] = [];
+    const seen: CredentialRead[] = [];
+
+    const result = await instance.run(async (creds, attempt) => {
+      handed.push(attempt);
+      seen.push({ ...attempt });
+      // A caller may hold or even mutate its read; the source's own state must not ride on it —
+      // a mangled shared triple would report and fence the wrong identity below.
+      attempt.identity = "mangled";
+      attempt.generation = "mangled";
+      if (creds.token === "live") throw new Error("401");
+      return creds.token;
+    }, { replayable: true });
+
+    // The retry's read names the credentials that attempt actually ran under — the fence an
+    // action capture must ride, since authority() can move mid-operation.
+    expect(result).toBe("fresh");
+    expect(seen).toEqual([
+      { identity: "id-a", generation: "gen-a" },
+      { identity: "id-b", generation: "gen-a" },
+    ]);
+    expect(handed[0]).not.toBe(handed[1]);
   });
 
   it("surfaces the authority only while the principal is known", async () => {

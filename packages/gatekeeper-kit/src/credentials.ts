@@ -401,6 +401,14 @@ export type CredentialsWithIdentity<Creds> =
   { creds: Creds; identity: string; generation: string };
 
 /**
+ * The identity and generation of the read a `run` operation executes under — the values to
+ * capture in an action fence, since a retry runs under a different read than the first attempt
+ * and a shared accessor like `authority()` can move mid-operation. A fresh object per attempt,
+ * never the source's internal state.
+ */
+export type CredentialRead = { identity: string; generation: string };
+
+/**
  * Account-side RPC shape. See `CredentialSourceOptions.account` for stub ownership. The contract
  * is this structural interface; the coordinator helpers are the reference implementation, and an
  * account with esoteric needs — per-endpoint connections, custom storage — hand-writes either
@@ -506,9 +514,9 @@ export class CredentialSource<Creds> {
    * The cache authority for data fetched through this source (`KvTtlCache.partitionedBy`): mirrors
    * the connection generation of the last successful fetch rather than reading the account live, so
    * a reconnect repartitions at the next fetch and a token refresh never does. A shared last-seen
-   * value a concurrent fetch can move — action-fence capture must ride the `generation` of its own
-   * `getCredentials()` read, never this accessor. Direct callers compose custom authorities for the
-   * raw cache constructor.
+   * value a concurrent fetch can move — action-fence capture must ride the `CredentialRead` handed
+   * to its own `run` operation (or the `generation` of its own `getCredentials()` read), never
+   * this accessor. Direct callers compose custom authorities for the raw cache constructor.
    * @returns The last-seen connection generation; `undefined` (principal unknown) until a fetch
    * succeeds, and from a reported — or account-refused — expiry until a fetch started after the
    * report adopts an identity not reported dead.
@@ -521,7 +529,9 @@ export class CredentialSource<Creds> {
    * Runs a provider operation, resolving a confirmed credential rejection through the account's
    * verdict on the identity the operation used. The account heals past a rejected-but-current
    * credential inside that ask, so recovery stays invisible here except through the verdict.
-   * @param operation Provider call using current credentials.
+   * @param operation Provider call using current credentials. Its second argument is the read the
+   * attempt runs under — capture action fences from it, not from `authority()`, which a
+   * concurrent fetch can move mid-operation.
    * @param options `replayable` marks the operation safe to execute twice: a `"superseded"`
    * verdict — the rejected credential was already replaced, or the account just healed past it —
    * retries the operation once with freshly fetched credentials. Without the flag the same
@@ -535,12 +545,14 @@ export class CredentialSource<Creds> {
    * by name (`isCredentialsExpired` / `isCredentialsChanged`) across RPC boundaries.
    */
   async run<T>(
-    operation: (credentials: Creds) => Promise<T>,
+    operation: (credentials: Creds, read: CredentialRead) => Promise<T>,
     options: { replayable?: boolean } = {},
   ): Promise<T> {
     const first = await this.#current();
     try {
-      return await operation(first.creds);
+      // A fresh object, never the internal triple: the operation may hold or mutate its read.
+      return await operation(first.creds,
+        { identity: first.identity, generation: first.generation });
     } catch (error) {
       if (!this.#options.isAuthError(error)) throw error;
       return this.#resolve(operation, first, error, options.replayable === true);
@@ -556,7 +568,7 @@ export class CredentialSource<Creds> {
    * @returns The retried operation result, when a retry resolves it.
    */
   async #resolve<T>(
-    operation: (credentials: Creds) => Promise<T>,
+    operation: (credentials: Creds, read: CredentialRead) => Promise<T>,
     read: CredentialsWithIdentity<Creds>,
     cause: unknown,
     retry: boolean,
@@ -610,7 +622,7 @@ export class CredentialSource<Creds> {
    * @returns The retried operation result.
    */
   async #retry<T>(
-    operation: (credentials: Creds) => Promise<T>,
+    operation: (credentials: Creds, read: CredentialRead) => Promise<T>,
     first: CredentialsWithIdentity<Creds>,
     cause: unknown,
   ): Promise<T> {
@@ -627,7 +639,10 @@ export class CredentialSource<Creds> {
       throw new CredentialsExpiredError(this.#options.expiredMessage, { cause });
     }
     try {
-      return await operation(second.creds);
+      // The retry's own read, freshly constructed: an action fence captured from it names the
+      // credentials this attempt actually runs under.
+      return await operation(second.creds,
+        { identity: second.identity, generation: second.generation });
     } catch (error) {
       if (!this.#options.isAuthError(error)) throw error;
       // At most two attempts: the second rejection is adjudicated but never retried again.
