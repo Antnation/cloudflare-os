@@ -1121,7 +1121,7 @@ defect; each is either additive later or a fact about one provider that only bit
 
 | Obligation | Who it affects | Why it is deferred |
 | --- | --- | --- |
-| **Ordering credential mutations against `revoke`.** A refresh in flight when `revoke()` wipes storage mints a token the identity fence correctly discards — leaving live provider-side authority nobody stored. Google serializes its four credential paths on one FIFO chain (`google.ts:405-427`), and even it leaks one error-path `kv.delete("refreshToken")` outside the chain (`:524-530`). | every port with a refresh flow | `revoke()` is not in the kit — the account base owns it (§5.6): it drains the refresh in flight and best-effort revokes its result as well as the captured grant. `coordinator.fresh()` already coalesces concurrent refreshes; the coordinator needs no queue of its own. |
+| **Ordering credential mutations against `revoke`.** A refresh in flight when `revoke()` wipes storage mints a token the identity fence correctly discards — leaving live provider-side authority nobody stored. Google serializes its four credential paths on one FIFO chain (`google.ts:405-427`), and even it leaks one error-path `kv.delete("refreshToken")` outside the chain (`:524-530`). | every port with a refresh flow | `revoke()` is not in the kit — the account base owns it (§5.6): it drains the mint in flight — proactive refresh and rejection heal through one tracker — and best-effort revokes its result as well as the captured grant. `coordinator.fresh()` already coalesces concurrent refreshes; the coordinator needs no queue of its own. |
 | **Baseline re-checks on the exclusion path.** `verifyBaseline` runs at admission only, so an observer who later loses the binding-wide grant keeps observing. Google's batch result carries it per call — `{ baselineAllowed, allowed[] }` (`gatekeeper-google/src/observers.ts:48-49`) — and excludes on `!baselineAllowed` (`:206-215`). | google port first | Expressible today by folding the baseline into `hasSetAccess` (return all-`false`), so this is a documentation gap rather than a missing capability. Note google's baseline is a recorded *resource grant* (`resources.ts:203-205`), not org membership, and it *excludes* rather than removing the observer. |
 | **`maxTrackedSets` is a default, not a corpus constant.** 1000 comes from google's generic default, but its concrete Drive tracker overrides to **2000** (`drive-observers.ts:49-53`), sized against `ceil(N/100)` subrequests. | supabase, notion, linear ports, which had no cap at all | A port inherits a bound it never had; the number is per-provider and belongs in that port's options. |
 | **`maxObservers` is a platform bound the corpus does not have.** Every retained observer costs one verifier call per read, and Workers cap a request at **32 Worker invocations** — past that the call throws, so a binding with too many collaborators fails *every* read rather than degrading. No shipped tracker caps this: notion, confluence, context, linear and internal `gatekeeper-shared` fan out over all observers with unbounded `Promise.all`, and google throttles concurrency without bounding the total. | every strategy-C port | The kit refuses at admission instead, which is the legible half of the same failure. The default is **10**, not 20: an observer count prices only the kit's own hop, and every verifier in the corpus spends a second invocation calling its account DO (`notion.ts:615-635`), so 20 observers is 40 invocations before the read does anything. The real ceiling is per-deployment, so the number belongs in that port's options. `concurrency` is a throttle and never a bound. |
@@ -2115,10 +2115,12 @@ Public loopback-RPC methods and their sequencing:
   await, then best-effort `strategy.revoke` on the grant it captured (failures log `error` with
   event `oauth.grant.revoke.failed`). Destroying local state after awaiting the provider would let
   a connection begun during that await be erased by the revoke that preceded it. It also owns the
-  refresh in flight when it runs: the base hands the coordinator `strategy.refresh` wrapped so the
-  latest refresh promise is observable, and after `deleteAll()` it awaits that promise and
-  best-effort revokes its result too — a refresh that loses the identity fence otherwise mints
-  rotated provider-side authority nobody stored and nobody would ever revoke (§4.6 obligations).
+  mint in flight when it runs: the base hands the coordinator `strategy.refresh` *and*
+  `strategy.heal` wrapped through one tracker so the latest mint promise is observable, and after
+  `deleteAll()` it awaits that promise and best-effort revokes its result too — a refresh or
+  rejection heal that loses the identity fence otherwise mints rotated provider-side authority
+  nobody stored and nobody would ever revoke (§4.6 obligations). Draining only the refresh would
+  leave the heal's mint as exactly that leak.
 - `alarm()` — `deleteAll()` when no credentials exist or the account is ephemeral.
 
 Storage keys owned by the base: `"callback"`, `"nonce"`, `"reconnecting"`, `"expiredNotified"`,
