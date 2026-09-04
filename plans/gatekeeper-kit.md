@@ -1684,6 +1684,17 @@ spend a rotation nor invalidate a bearer a replay is mid-flight with.
 holds one (`AccountHandle.creds`, §5.1), which retries where the port wired
 `kitUserConfig().refreshCredentials` (§5.8) — the assembly passes it into the source it builds,
 keeping refresh material account-side (§5.6).
+The replay itself also stays source-side by adjudication, not only by the fencing argument above
+(which defeats the `withAuthRetry` composition and nothing else). The alternative — the account
+minting inside the report, `noteCredentialsExpired` trying `rotate()` and answering
+`"superseded"` when it minted past the rejected identity, the caller's retry-on-"changed"
+re-entering `run` — would collapse the replay protocol, but at the wrong costs: the routine
+stale-bearer 401 becomes a caller-visible retry (no retry loop stands between facet and agent,
+and today's four derived-bearer providers all recover invisibly in place), each incident spends a
+third account round trip, the healthy account takes the adjudication's authority drops where the
+in-source replay never touches the authority on success, and one-retry-then-death determinism
+migrates from a single replay frame into cross-request account state racing every source that
+holds the grant.
 
 **Where the refresh comes from is still the port's, and it is account-side by construction.** For
 the five providers whose 401 means the grant is gone, there is nothing to wire:
