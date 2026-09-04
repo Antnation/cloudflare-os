@@ -17,13 +17,12 @@ export type AuthRetryOptions<Token> = {
 };
 
 /**
- * Retries once after provider-confirmed credential rejection. This helper never reports expiry,
- * and wrapping it in `CredentialSource.run()` cannot reliably make it: the refresh happens where
- * no source sees it, so the moment it rotates the grant's identity, the outer report names the
- * superseded grant and is gated out. Provider calls made through a `CredentialSource` get this
- * retry from `run(operation, { replayable: true })` with a `refreshCredentials` channel, which
- * reports the identity it actually replayed; this helper remains for token flows that hold no
- * source.
+ * Retries once after provider-confirmed credential rejection. This helper never reports expiry:
+ * the refresh happens where no account adjudicates it, so recovery and grant death alike stay
+ * invisible to the Workshop. Provider calls made through a `CredentialSource` get the one-retry
+ * doctrine from `run(operation, { replayable: true })`, where the account heals past a stale
+ * credential inside the rejection adjudication and confirmed grant death is reported; this helper
+ * remains for token flows that hold no source.
  * @param options Token acquisition and error policy.
  * @param run Replayable provider operation, executed at most twice.
  * @returns The first successful result.

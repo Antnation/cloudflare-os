@@ -53,8 +53,8 @@ describe("withAuthRetry", () => {
     });
 
     // Reporting is out of scope here: `CredentialSource.run(operation, { replayable: true })`
-    // with a `refreshCredentials` channel owns the retry-then-report flow — `replayable` without
-    // the channel is a configuration error thrown at the call.
+    // owns the retry-then-report flow, with the account healing inside the rejection
+    // adjudication.
     await expect(withAuthRetry({
       getToken,
       isAuthError: error => error === firstError || error === secondError,
