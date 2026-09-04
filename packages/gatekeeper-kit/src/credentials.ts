@@ -72,18 +72,6 @@ export function isCredentialsChanged(error: unknown): boolean {
  */
 export type RejectionVerdict = "expired" | "superseded" | "unavailable";
 
-/** Awaits a Workshop notification, logging a failure rather than masking the verdict with it. */
-async function notified(notify: () => Promise<void>, log: typeof logger): Promise<void> {
-  try {
-    await notify();
-  } catch (error) {
-    log.warn("failed to notify credential expiry", {
-      event: "credentials.expiry.notify.failed",
-      error,
-    });
-  }
-}
-
 // Shared storage layout for kit-managed credentials.
 const CREDENTIALS_KEY = "credentials";
 const IDENTITY_KEY = `${CREDENTIALS_KEY}:identity`;
@@ -342,15 +330,12 @@ export class CredentialCoordinator<Creds> {
     try {
       await this.fresh(refresh);
     } catch (error) {
-      const dead = this.identity();
-      if (isCredentialsExpired(error) && this.stored() !== undefined && options.notify !== undefined) {
-        await notified(options.notify, this.#logger);
-      }
+      if (!isCredentialsExpired(error) || this.stored() === undefined
+        || options.notify === undefined) throw error;
       // A reconnect landing mid-notify replaced the dead grant: serve it instead of stale death.
-      if (this.identity() === dead) throw error;
+      if (await this.#notified(this.identity(), options.notify)) throw error;
     }
-    const creds = this.stored();
-    if (creds === undefined) throw new CredentialsExpiredError("This account is not connected.");
+    const creds = this.#connected();
     return { creds, identity: this.identity(), generation: this.connectionGeneration() };
   }
 
@@ -407,10 +392,34 @@ export class CredentialCoordinator<Creds> {
     }
   }
 
-  /** Announces grant death, then re-checks the fence: a reconnect landing mid-notify supersedes. */
+  /**
+   * Resolves a confirmed grant death into its verdict.
+   * @param identity The dead grant's identity fence.
+   * @param notify Announces the grant death to the Workshop.
+   * @returns `"expired"`, or `"superseded"` when a reconnect landing mid-notify moved the fence.
+   */
   async #expired(identity: string, notify: () => Promise<void>): Promise<RejectionVerdict> {
-    await notified(notify, this.#logger);
-    return this.identity() === identity ? "expired" : "superseded";
+    return await this.#notified(identity, notify) ? "expired" : "superseded";
+  }
+
+  /**
+   * Awaits a Workshop notification, then re-checks the identity fence.
+   * @param identity Identity fence captured when the death was decided.
+   * @param notify Announces the grant death to the Workshop; a failure is logged, never masking
+   * the verdict.
+   * @returns Whether `identity` survived the await — a reconnect landing mid-notify moves the
+   * fence, so a death decided before the notification no longer stands.
+   */
+  async #notified(identity: string, notify: () => Promise<void>): Promise<boolean> {
+    try {
+      await notify();
+    } catch (error) {
+      this.#logger.warn("failed to notify credential expiry", {
+        event: "credentials.expiry.notify.failed",
+        error,
+      });
+    }
+    return this.identity() === identity;
   }
 }
 

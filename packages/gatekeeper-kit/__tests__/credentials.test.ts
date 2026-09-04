@@ -33,6 +33,17 @@ function coordinator(
 const live: Creds = { token: "live", expiresAt: Date.now() + 60 * 60 * 1000 };
 const stale: Creds = { token: "stale", expiresAt: Date.now() + 1000 };
 
+/** A notify that stalls until released, resolving `entered` once the notification is in flight. */
+function stallingNotify() {
+  const entered = Promise.withResolvers<void>();
+  const stalled = Promise.withResolvers<void>();
+  return {
+    notify: () => { entered.resolve(); return stalled.promise; },
+    entered: entered.promise,
+    release: stalled.resolve,
+  };
+}
+
 describe("CredentialCoordinator", () => {
   it("reports expiry when nothing is stored", async () => {
     await expect(coordinator(makeKv()).fresh(async () => live))
@@ -544,15 +555,14 @@ describe("CredentialCoordinator", () => {
     it("serves a reconnect that lands mid-notify instead of the stale death", async () => {
       const instance = coordinator(makeKv());
       instance.connect(stale);
-      const entered = Promise.withResolvers<void>();
-      const stalled = Promise.withResolvers<void>();
+      const { notify, entered, release } = stallingNotify();
 
       const reading = instance.snapshot(async () => {
         throw new CredentialsExpiredError("invalid_grant");
-      }, { notify: () => { entered.resolve(); return stalled.promise; } });
-      await entered.promise;
+      }, { notify });
+      await entered;
       instance.connect(live);
-      stalled.resolve();
+      release();
 
       expect(await reading).toEqual({
         creds: live,
@@ -652,34 +662,19 @@ describe("CredentialCoordinator", () => {
       }
     });
 
-    it("supersedes a grant-death verdict when a reconnect lands mid-notify", async () => {
+    it.each([
+      { death: "a grant-death verdict", refresh: undefined },
+      { death: "a dead mint's verdict",
+        refresh: async () => { throw new CredentialsExpiredError("invalid_grant"); } },
+    ])("supersedes $death when a reconnect lands mid-notify", async ({ refresh }) => {
       const instance = coordinator(makeKv());
       instance.connect(live);
-      const entered = Promise.withResolvers<void>();
-      const stalled = Promise.withResolvers<void>();
+      const { notify, entered, release } = stallingNotify();
 
-      const verdict = instance.adjudicateRejection(instance.identity(),
-        { notify: () => { entered.resolve(); return stalled.promise; } });
-      await entered.promise;
+      const verdict = instance.adjudicateRejection(instance.identity(), { refresh, notify });
+      await entered;
       instance.connect({ token: "reconnected", expiresAt: live.expiresAt });
-      stalled.resolve();
-
-      await expect(verdict).resolves.toBe("superseded");
-    });
-
-    it("supersedes a dead mint's verdict when a reconnect lands mid-notify", async () => {
-      const instance = coordinator(makeKv());
-      instance.connect(live);
-      const entered = Promise.withResolvers<void>();
-      const stalled = Promise.withResolvers<void>();
-
-      const verdict = instance.adjudicateRejection(instance.identity(), {
-        refresh: async () => { throw new CredentialsExpiredError("invalid_grant"); },
-        notify: () => { entered.resolve(); return stalled.promise; },
-      });
-      await entered.promise;
-      instance.connect({ token: "reconnected", expiresAt: live.expiresAt });
-      stalled.resolve();
+      release();
 
       await expect(verdict).resolves.toBe("superseded");
     });
@@ -1141,11 +1136,7 @@ describe("CredentialSource", () => {
       return read.promise;
     });
     const reportCredentialsRejected = vi.fn(async (_identity: string) => "superseded" as const);
-    const instance = new CredentialSource<Creds>({
-      account: () => ({ getCredentials, reportCredentialsRejected }),
-      isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage,
-    });
+    const { instance } = source({ account: () => ({ getCredentials, reportCredentialsRejected }) });
 
     const gate = Promise.withResolvers<void>();
     const first = vi.fn(async () => { throw new Error("401"); });
