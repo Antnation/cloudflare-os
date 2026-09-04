@@ -1073,6 +1073,9 @@ describe("CredentialSource", () => {
       .rejects.toThrow(CredentialsChangedError);
     expect(operation).toHaveBeenCalledOnce();
     expect(reportCredentialsRejected).toHaveBeenCalledOnce();
+    // The refetch adopted the very identity the provider rejected, so its vouch is dropped:
+    // a cache-first re-entry bypasses instead of serving the partition it failed to defend.
+    expect(instance.authority()).toBeUndefined();
   });
 
   it("never runs the retry under a successor already adjudicated dead", async () => {

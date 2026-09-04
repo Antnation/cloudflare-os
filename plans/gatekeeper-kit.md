@@ -493,7 +493,9 @@ just healed past it — resolves as `CredentialsChangedError` with the authority
 under `replayable`, as one internal retry: a fresh account read (the ask's fence bump forgot the
 pre-ask flight, and the single-threaded account answers after the heal's commit), refused as
 "changed" when its generation moved (a reconnect — never run under a principal the caller didn't
-start with) or its identity did not (a lazy account re-served the rejected credentials), resolved
+start with) or its identity did not (a lazy account re-served the rejected credentials, whose
+refetch-adopted authority is dropped again so cache-first re-entries bypass rather than serve the
+partition it failed to defend), resolved
 as expiry without a provider call when the successor is already in the dead set, and otherwise a
 second execution whose own rejection is adjudicated but never retried — at most two executions.
 `"unavailable"` rethrows the caller's original provider error: nothing was adjudicated, and the

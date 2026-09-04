@@ -536,7 +536,8 @@ export class CredentialSource<Creds> {
    * this accessor. Direct callers compose custom authorities for the raw cache constructor.
    * @returns The last-seen connection generation; `undefined` (principal unknown) until a fetch
    * succeeds, and from a reported — or account-refused — expiry until a fetch started after the
-   * report adopts an identity not reported dead.
+   * report adopts an identity not reported dead. A refetch that re-serves the identity a
+   * `"superseded"` verdict promised to replace drops it again.
    */
   authority(): string | undefined {
     return this.#generation;
@@ -668,8 +669,12 @@ export class CredentialSource<Creds> {
     if (second.generation !== first.generation) throw this.#changed(cause);
     // "Superseded" promised a successor; the same identity back means a lazy account re-served
     // the credentials the provider already rejected. Re-entering is honest — retrying would burn
-    // the one retry proving nothing.
-    if (second.identity === first.identity) throw this.#changed(cause);
+    // the one retry proving nothing — and the refetch's adoption is undone: a just-rejected
+    // credential cannot keep vouching for the cache partition.
+    if (second.identity === first.identity) {
+      this.#supersede();
+      throw this.#changed(cause);
+    }
     // A concurrent resolution already had this successor adjudicated dead — don't run under it.
     if (this.#dead.has(second.identity)) {
       throw new CredentialsExpiredError(this.#options.expiredMessage, { cause });
