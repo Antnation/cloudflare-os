@@ -1635,3 +1635,143 @@ describe("CredentialSource", () => {
     expect(instance.authority()).toBeUndefined();
   });
 });
+
+describe("CredentialSource over a CredentialCoordinator", () => {
+  // The two halves composed the way a port wires them: `getCredentials` projects
+  // `coordinator.snapshot(...)`, the rejection report delegates to `adjudicateRejection`, and in
+  // production `notify` is `notifyCredentialsExpiredOnce` over the same storage.
+  function harness(options: { mint?: (current: Creds) => Promise<Creds> } = {}) {
+    const kv = fakeKv();
+    const instance = new CredentialCoordinator<Creds>(kv);
+    const notify = vi.fn(async () => {});
+    const mint = vi.fn(options.mint
+      ?? (async () => ({ token: "minted", expiresAt: Date.now() + 3_600_000 })));
+    const account = {
+      getCredentials: () => instance.snapshot(async current => current, { notify }),
+      reportCredentialsRejected:
+        (identity: string) => instance.adjudicateRejection(identity, { refresh: mint, notify }),
+    };
+    const newSource = () => new CredentialSource<Creds>({
+      account: () => account,
+      isAuthError: error => error instanceof Error && error.message === "401",
+      expiredMessage: "Reconnect.",
+    });
+    return { coordinator: instance, source: newSource(), newSource, notify, mint };
+  }
+
+  /** A provider accepting exactly the given tokens, rejecting everything else as a 401. */
+  function providerAccepting(...tokens: string[]) {
+    return vi.fn(async (creds: Creds) => {
+      if (!tokens.includes(creds.token)) throw new Error("401");
+      return creds.token;
+    });
+  }
+
+  const hour = 3_600_000;
+
+  it("heals a stale bearer invisibly with one mint and no notification", async () => {
+    const { coordinator, source, notify, mint } = harness();
+    coordinator.connect({ token: "stale-bearer", expiresAt: Date.now() + hour });
+    const operation = providerAccepting("minted");
+
+    expect(await source.run(operation, { replayable: true })).toBe("minted");
+
+    // The whole recovery happened inside the report round trip: one provider mint, the caller
+    // never saw an error, and the Workshop was never told anything.
+    expect(operation).toHaveBeenCalledTimes(2);
+    expect(mint).toHaveBeenCalledOnce();
+    expect(notify).not.toHaveBeenCalled();
+    expect(coordinator.stored()?.token).toBe("minted");
+  });
+
+  it("spends one mint and one notification on a dead grant under concurrent runs", async () => {
+    const { coordinator, source, notify, mint } = harness({
+      mint: async () => { throw new CredentialsExpiredError("invalid_grant"); },
+    });
+    coordinator.connect({ token: "dead-bearer", expiresAt: Date.now() + hour });
+
+    const runs = [
+      source.run(async () => { throw new Error("401"); }, { replayable: true }),
+      source.run(async () => { throw new Error("401"); }, { replayable: true }),
+      source.run(async () => { throw new Error("401"); }, { replayable: true }),
+    ];
+    for (const run of runs) await expect(run).rejects.toThrow(CredentialsExpiredError);
+
+    // The burst coalesces: one read, one ask, one doomed mint, one Workshop notification.
+    expect(mint).toHaveBeenCalledOnce();
+    expect(notify).toHaveBeenCalledOnce();
+    // The grant stays stored until reconnect; the account made its verdict, not a disconnect.
+    expect(coordinator.stored()?.token).toBe("dead-bearer");
+  });
+
+  it("hands a non-replayable caller a retryable error whose re-entry needs no second mint", async () => {
+    const { coordinator, source, notify, mint } = harness();
+    coordinator.connect({ token: "stale-bearer", expiresAt: Date.now() + hour });
+    const operation = providerAccepting("minted");
+
+    // The branch's old footgun, closed: a stale derived bearer on a non-replayable call heals
+    // account-side all the same — the caller re-enters instead of retiring a healthy account.
+    await expect(source.run(operation)).rejects.toThrow(CredentialsChangedError);
+    expect(await source.run(operation)).toBe("minted");
+
+    expect(mint).toHaveBeenCalledOnce();
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("resolves a rejection under a mid-operation reconnect as retryable without healing", async () => {
+    const { coordinator, source, notify, mint } = harness();
+    coordinator.connect({ token: "old", expiresAt: Date.now() + hour });
+    const entered = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+
+    const call = source.run(async () => {
+      entered.resolve();
+      await gate.promise;
+      throw new Error("401");
+    }, { replayable: true });
+    await entered.promise;
+
+    coordinator.connect({ token: "reconnected", expiresAt: Date.now() + hour });
+    gate.resolve();
+
+    // The rejected identity was already replaced: the moved-past gate answers superseded with no
+    // mint, and the crossed generation keeps the retry off the new principal — the caller
+    // re-enters and runs under the reconnect deliberately.
+    await expect(call).rejects.toThrow(CredentialsChangedError);
+    expect(mint).not.toHaveBeenCalled();
+    expect(notify).not.toHaveBeenCalled();
+    expect(await source.run(providerAccepting("reconnected"))).toBe("reconnected");
+  });
+
+  it("spends one mint however many facets report their stale bearers", async () => {
+    const { coordinator, source, newSource, notify, mint } = harness();
+    coordinator.connect({ token: "first-bearer", expiresAt: Date.now() + hour });
+    const operation = providerAccepting("minted");
+
+    // A facet's run reads the first bearer and stalls mid-operation.
+    const entered = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    const slow = source.run(async creds => {
+      if (creds.token === "first-bearer") {
+        entered.resolve();
+        await gate.promise;
+        throw new Error("401");
+      }
+      return operation(creds);
+    }, { replayable: true });
+    await entered.promise;
+
+    // The account rotates in place — a sibling refresh — and a second facet's rejection of the
+    // rotated bearer heals: the one mint.
+    await coordinator.rotate(async () => ({ token: "second-bearer", expiresAt: Date.now() + hour }));
+    expect(await newSource().run(operation, { replayable: true })).toBe("minted");
+    expect(mint).toHaveBeenCalledOnce();
+
+    // The first facet's report names an identity the account moved past twice over: the gate
+    // answers superseded without minting, and its retry rides the healed grant.
+    gate.resolve();
+    expect(await slow).toBe("minted");
+    expect(mint).toHaveBeenCalledOnce();
+    expect(notify).not.toHaveBeenCalled();
+  });
+});
