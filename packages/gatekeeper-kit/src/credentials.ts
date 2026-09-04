@@ -322,6 +322,7 @@ export class CredentialCoordinator<Creds> {
    * @throws `CredentialsExpiredError` on confirmed expiry, after awaiting `notify` when the dead
    * grant is still stored — a disconnect is a user action, not grant death, and never notifies.
    * A reconnect landing while `notify` is pending replaces the death: the fresh triple is served.
+   * A disconnect landing there reads as not connected, carrying the death as its cause.
    */
   async snapshot(
     refresh: (current: Creds) => Promise<Creds>,
@@ -334,6 +335,10 @@ export class CredentialCoordinator<Creds> {
         || options.notify === undefined) throw error;
       // A reconnect landing mid-notify replaced the dead grant: serve it instead of stale death.
       if (await this.#notified(this.identity(), options.notify)) throw error;
+      // A disconnect landing there moves the fence too; keep the death's provenance.
+      if (this.stored() === undefined) {
+        throw new CredentialsExpiredError("This account is not connected.", { cause: error });
+      }
     }
     const creds = this.#connected();
     return { creds, identity: this.identity(), generation: this.connectionGeneration() };

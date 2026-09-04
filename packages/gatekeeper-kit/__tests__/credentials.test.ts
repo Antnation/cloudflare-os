@@ -571,6 +571,26 @@ describe("CredentialCoordinator", () => {
       });
     });
 
+    it("keeps the death's provenance when a disconnect lands mid-notify", async () => {
+      const instance = coordinator(makeKv());
+      instance.connect(stale);
+      const { notify, entered, release } = stallingNotify();
+
+      const reading = instance.snapshot(async () => {
+        throw new CredentialsExpiredError("invalid_grant");
+      }, { notify });
+      await entered;
+      instance.clear();
+      release();
+
+      // The disconnect moved the fence like a reconnect would, but nothing replaced the grant:
+      // still expiry, chaining the death instead of fabricating a causeless one.
+      const thrown = await reading.then(() => undefined, (error: unknown) => error);
+      expect(thrown).toBeInstanceOf(CredentialsExpiredError);
+      expect((thrown as Error).message).toBe("This account is not connected.");
+      expect(((thrown as Error).cause as Error).message).toBe("invalid_grant");
+    });
+
     it("never notifies for a disconnect", async () => {
       const notify = vi.fn(async () => {});
       // Nothing stored: reading a disconnected account is not grant death.

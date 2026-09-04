@@ -349,8 +349,9 @@ export class CredentialCoordinator<Creds> {                  // lives in the Use
                                  // boundary — the reason the helper lives here. A confirmed expiry
                                  // of the still-stored grant awaits notify (§4.4's latch) before
                                  // rethrowing — a reconnect landing mid-notify replaces the death
-                                 // and the fresh triple is served; a disconnect is a user action
-                                 // and never notifies
+                                 // and the fresh triple is served, while a disconnect landing
+                                 // there reads as not connected with the death as its cause; a
+                                 // disconnect is a user action and never notifies
   adjudicateRejection(identity, opts: { refresh?; notify }): Promise<RejectionVerdict>;
                                  // the account's reportCredentialsRejected half. Moved-past gate
                                  // first ("" — never-connected — never matches); no refresh means a
