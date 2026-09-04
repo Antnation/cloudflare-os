@@ -31,6 +31,14 @@ export class SingleFlight<K = string> {
   }
 
   /**
+   * @param key Flight key.
+   * @returns Whether a flight for the key is in progress.
+   */
+  pending(key: K): boolean {
+    return this.#inFlight.has(key);
+  }
+
+  /**
    * Stops offering a flight to later callers.
    * @param key Flight key to forget.
    */

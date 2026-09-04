@@ -497,13 +497,13 @@ just healed past it — resolves as `CredentialsChangedError` with the authority
 under `replayable`, as one internal retry: a fresh account read (the ask's fence bump forgot the
 pre-ask flight, and the single-threaded account answers after the heal's commit), refused as
 "changed" when its generation moved (a reconnect — never run under a principal the caller didn't
-start with) or its identity did not (a lazy account re-served the rejected credentials, whose
-refetch-adopted authority is dropped again so cache-first re-entries bypass rather than serve the
-partition it failed to defend), resolved
-as expiry without a provider call when the successor is already in the dead set, refused as
-"changed" when the refetch was not itself adopted (a fenced-out response is stale evidence that
-can postdate a reconnect the source already adopted), and otherwise a
-second execution whose own rejection is adjudicated but never retried — at most two executions.
+start with), resolved as expiry without a provider call when it re-serves a dead-set successor
+the source last stood behind, refused as "changed" when the refetch was not itself adopted (a
+fenced-out response is stale evidence that can postdate a reconnect the source already adopted,
+with no adoption of its own to act on), refused as "changed" when its identity did not move (a
+lazy account re-served the rejected credentials, whose refetch's own adoption is dropped again so
+cache-first re-entries bypass rather than serve the partition it failed to defend), and otherwise
+a second execution whose own rejection is adjudicated but never retried — at most two executions.
 `"unavailable"` rethrows the caller's original provider error: nothing was adjudicated, and the
 heal's own failure lives in the account's logs. When a concurrent refetch has since adopted a
 **live successor** — a different
@@ -1696,10 +1696,11 @@ unset on a failed callback so a later expiry re-notifies. The rejected
 authority drops at the ask: the rejection already proves the snapshot cannot vouch whichever way
 the answer goes — dead, its partition could serve the next principal stale data on a hit;
 superseded, it no longer vouches for the current principal (§4.10) — so cache-first readers
-bypass during the round trip instead of serving the rejected partition. It drops again with the
-fences at the verdict, because a read landing mid-ask re-adopts the grant the account still
-serves — the second drop is why that re-adoption cannot outlive the answer, and the death mark
-itself waits for an `"expired"` one. Asks coalesce per identity: the verdict adjudicates the
+bypass during the round trip instead of serving the rejected partition. A read landing mid-ask is
+served to its caller but never adopted — the pending ask blocks handing the rejected identity's
+partition back before the verdict, so the bypass holds for the whole round trip — and the
+authority drops again with the fences at the verdict, while the death mark itself waits for an
+`"expired"` answer. Asks coalesce per identity: the verdict adjudicates the
 identity, not the report, so concurrent reporters of one grant share the account round trip —
 and the account's fence-keyed mint flight collapses their heals onto one provider call; each
 reporter still takes its own drops around the shared answer.
@@ -2438,15 +2439,17 @@ Each step leaves the tree building; tests land with the module they cover. Nothi
    `CredentialsChangedError` or, under `replayable`, refetches and retries once, `"unavailable"`
    (or a malformed or lost answer, which reads `"expired"`) never masks a dead grant as retryable;
    the retry is refused as "changed" when its refetch crosses a generation, re-serves the
-   rejected identity, or was not itself adopted, resolved as expiry without a provider call when
-   the successor is already dead, and its own rejection is adjudicated but never retried (at most
-   two executions); a live
+   rejected identity, or was not itself adopted (a fenced-out refetch triggers neither the
+   re-serve's authority drop nor the dead successor's expiry — both act only on the read the
+   source last stood behind), resolved as expiry without a provider call when the successor the
+   source stands behind is already dead, and its own rejection is adjudicated but never retried
+   (at most two executions); a live
    successor adopted mid-operation resolves the failure as "changed" with no ask spent and the
    live authority kept — before the first ask and at the retry's rejection alike; the rejected
    authority drops at the ask (cache-first readers bypass during the round trip instead of
-   serving the rejected partition) and drops again at the verdict, so an identity adopted while
-   the answer was pending never outlives it, with the death mark waiting for an `"expired"`
-   answer; asks coalesce per identity, so a burst of rejections of one grant spends one report
+   serving the rejected partition) and a read landing mid-ask is served but never adopted —
+   the pending ask blocks re-adopting the identity whose verdict is out — then drops again at
+   the verdict, with the death mark waiting for an `"expired"` answer; asks coalesce per identity, so a burst of rejections of one grant spends one report
    and one refetch; and the coordinator halves hold their own contracts — `snapshot`'s triple is
    atomic against a connect landing at the await boundary and notifies only a still-stored
    grant's confirmed death, `adjudicateRejection` gates moved-past identities ("" never matches)

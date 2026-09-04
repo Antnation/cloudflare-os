@@ -1162,6 +1162,39 @@ describe("CredentialSource", () => {
     expect(instance.authority()).toBe("gen-c");
   });
 
+  it("keeps a reconnect's authority when a fenced-out refetch re-serves the rejected identity", async () => {
+    // Same shape as above, but the dangling response re-serves the rejected identity itself. The
+    // re-serve branch undoes a refetch's adoption — this refetch adopted nothing, so acting on it
+    // would destroy the reconnect's live authority instead.
+    const reads: PromiseWithResolvers<CredentialsWithIdentity<Creds>>[] = [];
+    const getCredentials = vi.fn(() => {
+      const read = Promise.withResolvers<CredentialsWithIdentity<Creds>>();
+      reads.push(read);
+      return read.promise;
+    });
+    const reportCredentialsRejected = vi.fn(async (_identity: string) => "superseded" as const);
+    const { instance } = source({ account: () => ({ getCredentials, reportCredentialsRejected }) });
+
+    const gate = Promise.withResolvers<void>();
+    const runFirst = instance.run(async () => { throw new Error("401"); }, { replayable: true });
+    const runSecond = instance.run(async () => {
+      await gate.promise;
+      throw new Error("401");
+    }, { replayable: true });
+    reads[0].resolve({ creds: live, identity: "id-a", generation: "gen-a" });
+
+    await vi.waitFor(() => expect(reads).toHaveLength(2));
+    gate.resolve();
+    await vi.waitFor(() => expect(reads).toHaveLength(3));
+
+    reads[2].resolve({ creds: fresh, identity: "id-c", generation: "gen-c" });
+    await expect(runSecond).rejects.toThrow(CredentialsChangedError);
+    reads[1].resolve({ creds: live, identity: "id-a", generation: "gen-a" });
+    await expect(runFirst).rejects.toThrow(CredentialsChangedError);
+
+    expect(instance.authority()).toBe("gen-c");
+  });
+
   it("never runs the retry under a successor already adjudicated dead", async () => {
     const gate = Promise.withResolvers<void>();
     let current = { creds: live, identity: "id-a", generation: "gen-a" };
@@ -1191,6 +1224,48 @@ describe("CredentialSource", () => {
     // The slow retry's refetch returned the dead grant the account still serves: no provider call
     // runs under credentials the source confirmed dead.
     expect(slowOp).toHaveBeenCalledOnce();
+  });
+
+  it("re-enters instead of expiring when a dead successor's fenced-out refetch postdates a reconnect", async () => {
+    const reads: PromiseWithResolvers<CredentialsWithIdentity<Creds>>[] = [];
+    const getCredentials = vi.fn(() => {
+      const read = Promise.withResolvers<CredentialsWithIdentity<Creds>>();
+      reads.push(read);
+      return read.promise;
+    });
+    const reportCredentialsRejected = vi.fn(async (identity: string) =>
+      identity === "id-b" ? "expired" as const : "superseded" as const);
+    const { instance } = source({ account: () => ({ getCredentials, reportCredentialsRejected }) });
+
+    const gate = Promise.withResolvers<void>();
+    const first = vi.fn(async () => { throw new Error("401"); });
+    const runFirst = instance.run(first, { replayable: true });
+    const runSecond = instance.run(async () => {
+      await gate.promise;
+      throw new Error("401");
+    }, { replayable: true });
+    reads[0].resolve({ creds: live, identity: "id-a", generation: "gen-a" });
+
+    // The first run's refetch dangles; the second's verdict fences it out, and the second's own
+    // refetch adopts the healed successor — whose repeat rejection is then adjudicated dead.
+    await vi.waitFor(() => expect(reads).toHaveLength(2));
+    gate.resolve();
+    await vi.waitFor(() => expect(reads).toHaveLength(3));
+    reads[2].resolve({ creds: fresh, identity: "id-b", generation: "gen-a" });
+    await expect(runSecond).rejects.toThrow(CredentialsExpiredError);
+
+    // A reconnect is adopted before the dangling refetch answers with the dead successor.
+    const revived = instance.get();
+    await vi.waitFor(() => expect(reads).toHaveLength(4));
+    reads[3].resolve({ creds: fresh, identity: "id-c", generation: "gen-c" });
+    await revived;
+    reads[1].resolve({ creds: fresh, identity: "id-b", generation: "gen-a" });
+
+    // Stale evidence about a read the source no longer stands behind: re-enter, don't tell the
+    // caller a freshly reconnected account is expired.
+    await expect(runFirst).rejects.toThrow(CredentialsChangedError);
+    expect(first).toHaveBeenCalledOnce();
+    expect(instance.authority()).toBe("gen-c");
   });
 
   it("makes at most two attempts however many verdicts answer superseded", async () => {
@@ -1337,10 +1412,10 @@ describe("CredentialSource", () => {
   });
 
   it.each([
-    { verdict: "expired", error: CredentialsExpiredError },
-    { verdict: "superseded", error: CredentialsChangedError },
-  ] as const)("clears an authority adopted while the verdict was pending (verdict $verdict)",
-    async ({ verdict, error }) => {
+    { verdict: "expired", error: CredentialsExpiredError, readopted: undefined },
+    { verdict: "superseded", error: CredentialsChangedError, readopted: "gen-a" },
+  ] as const)("never re-adopts the rejected identity while its verdict is pending ($verdict)",
+    async ({ verdict, error, readopted }) => {
       const answer = Promise.withResolvers<RejectionVerdict>();
       const reportCredentialsRejected = vi.fn((_identity: string) => answer.promise);
       const instance = new CredentialSource<Creds>({
@@ -1355,14 +1430,18 @@ describe("CredentialSource", () => {
       const report = instance.run(async () => { throw new Error("401"); });
       await vi.waitFor(() => expect(reportCredentialsRejected).toHaveBeenCalled());
 
-      // A read landing mid-adjudication re-adopts the grant the account still serves; the
-      // verdict-time drop clears it, so the adoption cannot outlive the answer either way.
-      await instance.get();
-      expect(instance.authority()).toBe("gen-a");
+      // A read landing mid-adjudication is served but never adopted: the rejected partition must
+      // not come back to cache-first readers while the verdict is out.
+      expect(await instance.get()).toEqual(live);
+      expect(instance.authority()).toBeUndefined();
 
       answer.resolve(verdict);
       await expect(report).rejects.toThrow(error);
-      expect(instance.authority()).toBeUndefined();
+
+      // The bypass is the round trip, not the identity: once superseded settles, a fresh read
+      // adopts again, while a confirmed-dead identity stays refused.
+      await instance.get();
+      expect(instance.authority()).toBe(readopted);
     });
 
   it("stops vouching for a rejected authority while the verdict is pending", async () => {

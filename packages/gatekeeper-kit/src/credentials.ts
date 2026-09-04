@@ -549,7 +549,8 @@ export class CredentialSource<Creds> {
    * this accessor. Direct callers compose custom authorities for the raw cache constructor.
    * @returns The last-seen connection generation; `undefined` (principal unknown) until a fetch
    * succeeds, and from a reported — or account-refused — expiry until a fetch started after the
-   * report adopts an identity not reported dead. A refetch that re-serves the identity a
+   * report adopts an identity neither adjudicated dead nor still under adjudication. A refetch
+   * that re-serves the identity a
    * `"superseded"` verdict promised to replace drops it again.
    */
   authority(): string | undefined {
@@ -680,21 +681,24 @@ export class CredentialSource<Creds> {
     // A moved generation is a reconnect: never run under a principal the caller didn't start
     // with. The caller re-enters and fetches the new connection deliberately.
     if (second.generation !== first.generation) throw this.#changed(cause);
+    // A concurrent resolution already had this successor adjudicated dead — don't run under it.
+    // Only when it is the read the source last stood behind: a fenced-out refetch of a dead
+    // identity is stale evidence, adjudicating nothing the source stands behind now.
+    if (this.#dead.has(second.identity) && this.#identity === second.identity) {
+      throw new CredentialsExpiredError(this.#options.expiredMessage, { cause });
+    }
+    // Retry only under the read the source itself adopted: a fenced-out or since-superseded
+    // refetch is stale evidence that can postdate a reconnect the source already adopted, with
+    // no adoption of its own to act on — checked before the same-identity supersede below.
+    if (this.#generation !== second.generation || this.#identity !== second.identity) {
+      throw this.#changed(cause);
+    }
     // "Superseded" promised a successor; the same identity back means a lazy account re-served
     // the credentials the provider already rejected. Re-entering is honest — retrying would burn
     // the one retry proving nothing — and the refetch's adoption is undone: a just-rejected
     // credential cannot keep vouching for the cache partition.
     if (second.identity === first.identity) {
       this.#supersede();
-      throw this.#changed(cause);
-    }
-    // A concurrent resolution already had this successor adjudicated dead — don't run under it.
-    if (this.#dead.has(second.identity)) {
-      throw new CredentialsExpiredError(this.#options.expiredMessage, { cause });
-    }
-    // Retry only under the read the source itself adopted: a fenced-out or since-superseded
-    // refetch is stale evidence that can postdate a reconnect the source already adopted.
-    if (this.#generation !== second.generation || this.#identity !== second.identity) {
       throw this.#changed(cause);
     }
     // At most two attempts: a second rejection is adjudicated but never retried again.
@@ -735,12 +739,15 @@ export class CredentialSource<Creds> {
       if (fence === this.#clearFence && isCredentialsExpired(error)) this.#generation = undefined;
       throw error;
     }
-    // Dual guard, neither subsumes the other: the fence blocks fetches started before an expiry
+    // Three guards, none subsuming another: the fence blocks fetches started before an expiry
     // report (a straggler can carry any old identity, not just a marked one), the dead set blocks
-    // the grants the account keeps serving after their reports. The fence holds even against a
-    // read resolving a reconnect: generations are opaque and equality-only, so a fenced response
-    // cannot prove itself newest — authority stays the last unfenced fetch.
-    if (fence === this.#clearFence && !this.#dead.has(current.identity)) {
+    // the grants the account keeps serving after their reports, and the pending ask blocks a
+    // post-report fetch handing the rejected partition back before the verdict — cache-first
+    // readers bypass for the whole round trip. The fence holds even against a read resolving a
+    // reconnect: generations are opaque and equality-only, so a fenced response cannot prove
+    // itself newest — authority stays the last unfenced fetch.
+    if (fence === this.#clearFence && !this.#dead.has(current.identity)
+      && !this.#asks.pending(current.identity)) {
       this.#generation = current.generation;
       this.#identity = current.identity;
     }
