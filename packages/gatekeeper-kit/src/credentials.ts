@@ -27,9 +27,38 @@ export class CredentialsExpiredError extends Error {
   }
 }
 
-/** Matches confirmed expiry by name, which survives the RPC boundary where the class does not. */
-function isExpiredError(error: unknown): boolean {
+/**
+ * Credentials replaced while an operation was in flight: the rejection the operation saw was
+ * stale, nothing was adjudicated against the account, and the caller retries by re-entering.
+ */
+export class CredentialsChangedError extends Error {
+  /**
+   * Creates a retryable mid-operation replacement error.
+   * @param options Optional error cause — typically the stale provider rejection.
+   */
+  constructor(options?: { cause?: unknown }) {
+    super("This account's credentials changed during the operation; retry it.", options);
+    this.name = "CredentialsChangedError";
+  }
+}
+
+/**
+ * Matches confirmed expiry by name, which survives the RPC boundary where the class does not.
+ * @param error Caught error.
+ * @returns Whether the error is a confirmed credential expiry.
+ */
+export function isCredentialsExpired(error: unknown): boolean {
   return error instanceof Error && error.name === "CredentialsExpiredError";
+}
+
+/**
+ * Matches a retryable mid-operation credential replacement by name, which survives the RPC
+ * boundary where the class does not.
+ * @param error Caught error.
+ * @returns Whether the error marks the operation retryable.
+ */
+export function isCredentialsChanged(error: unknown): boolean {
+  return error instanceof Error && error.name === "CredentialsChangedError";
 }
 
 /**
@@ -305,7 +334,7 @@ export class CredentialCoordinator<Creds> {
     try {
       await this.fresh(refresh);
     } catch (error) {
-      if (isExpiredError(error) && this.stored() !== undefined && options.notify !== undefined) {
+      if (isCredentialsExpired(error) && this.stored() !== undefined && options.notify !== undefined) {
         await notified(options.notify);
       }
       throw error;
@@ -350,7 +379,7 @@ export class CredentialCoordinator<Creds> {
       // identity is no longer current.
       return "superseded";
     } catch (error) {
-      if (isExpiredError(error)) {
+      if (isCredentialsExpired(error)) {
         // A reconnect landing while the mint failed replaced the rejected grant; it wins.
         if (this.identity() !== identity) return "superseded";
         await notified(options.notify);
@@ -635,13 +664,12 @@ export class CredentialSource<Creds> {
       throw this.#changed(cause);
     }
     this.#supersede(identity);
-    throw new Error(this.#options.expiredMessage, { cause });
+    throw new CredentialsExpiredError(this.#options.expiredMessage, { cause });
   }
 
   /** @returns The retryable error for credentials replaced mid-operation. */
   #changed(cause: unknown): Error {
-    return new Error("This account's credentials changed during the operation; retry it.",
-      { cause });
+    return new CredentialsChangedError({ cause });
   }
 
   /**
@@ -691,7 +719,7 @@ export class CredentialSource<Creds> {
       if (this.#moved(rejected.generation)) throw this.#changed(error);
       // The channel confirming expiry is the account's own verdict: take the death fences, so a
       // read still in flight cannot restore the dead authority.
-      if (isExpiredError(error)) this.#supersede(rejected.identity);
+      if (isCredentialsExpired(error)) this.#supersede(rejected.identity);
       throw error;
     }
   }
@@ -710,7 +738,7 @@ export class CredentialSource<Creds> {
     } catch (error) {
       // A fetch rejecting with confirmed expiry (a failed refresh) reports the grant as dead as a
       // 401 does. Fenced like adoption: a straggler's stale rejection must not clear a revival.
-      if (fence === this.#clearFence && isExpiredError(error)) this.#generation = undefined;
+      if (fence === this.#clearFence && isCredentialsExpired(error)) this.#generation = undefined;
       throw error;
     }
     // Dual guard, neither subsumes the other: the fence blocks fetches started before an expiry

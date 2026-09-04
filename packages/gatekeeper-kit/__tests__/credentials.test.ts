@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   CredentialCoordinator,
+  CredentialsChangedError,
   CredentialsExpiredError,
   CredentialSource,
+  isCredentialsChanged,
+  isCredentialsExpired,
   type CredentialCoordinatorOptions,
   type CredentialsKv,
   type CredentialSourceOptions,
@@ -686,7 +689,41 @@ describe("CredentialCoordinator", () => {
   });
 });
 
+describe("credential errors", () => {
+  it("pins the fixed retryable message", () => {
+    // The one place the message is asserted: it is display-safe wording, not the contract — the
+    // contract is the name, matched below.
+    expect(new CredentialsChangedError().message)
+      .toBe("This account's credentials changed during the operation; retry it.");
+  });
+
+  it("matches a mid-operation replacement by name, surviving an RPC-stripped class", () => {
+    expect(isCredentialsChanged(new CredentialsChangedError({ cause: new Error("401") })))
+      .toBe(true);
+    expect(isCredentialsChanged(
+      Object.assign(new Error("stripped by transport"), { name: "CredentialsChangedError" })))
+      .toBe(true);
+    expect(isCredentialsChanged(new Error("some other failure"))).toBe(false);
+    expect(isCredentialsChanged(new CredentialsExpiredError("expired"))).toBe(false);
+    expect(isCredentialsChanged("not an error")).toBe(false);
+  });
+
+  it("matches confirmed expiry by name, surviving an RPC-stripped class", () => {
+    expect(isCredentialsExpired(new CredentialsExpiredError("expired"))).toBe(true);
+    expect(isCredentialsExpired(
+      Object.assign(new Error("stripped by transport"), { name: "CredentialsExpiredError" })))
+      .toBe(true);
+    expect(isCredentialsExpired(new Error("some other failure"))).toBe(false);
+    expect(isCredentialsExpired(new CredentialsChangedError())).toBe(false);
+    expect(isCredentialsExpired(undefined)).toBe(false);
+  });
+});
+
 describe("CredentialSource", () => {
+  // The one literal in the suite: run() must surface exactly the configured message on expiry, and
+  // every other assertion matches the error class instead.
+  const expiredMessage = "Reconnect the account.";
+
   function source(overrides: Partial<CredentialSourceOptions<Creds>> = {}) {
     const getCredentials =
       vi.fn(async () => ({ creds: live, identity: "id-a", generation: "gen-a" }));
@@ -694,7 +731,7 @@ describe("CredentialSource", () => {
     const instance = new CredentialSource<Creds>({
       account: () => ({ getCredentials, noteCredentialsExpired }),
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
       ...overrides,
     });
     return { instance, getCredentials, noteCredentialsExpired };
@@ -726,7 +763,7 @@ describe("CredentialSource", () => {
         noteCredentialsExpired: async () => "accepted" as const,
       }),
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
     // Nothing fetched yet: a cache keyed on this must bypass, not hit a props-keyed partition.
     expect(instance.authority()).toBeUndefined();
@@ -736,7 +773,7 @@ describe("CredentialSource", () => {
 
     // A reported expiry means a reconnect will rotate the generation; forget the old one.
     await expect(instance.run(async () => { throw new Error("401"); }))
-      .rejects.toThrow("Reconnect the account.");
+      .rejects.toThrow(CredentialsExpiredError);
     expect(instance.authority()).toBeUndefined();
 
     // The account keeps the dead grant until reconnect: refetching the same identity must not
@@ -754,8 +791,10 @@ describe("CredentialSource", () => {
   it("reports expiry against the identity the failed call used", async () => {
     const { instance, getCredentials, noteCredentialsExpired } = source();
 
-    await expect(instance.run(async () => { throw new Error("401"); }))
-      .rejects.toThrow("Reconnect the account.");
+    const failure = instance.run(async () => { throw new Error("401"); });
+    await expect(failure).rejects.toThrow(CredentialsExpiredError);
+    // The one message pin: expiry surfaces exactly the configured display-safe wording.
+    await expect(failure).rejects.toThrow(expiredMessage);
     expect(noteCredentialsExpired).toHaveBeenCalledWith("id-a");
 
     await instance.get();
@@ -776,7 +815,7 @@ describe("CredentialSource", () => {
       account: () => ({ getCredentials, noteCredentialsExpired }),
       refreshCredentials,
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
     return { instance, getCredentials, refreshCredentials, noteCredentialsExpired };
   }
@@ -820,7 +859,7 @@ describe("CredentialSource", () => {
     const operation = vi.fn(async () => { throw new Error("401"); });
 
     await expect(instance.run(operation, { replayable: true }))
-      .rejects.toThrow("Reconnect the account.");
+      .rejects.toThrow(CredentialsExpiredError);
 
     expect(operation).toHaveBeenCalledTimes(2);
     expect(noteCredentialsExpired).toHaveBeenCalledOnce();
@@ -834,7 +873,7 @@ describe("CredentialSource", () => {
       async () => ({ creds: fresh, identity: "id-b", generation: "gen-a" }));
 
     await expect(instance.run(async () => { throw new Error("401"); }, { replayable: true }))
-      .rejects.toThrow("Reconnect the account.");
+      .rejects.toThrow(CredentialsExpiredError);
 
     // The report must name what was replayed: the account gates on its current identity, so naming
     // the pre-rotation grant would be gated out, leaving the dead grant accepted and the Workshop
@@ -866,11 +905,11 @@ describe("CredentialSource", () => {
         noteCredentialsExpired,
       }),
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     await expect(instance.run(async () => { throw new Error("401"); }))
-      .rejects.toThrow("credentials changed during the operation");
+      .rejects.toThrow(CredentialsChangedError);
     expect(noteCredentialsExpired).toHaveBeenCalledWith("id-a");
     // The refusal proves this snapshot stale: its authority cannot vouch for the current
     // principal, so caches bypass until the next read re-establishes it.
@@ -882,7 +921,7 @@ describe("CredentialSource", () => {
       async () => ({ creds: fresh, identity: "id-b", generation: "gen-b" }));
 
     await expect(instance.run(async () => { throw new Error("401"); }, { replayable: true }))
-      .rejects.toThrow("credentials changed during the operation");
+      .rejects.toThrow(CredentialsChangedError);
 
     // The replacement belongs to a connection the caller never fetched: replaying could act as a
     // different principal, and reporting would retire the grant the user just connected. The
@@ -899,22 +938,22 @@ describe("CredentialSource", () => {
 
     // The first run replays the rotated mint and has its grant (id-b) reported dead.
     await expect(instance.run(operation, { replayable: true }))
-      .rejects.toThrow("Reconnect the account.");
+      .rejects.toThrow(CredentialsExpiredError);
     expect(operation).toHaveBeenCalledTimes(2);
 
     // A later rejection whose refresh resolves to the dead grant reports instead of replaying.
     await expect(instance.run(operation, { replayable: true }))
-      .rejects.toThrow("Reconnect the account.");
+      .rejects.toThrow(CredentialsExpiredError);
     expect(operation).toHaveBeenCalledTimes(3);
     expect(noteCredentialsExpired).toHaveBeenCalledTimes(2);
     expect(noteCredentialsExpired).toHaveBeenLastCalledWith("id-b");
   });
 
   it.each([
-    { verdict: "accepted", message: "Reconnect the account." },
-    { verdict: "superseded", message: "credentials changed" },
+    { verdict: "accepted", error: CredentialsExpiredError },
+    { verdict: "superseded", error: CredentialsChangedError },
   ] as const)("clears an authority adopted while the expiry answer was pending (verdict $verdict)",
-    async ({ verdict, message }) => {
+    async ({ verdict, error }) => {
       const answer = Promise.withResolvers<ExpiryVerdict>();
       const noteCredentialsExpired = vi.fn((_identity: string) => answer.promise);
       const instance = new CredentialSource<Creds>({
@@ -923,7 +962,7 @@ describe("CredentialSource", () => {
           noteCredentialsExpired,
         }),
         isAuthError: error => error instanceof Error && error.message === "401",
-        expiredMessage: "Reconnect the account.",
+        expiredMessage,
       });
 
       const report = instance.run(async () => { throw new Error("401"); });
@@ -935,7 +974,7 @@ describe("CredentialSource", () => {
       expect(instance.authority()).toBe("gen-a");
 
       answer.resolve(verdict);
-      await expect(report).rejects.toThrow(message);
+      await expect(report).rejects.toThrow(error);
       expect(instance.authority()).toBeUndefined();
     });
 
@@ -959,7 +998,7 @@ describe("CredentialSource", () => {
     expect(instance.authority()).toBeUndefined();
 
     answer.resolve("accepted");
-    await expect(report).rejects.toThrow("Reconnect the account.");
+    await expect(report).rejects.toThrow(CredentialsExpiredError);
   });
 
   it("reports a rejection served by a fenced read once the authority is unknown", async () => {
@@ -974,7 +1013,7 @@ describe("CredentialSource", () => {
         noteCredentialsExpired,
       }),
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     const first = instance.run(async () => { throw new Error("401"); });
@@ -987,12 +1026,12 @@ describe("CredentialSource", () => {
     const second = instance.run(async () => { throw new Error("401"); });
     await vi.waitFor(() => expect(reads).toHaveLength(2));
     answer.resolve("superseded");
-    await expect(first).rejects.toThrow("credentials changed");
+    await expect(first).rejects.toThrow(CredentialsChangedError);
     reads[1]({ creds: fresh, identity: "id-b", generation: "gen-b" });
 
     // The retained id-a identity is no successor once its authority dropped — the failure under
     // the account's actual current credential must reach the account, not resolve as stale.
-    await expect(second).rejects.toThrow("Reconnect the account.");
+    await expect(second).rejects.toThrow(CredentialsExpiredError);
     expect(noteCredentialsExpired).toHaveBeenLastCalledWith("id-b");
   });
 
@@ -1008,7 +1047,7 @@ describe("CredentialSource", () => {
       }),
       refreshCredentials,
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     const replay = instance.run(async () => { throw new Error("401"); }, { replayable: true });
@@ -1020,7 +1059,7 @@ describe("CredentialSource", () => {
     const refused = instance.run(async () => { throw new Error("401"); });
     await vi.waitFor(() => expect(reads).toHaveLength(2));
     reads[1]({ creds: live, identity: "id-a", generation: "gen-a" });
-    await expect(refused).rejects.toThrow("credentials changed");
+    await expect(refused).rejects.toThrow(CredentialsChangedError);
     expect(instance.authority()).toBeUndefined();
 
     // A read started after the refusal can still resolve pre-reconnect account state.
@@ -1029,7 +1068,7 @@ describe("CredentialSource", () => {
 
     // The crossing must fence again, or that straggler restores the gen-a partition.
     refreshGate.resolve({ creds: fresh, identity: "id-b", generation: "gen-b" });
-    await expect(replay).rejects.toThrow("credentials changed");
+    await expect(replay).rejects.toThrow(CredentialsChangedError);
     reads[2]({ creds: live, identity: "id-a", generation: "gen-a" });
     expect(await straggler).toEqual(live);
     expect(instance.authority()).toBeUndefined();
@@ -1058,7 +1097,7 @@ describe("CredentialSource", () => {
     // The outcome is already decided: no mint is spent on the superseded read, and a refresh
     // failure or stall cannot reach a caller who only needs to re-enter.
     stalled.release();
-    await expect(stalled.run).rejects.toThrow("credentials changed");
+    await expect(stalled.run).rejects.toThrow(CredentialsChangedError);
     expect(refreshCredentials).not.toHaveBeenCalled();
     expect(instance.authority()).toBe("gen-b");
   });
@@ -1080,7 +1119,7 @@ describe("CredentialSource", () => {
       account: () => ({ getCredentials: async () => current, noteCredentialsExpired }),
       refreshCredentials: async () => ({ creds: fresh, identity: "id-b", generation: "gen-a" }),
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     await expect(instance.run(async creds => {
@@ -1089,7 +1128,7 @@ describe("CredentialSource", () => {
       current = { creds: live, identity: "id-c", generation: "gen-c" };
       await instance.get();
       throw new Error("401");
-    }, { replayable: true })).rejects.toThrow("credentials changed during the operation");
+    }, { replayable: true })).rejects.toThrow(CredentialsChangedError);
 
     // The mint the replay used was superseded by the adopted reconnect: the account's only
     // possible verdict is already known, so no ask is spent and the live authority stands.
@@ -1165,7 +1204,7 @@ describe("CredentialSource", () => {
       }),
       refreshCredentials,
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     const gate = Promise.withResolvers<void>();
@@ -1203,7 +1242,7 @@ describe("CredentialSource", () => {
       account: () => ({ getCredentials, noteCredentialsExpired }),
       refreshCredentials: () => refreshGate.promise,
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     const firstAttempt = Promise.withResolvers<void>();
@@ -1231,7 +1270,7 @@ describe("CredentialSource", () => {
     // The pre-refresh read must not overwrite the successor: the replay's rejection is the
     // freshest evidence, so it reports rather than dying as "changed".
     replayGate.resolve();
-    await expect(call).rejects.toThrow("Reconnect the account.");
+    await expect(call).rejects.toThrow(CredentialsExpiredError);
     expect(noteCredentialsExpired).toHaveBeenCalledOnce();
     expect(noteCredentialsExpired).toHaveBeenCalledWith("id-b");
   });
@@ -1249,10 +1288,10 @@ describe("CredentialSource", () => {
     });
     const fast = instance.run(async () => { throw new Error("401"); }, { replayable: true });
     const slow = instance.run(slowOp, { replayable: true });
-    await expect(fast).rejects.toThrow("Reconnect the account.");
+    await expect(fast).rejects.toThrow(CredentialsExpiredError);
 
     gate.resolve();
-    await expect(slow).rejects.toThrow("Reconnect the account.");
+    await expect(slow).rejects.toThrow(CredentialsExpiredError);
     expect(noteCredentialsExpired).toHaveBeenCalledWith("id-a");
     // No second mint and no provider call under credentials the source confirmed dead.
     expect(refreshCredentials).toHaveBeenCalledOnce();
@@ -1279,7 +1318,7 @@ describe("CredentialSource", () => {
       account: () => ({ getCredentials, noteCredentialsExpired }),
       refreshCredentials: () => refreshGate.promise,
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     const firstAttempt = Promise.withResolvers<void>();
@@ -1310,7 +1349,7 @@ describe("CredentialSource", () => {
     // account could return is already known, so the caller re-enters without an ask and the
     // reconnect's live authority stands.
     replayGate.resolve();
-    await expect(call).rejects.toThrow("credentials changed during the operation");
+    await expect(call).rejects.toThrow(CredentialsChangedError);
     expect(noteCredentialsExpired).not.toHaveBeenCalled();
     expect(instance.authority()).toBe("gen-b");
   });
@@ -1327,7 +1366,7 @@ describe("CredentialSource", () => {
         return refreshGate.promise;
       },
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     const firstAttempt = Promise.withResolvers<void>();
@@ -1346,7 +1385,7 @@ describe("CredentialSource", () => {
     // The late result belongs to the replaced connection: adopting it would put the cache back on
     // the dead partition, and replaying it would act as the old principal.
     refreshGate.resolve({ creds: fresh, identity: "id-b", generation: "gen-a" });
-    await expect(call).rejects.toThrow("credentials changed during the operation");
+    await expect(call).rejects.toThrow(CredentialsChangedError);
     expect(instance.authority()).toBe("gen-b");
     expect(noteCredentialsExpired).not.toHaveBeenCalled();
   });
@@ -1363,7 +1402,7 @@ describe("CredentialSource", () => {
         return refreshGate.promise;
       },
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     const firstAttempt = Promise.withResolvers<void>();
@@ -1380,7 +1419,7 @@ describe("CredentialSource", () => {
     // The expiry belongs to the replaced grant's lineage; the live successor decides now, so the
     // caller re-enters instead of seeing an expiry the reconnect already answered.
     refreshGate.reject(new CredentialsExpiredError("invalid_grant"));
-    await expect(call).rejects.toThrow("credentials changed during the operation");
+    await expect(call).rejects.toThrow(CredentialsChangedError);
     expect(instance.authority()).toBe("gen-b");
     expect(noteCredentialsExpired).not.toHaveBeenCalled();
   });
@@ -1397,7 +1436,7 @@ describe("CredentialSource", () => {
         return refreshGate.promise;
       },
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     const firstAttempt = Promise.withResolvers<void>();
@@ -1414,7 +1453,7 @@ describe("CredentialSource", () => {
     // The mint was for a grant the reconnect replaced; its infrastructure trouble is not this
     // caller's outcome — the retry reads fresh and surfaces any real outage itself.
     refreshGate.reject(new Error("mint transport lost"));
-    await expect(call).rejects.toThrow("credentials changed during the operation");
+    await expect(call).rejects.toThrow(CredentialsChangedError);
     expect(instance.authority()).toBe("gen-b");
     expect(noteCredentialsExpired).not.toHaveBeenCalled();
   });
@@ -1437,12 +1476,12 @@ describe("CredentialSource", () => {
       account: () => ({ getCredentials: async () => current, noteCredentialsExpired }),
       refreshCredentials,
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     // A first run has the mint id-b adjudicated dead.
     await expect(instance.run(async () => { throw new Error("401"); }, { replayable: true }))
-      .rejects.toThrow("Reconnect the account.");
+      .rejects.toThrow(CredentialsExpiredError);
     expect(noteCredentialsExpired).toHaveBeenCalledWith("id-b");
 
     // A second run's refresh response is still in flight when a reconnect lands and is adopted.
@@ -1455,7 +1494,7 @@ describe("CredentialSource", () => {
     // The delayed response carries the dead mint, but the read it answers is superseded: the
     // dead shortcut must not adjudicate it against the live successor.
     lateRefresh.resolve({ creds: fresh, identity: "id-b", generation: "gen-a" });
-    await expect(call).rejects.toThrow("credentials changed during the operation");
+    await expect(call).rejects.toThrow(CredentialsChangedError);
     expect(noteCredentialsExpired).toHaveBeenCalledTimes(1);
     expect(instance.authority()).toBe("gen-c");
   });
@@ -1491,12 +1530,12 @@ describe("CredentialSource", () => {
 
     // The first refresh observes the reconnect's crossing: gen-a is now proven superseded.
     crossing.resolve({ creds: fresh, identity: "id-b", generation: "gen-b" });
-    await expect(one).rejects.toThrow("credentials changed during the operation");
+    await expect(one).rejects.toThrow(CredentialsChangedError);
 
     // The second read's mint ran before the reconnect and its response arrives after the crossing
     // was observed: it must never be replayed, even with the authority already unknown.
     delayed.resolve({ creds: fresh, identity: "id-c", generation: "gen-a" });
-    await expect(two).rejects.toThrow("credentials changed during the operation");
+    await expect(two).rejects.toThrow(CredentialsChangedError);
     expect(operation).toHaveBeenCalledTimes(2);
     expect(noteCredentialsExpired).not.toHaveBeenCalled();
   });
@@ -1523,19 +1562,19 @@ describe("CredentialSource", () => {
     // A third run's rotated mint (id-b) is replayed and adjudicated dead, clearing the authority
     // with no crossing observed by any adoption.
     await expect(instance.run(async () => { throw new Error("401"); }, { replayable: true }))
-      .rejects.toThrow("Reconnect the account.");
+      .rejects.toThrow(CredentialsExpiredError);
     expect(noteCredentialsExpired).toHaveBeenCalledWith("id-b");
     expect(instance.authority()).toBeUndefined();
 
     // The first stalled run's mint is that dead identity on a newer generation: the crossing is
     // recorded and the read refused — never adjudicated against the dead set.
     one.release();
-    await expect(one.run).rejects.toThrow("credentials changed during the operation");
+    await expect(one.run).rejects.toThrow(CredentialsChangedError);
     expect(noteCredentialsExpired).toHaveBeenCalledTimes(1);
 
     // The recorded crossing refuses the second gen-a read before it can spend the channel.
     two.release();
-    await expect(two.run).rejects.toThrow("credentials changed during the operation");
+    await expect(two.run).rejects.toThrow(CredentialsChangedError);
     expect(refreshCredentials).toHaveBeenCalledTimes(2);
   });
 
@@ -1556,12 +1595,12 @@ describe("CredentialSource", () => {
     current = { creds: live, identity: "id-c", generation: "gen-b" };
     expect(await instance.get()).toEqual(live);
     await expect(instance.run(async () => { throw new Error("401"); }))
-      .rejects.toThrow("Reconnect the account.");
+      .rejects.toThrow(CredentialsExpiredError);
     expect(instance.authority()).toBeUndefined();
 
     // The stalled gen-a read is refused on the recorded crossing without spending the channel.
     stalled.release();
-    await expect(stalled.run).rejects.toThrow("credentials changed during the operation");
+    await expect(stalled.run).rejects.toThrow(CredentialsChangedError);
     expect(refreshCredentials).not.toHaveBeenCalled();
   });
 
@@ -1584,22 +1623,22 @@ describe("CredentialSource", () => {
 
     // A refused report clears the authority (no death) while the first run's mint is still out.
     await expect(instance.run(async () => { throw new Error("401"); }))
-      .rejects.toThrow("credentials changed during the operation");
+      .rejects.toThrow(CredentialsChangedError);
     current = { creds: live, identity: "id-b", generation: "gen-b" };
     expect(await instance.get()).toEqual(live);
 
     // The first run's mint resolves under the adopted reconnect: refused, with the crossing
     // recorded at the refusal itself as well as at the adoption.
     mint.resolve({ creds: fresh, identity: "id-c", generation: "gen-a" });
-    await expect(one.run).rejects.toThrow("credentials changed during the operation");
+    await expect(one.run).rejects.toThrow(CredentialsChangedError);
 
     // The reconnect's grant dies and clears the authority; only the recorded crossing now proves
     // the second stalled gen-a read superseded, keeping its delayed mint unreplayed.
     await expect(instance.run(async () => { throw new Error("401"); }))
-      .rejects.toThrow("Reconnect the account.");
+      .rejects.toThrow(CredentialsExpiredError);
     expect(instance.authority()).toBeUndefined();
     two.release();
-    await expect(two.run).rejects.toThrow("credentials changed during the operation");
+    await expect(two.run).rejects.toThrow(CredentialsChangedError);
     expect(refreshCredentials).toHaveBeenCalledTimes(1);
   });
 
@@ -1617,7 +1656,7 @@ describe("CredentialSource", () => {
     current = { creds: live, identity: "id-b", generation: "gen-b" };
     expect(await instance.get()).toEqual(live);
     await expect(instance.run(async () => { throw new Error("401"); }))
-      .rejects.toThrow("Reconnect the account.");
+      .rejects.toThrow(CredentialsExpiredError);
     expect(noteCredentialsExpired).toHaveBeenCalledWith("id-b");
     expect(instance.authority()).toBeUndefined();
 
@@ -1625,7 +1664,7 @@ describe("CredentialSource", () => {
     // an "accepted" verdict here would bury a stale identity in the dead set and prompt a
     // reconnect right after one succeeded.
     stalled.release();
-    await expect(stalled.run).rejects.toThrow("credentials changed during the operation");
+    await expect(stalled.run).rejects.toThrow(CredentialsChangedError);
     expect(noteCredentialsExpired).toHaveBeenCalledTimes(1);
   });
 
@@ -1646,7 +1685,7 @@ describe("CredentialSource", () => {
 
     // A refused report clears the authority before any crossing is observed.
     await expect(instance.run(async () => { throw new Error("401"); }))
-      .rejects.toThrow("credentials changed");
+      .rejects.toThrow(CredentialsChangedError);
 
     // The reconnect is adopted from that unknown authority: the last-seen generation, which
     // survives the clear, is what records the crossing.
@@ -1656,12 +1695,12 @@ describe("CredentialSource", () => {
     // The new grant dies too, clearing the authority again.
     verdict = "accepted";
     await expect(instance.run(async () => { throw new Error("401"); }))
-      .rejects.toThrow("Reconnect the account.");
+      .rejects.toThrow(CredentialsExpiredError);
 
     // The delayed gen-a mint arrives under two clears straddling the reconnect: refused, never
     // replayed under the pre-reconnect principal.
     mint.resolve({ creds: fresh, identity: "id-a2", generation: "gen-a" });
-    await expect(stalled.run).rejects.toThrow("credentials changed during the operation");
+    await expect(stalled.run).rejects.toThrow(CredentialsChangedError);
     expect(noteCredentialsExpired).toHaveBeenCalledTimes(2);
   });
 
@@ -1677,7 +1716,7 @@ describe("CredentialSource", () => {
         return refreshGate.promise;
       },
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     const firstAttempt = Promise.withResolvers<void>();
@@ -1696,7 +1735,7 @@ describe("CredentialSource", () => {
     // The stale mint replays and is rejected; the account, which can order them, refuses the
     // report — the caller retries, and the authority bypasses until the next read.
     refreshGate.resolve({ creds: fresh, identity: "id-b", generation: "gen-a" });
-    await expect(call).rejects.toThrow("credentials changed during the operation");
+    await expect(call).rejects.toThrow(CredentialsChangedError);
     expect(noteCredentialsExpired).toHaveBeenCalledWith("id-b");
     expect(instance.authority()).toBeUndefined();
   });
@@ -1710,7 +1749,7 @@ describe("CredentialSource", () => {
     const instance = new CredentialSource<Creds>({
       account: () => ({ getCredentials, noteCredentialsExpired }),
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     const gate = Promise.withResolvers<void>();
@@ -1720,13 +1759,13 @@ describe("CredentialSource", () => {
       throw new Error("401");
     });
     reads[0]?.({ creds: live, identity: "id-a", generation: "gen-a" });
-    await expect(fast).rejects.toThrow("Reconnect the account.");
+    await expect(fast).rejects.toThrow(CredentialsExpiredError);
     expect(instance.authority()).toBeUndefined();
 
     // A read opens while the authority is unknown, and a second report fences it in flight.
     const pending = instance.get();
     gate.resolve();
-    await expect(slow).rejects.toThrow("Reconnect the account.");
+    await expect(slow).rejects.toThrow(CredentialsExpiredError);
 
     // Resolving now must not restore authority: this is a fenced response, not a fetch started
     // after the report — however its generation compares to the unknown one it opened under.
@@ -1745,7 +1784,7 @@ describe("CredentialSource", () => {
       account: () => ({ getCredentials, noteCredentialsExpired }),
       refreshCredentials: async () => { throw new CredentialsExpiredError("invalid_grant"); },
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     const firstAttempt = Promise.withResolvers<void>();
@@ -1778,7 +1817,7 @@ describe("CredentialSource", () => {
         noteCredentialsExpired,
       }),
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     await expect(instance.run(async () => {
@@ -1787,7 +1826,7 @@ describe("CredentialSource", () => {
       generation = "gen-b";
       await instance.get();
       throw new Error("401");
-    })).rejects.toThrow("credentials changed during the operation");
+    })).rejects.toThrow(CredentialsChangedError);
 
     // Reporting would expire the grant the user just reconnected, and clearing the authority
     // would drop its live partition; both belong to the grant that actually died.
@@ -1806,7 +1845,7 @@ describe("CredentialSource", () => {
       });
 
       await expect(instance.run(async () => { throw new Error("401"); }))
-        .rejects.toThrow("Reconnect the account.");
+        .rejects.toThrow(CredentialsExpiredError);
       expect(logged).toHaveBeenCalledOnce();
     } finally {
       logged.mockRestore();
@@ -1828,7 +1867,7 @@ describe("CredentialSource", () => {
     const instance = new CredentialSource<Creds>({
       account: () => ({ getCredentials, noteCredentialsExpired: async () => "accepted" as const }),
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     // Two provider calls share one fetch, the way parallel calls in one gadget request do.
@@ -1846,13 +1885,13 @@ describe("CredentialSource", () => {
 
     // The first 401 empties the cache, so the next caller opens a second fetch...
     second.resolve();
-    await expect(secondCall).rejects.toThrow("Reconnect the account.");
+    await expect(secondCall).rejects.toThrow(CredentialsExpiredError);
     const riding = instance.get();
     expect(getCredentials).toHaveBeenCalledTimes(2);
 
     // ...which is still in flight when the second 401 declares those credentials dead.
     first.resolve();
-    await expect(firstCall).rejects.toThrow("Reconnect the account.");
+    await expect(firstCall).rejects.toThrow(CredentialsExpiredError);
 
     // Riding it would hand a caller credentials that have already been reported expired.
     const after = instance.get();
@@ -1874,7 +1913,7 @@ describe("CredentialSource", () => {
     const instance = new CredentialSource<Creds>({
       account: () => ({ getCredentials, noteCredentialsExpired: async () => "accepted" as const }),
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     const gate = Promise.withResolvers<void>();
@@ -1890,7 +1929,7 @@ describe("CredentialSource", () => {
     const pending = instance.get();
     expect(getCredentials).toHaveBeenCalledTimes(2);
     gate.resolve();
-    await expect(call).rejects.toThrow("Reconnect the account.");
+    await expect(call).rejects.toThrow(CredentialsExpiredError);
     expect(instance.authority()).toBeUndefined();
 
     // That fetch resolving carries the dead grant's generation; adopting it would put the cache
@@ -1917,7 +1956,7 @@ describe("CredentialSource", () => {
         noteCredentialsExpired: async () => "accepted" as const,
       }),
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     await instance.get();
@@ -1929,9 +1968,9 @@ describe("CredentialSource", () => {
     expect(instance.authority()).toBe("gen-a");
 
     // A failed refresh is a confirmed expiry. RPC strips the class, so the name is the contract.
-    failure = Object.assign(new Error("Reconnect the account."),
+    failure = Object.assign(new Error("grant expired upstream"),
       { name: "CredentialsExpiredError" });
-    await expect(instance.get()).rejects.toThrow("Reconnect the account.");
+    await expect(instance.get()).rejects.toThrow("grant expired upstream");
     expect(instance.authority()).toBeUndefined();
   });
 
@@ -1945,7 +1984,7 @@ describe("CredentialSource", () => {
     const instance = new CredentialSource<Creds>({
       account: () => ({ getCredentials, noteCredentialsExpired: async () => "accepted" as const }),
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     // Grant A is adopted, another fetch opens, then A's expiry forgets that fetch mid-flight.
@@ -1955,7 +1994,7 @@ describe("CredentialSource", () => {
     expect(await instance.get()).toEqual(live);
     const straggler = instance.get();
     gate.resolve();
-    await expect(call).rejects.toThrow("Reconnect the account.");
+    await expect(call).rejects.toThrow(CredentialsExpiredError);
 
     // A successful refresh commits a new identity on the same connection: the partition revives.
     const revived = instance.get();
@@ -1965,8 +2004,8 @@ describe("CredentialSource", () => {
 
     // The forgotten fetch's stale coalesced refresh finally fails; it must not clear the revival.
     fetches[1]?.reject(
-      Object.assign(new Error("Reconnect the account."), { name: "CredentialsExpiredError" }));
-    await expect(straggler).rejects.toThrow("Reconnect the account.");
+      Object.assign(new Error("grant expired upstream"), { name: "CredentialsExpiredError" }));
+    await expect(straggler).rejects.toThrow("grant expired upstream");
     expect(instance.authority()).toBe("gen-a");
   });
 
@@ -1978,7 +2017,7 @@ describe("CredentialSource", () => {
     const instance = new CredentialSource<Creds>({
       account: () => ({ getCredentials, noteCredentialsExpired: async () => "accepted" as const }),
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     // Grant A is adopted, another fetch opens, then A's expiry forgets that fetch mid-flight.
@@ -1989,12 +2028,12 @@ describe("CredentialSource", () => {
     const straggler = instance.get();
     expect(getCredentials).toHaveBeenCalledTimes(2);
     gate.resolve();
-    await expect(callA).rejects.toThrow("Reconnect the account.");
+    await expect(callA).rejects.toThrow(CredentialsExpiredError);
 
     // Grant B is adopted and dies too, rotating the dead marker away from A.
     const callB = instance.run(async () => { throw new Error("401"); });
     fetches[2]?.({ creds: live, identity: "id-b", generation: "gen-b" });
-    await expect(callB).rejects.toThrow("Reconnect the account.");
+    await expect(callB).rejects.toThrow(CredentialsExpiredError);
     expect(instance.authority()).toBeUndefined();
 
     // The straggler resolves with A, which no longer matches the marker. Adopting it would
@@ -2006,7 +2045,7 @@ describe("CredentialSource", () => {
     // A failure under the still-current dead grant routes to expiry, not "retry".
     const callC = instance.run(async () => { throw new Error("401"); });
     fetches[3]?.({ creds: live, identity: "id-b", generation: "gen-b" });
-    await expect(callC).rejects.toThrow("Reconnect the account.");
+    await expect(callC).rejects.toThrow(CredentialsExpiredError);
     expect(instance.authority()).toBeUndefined();
   });
 
@@ -2019,7 +2058,7 @@ describe("CredentialSource", () => {
     const instance = new CredentialSource<Creds>({
       account: () => ({ getCredentials, noteCredentialsExpired }),
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     // Grant A is adopted, a concurrent operation's fetch opens, then A's expiry fences it out.
@@ -2030,12 +2069,12 @@ describe("CredentialSource", () => {
     const callB = instance.run(async () => { throw new Error("401"); });
     expect(getCredentials).toHaveBeenCalledTimes(2);
     gate.resolve();
-    await expect(callA).rejects.toThrow("Reconnect the account.");
+    await expect(callA).rejects.toThrow(CredentialsExpiredError);
 
     // The fenced-out fetch delivers B, which fails too. Nothing live was adopted since A's
     // report, so "the credentials changed" would be a lie — B's death is fresh evidence.
     fetches[1]?.({ creds: live, identity: "id-b", generation: "gen-a" });
-    await expect(callB).rejects.toThrow("Reconnect the account.");
+    await expect(callB).rejects.toThrow(CredentialsExpiredError);
     expect(noteCredentialsExpired).toHaveBeenCalledWith("id-b");
     expect(instance.authority()).toBeUndefined();
 
@@ -2055,7 +2094,7 @@ describe("CredentialSource", () => {
     const instance = new CredentialSource<Creds>({
       account: () => ({ getCredentials, noteCredentialsExpired: async () => "accepted" as const }),
       isAuthError: error => error instanceof Error && error.message === "401",
-      expiredMessage: "Reconnect the account.",
+      expiredMessage,
     });
 
     // Nine operations park holding distinct stale identities, read one at a time so nothing
@@ -2077,9 +2116,9 @@ describe("CredentialSource", () => {
     // is adopted and dies, then every stale operation reports its own identity dead.
     const callB = instance.run(async () => { throw new Error("401"); });
     fetches[9]?.({ creds: live, identity: "id-b", generation: "gen-a" });
-    await expect(callB).rejects.toThrow("Reconnect the account.");
+    await expect(callB).rejects.toThrow(CredentialsExpiredError);
     for (const gate of gates) gate.resolve();
-    for (const failure of stale) await expect(failure).rejects.toThrow("Reconnect the account.");
+    for (const failure of stale) await expect(failure).rejects.toThrow(CredentialsExpiredError);
 
     // The stale reports land after B's in mark order; none may push B back into adoption.
     const refetch = instance.get();
