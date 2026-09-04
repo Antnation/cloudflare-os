@@ -2491,7 +2491,8 @@ class OverseerImpl implements AgentHooks {
         // on the post-apply describe refresh, but that refresh is best-effort, so accept an
         // approved action as proof too -- reaping on `provisional` alone could sever a real
         // provider resource. (The scan runs only on this rare stuck-provisional path; the index
-        // yields just the resolved type-"action" records, skipping observations.)
+        // yields the type-"action" records, pending included, skipping observations and hooks --
+        // the state check below is load-bearing.)
         let created = !record.provisional ||
             Iterator.from(this.storage.actions.byHistoryFilter.get("action")).some(action =>
                 action.gatekeeperId === record.id && action.state === "approved");
@@ -8628,8 +8629,11 @@ class OverseerImpl implements AgentHooks {
   getActionState(actionId: number)
       : {gatekeeperId: WorkpieceId, state: ActionState, resourceUrl?: string} | undefined {
     let action = this.storage.actions.get(actionId);
-    if (!action) return undefined;
-    let gatekeeper = this.storage.gatekeepers.get(action.gatekeeperId);
+    // Observations and hooks share the record space but are stamped "approved" at creation;
+    // only type-"action" records carry a real user decision.
+    if (action?.type !== "action") return undefined;
+    let gatekeeper = action.state === "approved"
+        ? this.storage.gatekeepers.get(action.gatekeeperId) : undefined;
     return {
       gatekeeperId: action.gatekeeperId,
       state: action.state,
@@ -9049,6 +9053,7 @@ class OverseerImpl implements AgentHooks {
     // spliced into the transcript. On failure, no half-created workpiece survives.
     // (submitCreationAction is optional on Gatekeeper; a creatable-advertising vendor must
     // implement it, so view the facet through the usual Required<Pick<...>> stub shape.)
+    let awaitDecisionBefore = this.#capturedActions.get(chatId)?.awaitDecision ?? false;
     try {
       let facet = this.getGatekeeperFacet(gatekeeperId) as unknown as
           Fetcher<Gatekeeper<any> & Required<Pick<Gatekeeper<any>, "submitCreationAction">>>;
@@ -9057,8 +9062,12 @@ class OverseerImpl implements AgentHooks {
       await facet.submitCreationAction(queue as unknown as ApprovalQueue);
     } catch (error) {
       // The facet may have queued its action durably before the RPC failed; settle it with the
-      // gatekeeper or the pending record would be unresolvable (its facet is gone).
+      // gatekeeper or the pending record would be unresolvable (its facet is gone). Any
+      // awaitDecision latch it set must unwind with it -- the settled action can never be
+      // decided, and suspending the turn would hide {created: false} from the model.
       this.#rejectPendingActionsAndRemoveGatekeeper(gatekeeperId);
+      let captured = this.#capturedActions.get(chatId);
+      if (captured) captured.awaitDecision = awaitDecisionBefore;
       return { created: false, message: `Cannot create the resource: ${stringifyError(error)}` };
     }
 

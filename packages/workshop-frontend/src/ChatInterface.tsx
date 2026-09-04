@@ -82,6 +82,7 @@ import {
   WorkpieceId,
   BlueprintOutput,
   MessageFormatRef,
+  isCreatedResourceSuccess,
 } from "@gadgets/workshop-shared/api";
 import { composeCodeChange, type CodeChange } from "@gadgets/workshop-shared/code-change";
 import type { ChatChangeRow } from "./otClient";
@@ -620,10 +621,9 @@ function getToolCallSummary(
     case "requestConnection":
       return { verb: "Requested connection", target: tc.input.vendorId };
     case "createExternalResource":
-      // A string output is a fixable rejection — nothing was created.
-      return typeof tc.output === "string"
-        ? { verb: "Tried to create external resource", target: tc.input.title }
-        : { verb: "Created external resource", target: tc.input.title };
+      return isCreatedResourceSuccess(tc.output)
+        ? { verb: "Created external resource", target: tc.input.title }
+        : { verb: "Tried to create external resource", target: tc.input.title };
   }
   // Compile-time exhaustiveness check.
   const _exhaustive: never = tc;
