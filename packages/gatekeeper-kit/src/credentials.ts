@@ -63,7 +63,8 @@ export function isCredentialsChanged(error: unknown): boolean {
 
 /**
  * The account's adjudication of a reported credential rejection.
- * - `"expired"` — the grant is dead; the account has notified the Workshop.
+ * - `"expired"` — the grant is dead; the account owns announcing it to the Workshop, and the
+ *   verdict never adjudicates that delivery.
  * - `"superseded"` — the rejected identity is no longer current: already replaced, or just healed
  *   past. The failure was stale, so the caller retries or re-enters.
  * - `"unavailable"` — the heal failed for non-credential reasons; nothing was adjudicated, and the
@@ -438,7 +439,8 @@ export type AccountCredentialStub<Creds> = {
    * @returns An adjudication of identity, never of notification delivery, which the account owns
    * end to end. `"superseded"` means the rejected identity is no longer current — already
    * replaced, or just healed past — so the failure was stale and the source resolves it as
-   * retryable; `"expired"` means the grant is dead and the account has notified the Workshop;
+   * retryable; `"expired"` means the grant is dead, with Workshop notification the account's own
+   * to deliver;
    * `"unavailable"` means the heal failed for non-credential reasons and nothing was adjudicated,
    * so the source surfaces the caller's original provider error. A malformed or lost answer reads
    * as `"expired"`, so a dead grant is never masked as retryable by a broken transport.

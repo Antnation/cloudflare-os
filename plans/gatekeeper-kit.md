@@ -308,7 +308,7 @@ export function isCredentialsChanged(e: unknown): boolean;  // strips classes, s
                                                             // contract callers match on
 
 export type RejectionVerdict = "expired" | "superseded" | "unavailable";
-  // expired     — grant dead; the account has notified the Workshop
+  // expired     — grant dead; the account owns announcing it (delivery never adjudicated)
   // superseded  — the rejected identity is no longer current: already replaced, or just healed past
   // unavailable — the heal failed for non-credential reasons; nothing adjudicated, and the source
   //               rethrows the caller's original provider error
@@ -501,7 +501,10 @@ heal's own failure lives in the account's logs. When a concurrent refetch has si
 **live successor** — a different
 identity not itself in the dead set — the failure is stale: reporting it would expire the grant
 that replaced the one the call used, and clearing the authority would drop the live grant's
-partition, so `run` reports nothing, clears nothing, and throws `CredentialsChangedError` instead. A
+partition, so `run` reports nothing and clears nothing. A replayable operation whose successor
+shares the read's generation — a heal of the caller's own principal — retries once under it, no
+ask spent; otherwise (non-replayable, or a moved generation marking a reconnect) `run` throws
+`CredentialsChangedError` instead. A
 bare identity mismatch is not enough: a fetch fenced out by the report still hands its credentials
 to its caller without adopting them, and when those fail too, nothing live succeeded them — the
 failure is fresh evidence and reports as expiry, or a later refetch would re-adopt the dead grant.
@@ -1976,7 +1979,7 @@ export function oauth2<Creds, E extends KitEnv = KitEnv>(config: {
   pkce?: boolean;                                        // S256; verifier lives in the strategy's kv view, keyed by state
   exchange(ctx: { code: string; redirectUri: string; client: { id: string; secret: string };
     env: E; codeVerifier?: string; requestedScopes?: string[] }): Promise<Creds>;
-  refresh?; revoke?; isAuthError; expiredMessage; expiresAt?; refreshSkewMs?;
+  refresh?; healRejection?; revoke?; isAuthError; expiredMessage; expiresAt?; refreshSkewMs?;
   legacyKeys?: readonly string[];
   upgradeStoredCredentials?;
 }): AuthStrategy<Creds, E>;
