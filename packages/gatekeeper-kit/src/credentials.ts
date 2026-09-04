@@ -73,11 +73,11 @@ export function isCredentialsChanged(error: unknown): boolean {
 export type RejectionVerdict = "expired" | "superseded" | "unavailable";
 
 /** Awaits a Workshop notification, logging a failure rather than masking the verdict with it. */
-async function notified(notify: () => Promise<void>): Promise<void> {
+async function notified(notify: () => Promise<void>, log: typeof logger): Promise<void> {
   try {
     await notify();
   } catch (error) {
-    logger.warn("failed to notify credential expiry", {
+    log.warn("failed to notify credential expiry", {
       event: "credentials.expiry.notify.failed",
       error,
     });
@@ -115,6 +115,8 @@ export type CredentialCoordinatorOptions<Creds> = {
    * @returns Legacy credentials, or `undefined` when absent.
    */
   upgrade?(kv: Pick<CredentialsKv, "get">): Creds | undefined;
+  /** Vendor id for log attribution. */
+  vendorId?: string;
 };
 
 /**
@@ -124,6 +126,7 @@ export type CredentialCoordinatorOptions<Creds> = {
 export class CredentialCoordinator<Creds> {
   readonly #kv: CredentialsKv;
   readonly #options: CredentialCoordinatorOptions<Creds>;
+  readonly #logger: typeof logger;
 
   /**
    * Creates a credential coordinator.
@@ -133,6 +136,7 @@ export class CredentialCoordinator<Creds> {
   constructor(kv: CredentialsKv, options: CredentialCoordinatorOptions<Creds> = {}) {
     this.#kv = kv;
     this.#options = options;
+    this.#logger = options.vendorId ? logger.with({ vendorId: options.vendorId }) : logger;
     for (const key of options.legacyKeys ?? []) {
       if (OWNED_KEYS.includes(key)) {
         throw new Error(`Legacy key "${key}" is one the coordinator owns.`);
@@ -298,7 +302,7 @@ export class CredentialCoordinator<Creds> {
     try {
       refreshed = await refresh(current);
     } catch (error) {
-      if (!(error instanceof CredentialsExpiredError) || this.identity() === fence) throw error;
+      if (!isCredentialsExpired(error) || this.identity() === fence) throw error;
       return this.#overtaken(error);
     }
 
@@ -338,7 +342,7 @@ export class CredentialCoordinator<Creds> {
       await this.fresh(refresh);
     } catch (error) {
       if (isCredentialsExpired(error) && this.stored() !== undefined && options.notify !== undefined) {
-        await notified(options.notify);
+        await notified(options.notify, this.#logger);
       }
       throw error;
     }
@@ -372,7 +376,7 @@ export class CredentialCoordinator<Creds> {
     if (identity === "" || identity !== this.identity()) return "superseded";
     // A grant-death provider has no mint to heal with: the rejection is the grant's death.
     if (options.refresh === undefined) {
-      await notified(options.notify);
+      await notified(options.notify, this.#logger);
       return "expired";
     }
     try {
@@ -385,19 +389,19 @@ export class CredentialCoordinator<Creds> {
       // A reconnect landing while the mint failed replaced the rejected grant; it wins whatever
       // the mint died of — logged, since this branch is the mint error's only account-side trace.
       if (this.identity() !== identity) {
-        logger.warn("credential rejection heal overtaken", {
+        this.#logger.warn("credential rejection heal overtaken", {
           event: "credentials.rejection.heal.overtaken",
           error,
         });
         return "superseded";
       }
       if (isCredentialsExpired(error)) {
-        await notified(options.notify);
+        await notified(options.notify, this.#logger);
         return "expired";
       }
       // Non-credential mint failure: nothing adjudicated, credentials intact. The consumer
       // surfaces the caller's original provider error; the token endpoint's lives in this log.
-      logger.error("credential rejection heal failed", {
+      this.#logger.error("credential rejection heal failed", {
         event: "credentials.rejection.heal.failed",
         error,
       });
@@ -407,8 +411,7 @@ export class CredentialCoordinator<Creds> {
 }
 
 /** One fetch of credentials, tagged with their identity and connection generation. */
-export type CredentialsWithIdentity<Creds> =
-  { creds: Creds; identity: string; generation: string };
+export type CredentialsWithIdentity<Creds> = CredentialRead & { creds: Creds };
 
 /**
  * The identity and generation of the read a `run` operation executes under — the values to
@@ -554,7 +557,8 @@ export class CredentialSource<Creds> {
    * either way.
    * @returns The provider operation result.
    * @throws `CredentialsExpiredError` (carrying the configured `expiredMessage`) on the account's
-   * `"expired"` verdict; `CredentialsChangedError` when the rejection was stale and re-entering
+   * `"expired"` verdict — the credential fetch itself may also throw one, and that carries the
+   * account's own message instead; `CredentialsChangedError` when the rejection was stale and re-entering
    * will read live credentials; the original provider error when the failure was not a credential
    * rejection or the account could not adjudicate it (`"unavailable"`). Both named errors match
    * by name (`isCredentialsExpired` / `isCredentialsChanged`) across RPC boundaries.

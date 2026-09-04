@@ -1815,4 +1815,19 @@ describe("CredentialSource over a CredentialCoordinator", () => {
     expect(mint).toHaveBeenCalledOnce();
     expect(notify).not.toHaveBeenCalled();
   });
+
+  it("caps a heal the provider keeps rejecting at two attempts", async () => {
+    const { coordinator, source, notify, mint } = harness();
+    coordinator.connect({ token: "stale-bearer", expiresAt: Date.now() + hour });
+    const operation = providerAccepting();
+
+    // Every mint succeeds and honestly supersedes the rejected identity, so no verdict ever says
+    // expired — the source still stops at two executions and hands re-entry to the caller.
+    await expect(source.run(operation, { replayable: true }))
+      .rejects.toThrow(CredentialsChangedError);
+
+    expect(operation).toHaveBeenCalledTimes(2);
+    expect(mint).toHaveBeenCalledTimes(2);
+    expect(notify).not.toHaveBeenCalled();
+  });
 });
