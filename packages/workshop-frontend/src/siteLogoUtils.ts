@@ -249,8 +249,8 @@ export function applySiteFavicon(logoUrl: string | undefined): () => void {
   let objectUrl: string | undefined
   let disposed = false
   const useDefault = () => {
-    favicon.href = '/favicon.svg'
-    favicon.type = 'image/svg+xml'
+    favicon.href = '/favicon.png'
+    favicon.type = 'image/png'
   }
   useDefault()
   if (!logoUrl) return () => {}

@@ -29,9 +29,10 @@ export function getSystemThemeMode(): ResolvedThemeMode {
 export function readThemeMode(): ThemeMode {
   try {
     const stored = window.localStorage.getItem(THEME_MODE_STORAGE_KEY)
-    return isThemeMode(stored) ? stored : 'system'
+    // Green Hat: dark by default, as the CRM is; a user's explicit choice still wins.
+    return isThemeMode(stored) ? stored : 'dark'
   } catch {
-    return 'system'
+    return 'dark'
   }
 }
 
@@ -67,4 +68,4 @@ export function applyAccentColor(color: string | null | undefined): void {
 }
 
 /** The base/default accent, shown in the admin picker when no custom color is set. */
-export const DEFAULT_ACCENT_COLOR = '#ff4801'
+export const DEFAULT_ACCENT_COLOR = '#00bb66'

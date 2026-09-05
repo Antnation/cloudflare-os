@@ -168,7 +168,7 @@ describe('site logo preparation', () => {
 
 describe('site favicon', () => {
   it('fetches the custom PNG once before assigning a blob favicon', async () => {
-    document.head.innerHTML = '<link rel="icon" type="image/svg+xml" href="/favicon.svg">'
+    document.head.innerHTML = '<link rel="icon" type="image/png" href="/favicon.png">'
     const blob = new Blob([new Uint8Array([1])], { type: 'image/png' })
     const fetchLogo = vi.fn<typeof fetch>().mockResolvedValue({
       ok: true,
@@ -182,7 +182,7 @@ describe('site favicon', () => {
 
     const cleanup = applySiteFavicon('/api/site-logo?v=revision')
     const favicon = document.querySelector<HTMLLinkElement>('link[rel~="icon"]')!
-    expect(favicon.getAttribute('href')).toBe('/favicon.svg')
+    expect(favicon.getAttribute('href')).toBe('/favicon.png')
 
     await vi.waitFor(() => expect(favicon.getAttribute('href')).toBe('blob:favicon'))
     expect(favicon.type).toBe('image/png')

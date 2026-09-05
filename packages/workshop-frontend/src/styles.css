@@ -5,7 +5,8 @@
 
 @theme {
   /* ===== FONTS ===== */
-  --font-sans: "FT Kunst Grotesk", -apple-system, BlinkMacSystemFont, "Segoe UI",
+  /* Green Hat: Inter, the same face as crm.greenhatsec.com (loaded from index.html). */
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
     "Roboto", "Helvetica Neue", sans-serif;
   --font-mono: "Apercu Mono Pro", "SF Mono", Menlo, Monaco, Consolas, monospace;
 
@@ -20,75 +21,76 @@
   --text-lg--line-height: 1.75rem;
 
   /* ===== KUMO SEMANTIC COLOR OVERRIDES =====
-     Near-neutral, barely-warm greys for every surface, border, and neutral text. The brand orange
-     is reserved for *intent only* (active item, links, primary action, focus) so it actually pops.
-     This is the single biggest lever between a "consumer/playground" feel and an enterprise one. */
+     Green Hat fork. The light palette is the Green Hat design system's neutral/green ramp
+     (near-white mint-tinted surfaces, security-green for intent only); the dark palette below is
+     the evergreen/pale-mint theme crm.greenhatsec.com runs, token for token, so the two products
+     read as one. Green is reserved for *intent* (active item, links, primary action, focus). */
 
-  /* Background tokens — near-white neutrals with a faint warm undertone */
-  --color-kumo-base: #fcfcfb;
-  --color-kumo-elevated: #f8f8f7;
-  --color-kumo-tint: #f3f3f1;
-  --color-kumo-overlay: #fbfbfa;
-  --color-kumo-recessed: #efeeec;
+  /* Background tokens -- near-white with a faint mint undertone */
+  --color-kumo-base: #fafbfa;
+  --color-kumo-elevated: #ffffff;
+  --color-kumo-tint: #f4f7f2;
+  --color-kumo-overlay: #ffffff;
+  --color-kumo-recessed: #f0f4f0;
   --color-kumo-control: #ffffff;
-  --color-kumo-contrast: #14110f;
-  --color-kumo-fill: #e8e7e4;
-  --color-kumo-fill-hover: #dededb;
-  --color-kumo-interact: #cac8c3;
+  --color-kumo-contrast: #0f1a12;
+  --color-kumo-fill: #e7ede7;
+  --color-kumo-fill-hover: #d3dfd3;
+  --color-kumo-interact: #a9bbad;
 
-  /* Brand — warm orange accent (intent only) */
-  --color-kumo-brand: #ff4801;
-  --color-kumo-brand-hover: #e03f00;
+  /* Brand -- Green Hat security green (intent only) */
+  --color-kumo-brand: #0f8a3d;
+  --color-kumo-brand-hover: #0f7a35;
 
-  /* Border / line tokens — neutral hairlines */
-  --color-kumo-line: #1411100f;
-  --color-kumo-ring: #cac8c3;
+  /* Border / line tokens -- neutral hairlines */
+  --color-kumo-line: #13201814;
+  --color-kumo-ring: #a9bbad;
 
   /* Chat surface tokens */
-  --color-kumo-bubble-user: #f1f0ee;
+  --color-kumo-bubble-user: #f0f4f0;
 
-  /* Status tints — keep functional colors, warm the tints */
+  /* Status tints -- functional colours, mint-tinted washes */
   --color-kumo-info: oklch(62.3% 0.214 259.815);
   --color-kumo-info-tint: oklch(90% 0.06 250);
   --color-kumo-warning: oklch(79.5% 0.184 86.047);
   --color-kumo-warning-tint: oklch(92% 0.08 85);
   --color-kumo-danger: oklch(63.7% 0.237 25.331);
   --color-kumo-danger-tint: oklch(92% 0.06 25);
-  --color-kumo-success: oklch(72.3% 0.219 149.579);
-  --color-kumo-success-tint: oklch(92% 0.08 150);
+  --color-kumo-success: #2e9a4e;
+  --color-kumo-success-tint: #dcf0de;
 
   /* Tooltip */
-  --color-kumo-tip-shadow: #14111014;
+  --color-kumo-tip-shadow: #13201814;
   --color-kumo-tip-stroke: transparent;
 
-  /* Text color tokens — near-neutral greys (faint warm undertone, no brown) */
-  --text-color-kumo-default: #1c1a18;
-  --text-color-kumo-default-hover: #100f0d;
+  /* Text color tokens -- deep evergreen neutrals */
+  --text-color-kumo-default: #132018;
+  --text-color-kumo-default-hover: #0f1a12;
   --text-color-kumo-inverse: #ffffff;
-  --text-color-kumo-strong: #100f0d;
-  --text-color-kumo-subtle: oklch(52% 0.006 60);
-  --text-color-kumo-inactive: oklch(66% 0.005 60);
-  --text-color-kumo-brand: #ff4801;
-  --text-color-kumo-link: #ff4801;
-  --text-color-kumo-success: oklch(72.3% 0.219 149.579);
+  --text-color-kumo-strong: #0f1a12;
+  --text-color-kumo-subtle: #586b5d;
+  --text-color-kumo-inactive: #7c8f82;
+  --text-color-kumo-brand: #0f8a3d;
+  --text-color-kumo-link: #0f8a3d;
+  --text-color-kumo-success: #0f7a35;
   --text-color-kumo-danger: oklch(63.7% 0.237 25.331);
   --text-color-kumo-warning: oklch(47.6% 0.114 61.907);
 
   /* ===== CUSTOM BRAND TOKENS (for direct use alongside Kumo tokens) ===== */
-  --color-accent-100: #ff4801;
-  --color-accent-200: #ff7038;
-  --color-background-100: #fcfcfb;
-  --color-background-200: #f8f8f7;
-  --color-background-300: #f3f3f1;
-  --color-foreground-100: #100f0d;
-  --color-foreground-200: #100f0d;
-  --color-foreground-300: #1c1a18;
-  --color-border-100: #e8e7e4;
-  --color-border-100-50: #e8e7e480;
-  --color-selection-bg: #ffe9e0;
-  --color-selection-text: #ff500a;
-  --color-shadow-accent-light: #ffa683;
-  --color-shadow-accent-dark: #b13200;
+  --color-accent-100: #0f8a3d;
+  --color-accent-200: #2e9a4e;
+  --color-background-100: #fafbfa;
+  --color-background-200: #ffffff;
+  --color-background-300: #f4f7f2;
+  --color-foreground-100: #0f1a12;
+  --color-foreground-200: #132018;
+  --color-foreground-300: #3e4f44;
+  --color-border-100: #e7ede7;
+  --color-border-100-50: #e7ede780;
+  --color-selection-bg: #dcf0de;
+  --color-selection-text: #0b5f2c;
+  --color-shadow-accent-light: #8acb93;
+  --color-shadow-accent-dark: #0b3b2c;
 
   /* Category colors */
   --color-compute-100: #0a95ff;
@@ -113,12 +115,12 @@
   --container-3xl: 48rem;
   --container-4xl: 56rem;
 
-  /* Radius */
+  /* Radius -- tightened to the CRM's 4px controls; larger steps stay for cards and sheets. */
   --radius-sm: 0.25rem;
-  --radius-md: 0.375rem;
-  --radius-lg: 0.5rem;
-  --radius-xl: 0.75rem;
-  --radius-2xl: 1rem;
+  --radius-md: 0.25rem;
+  --radius-lg: 0.375rem;
+  --radius-xl: 0.5rem;
+  --radius-2xl: 0.75rem;
 
   /* Transitions.
      Default CSS curves are too weak to feel intentional; keep them for legacy callers but add
@@ -141,79 +143,82 @@
 }
 
 [data-mode="dark"] {
-  /* Seal-inspired dark palette: violet-tinted surfaces around hue 285, not neutral black. */
-  --color-kumo-base: oklch(0.115 0.012 285);
-  --color-kumo-elevated: oklch(0.155 0.011 285);
-  --color-kumo-tint: oklch(0.225 0.025 285);
-  --color-kumo-overlay: oklch(0.155 0.011 285);
-  --color-kumo-recessed: oklch(0.1 0.012 285);
-  --color-kumo-control: oklch(0.155 0.011 285);
+  /* crm.greenhatsec.com's evergreen / pale-mint theme (GreenCRM gateway/greenhat-theme.css),
+     mapped onto Kumo's semantic tokens: primary #081919, secondary #0b2222, tertiary #10302e,
+     quaternary #16433e; text #f2fff8 / #c4f1da / #8bb6a4; lines #214242 / #2f5a51 / #467867;
+     accent #00bb66 with #009e58 hover and #7de0ae for text on dark. */
+  --color-kumo-base: #081919;
+  --color-kumo-elevated: #0b2222;
+  --color-kumo-tint: #10302e;
+  --color-kumo-overlay: #0b2222;
+  --color-kumo-recessed: #061414;
+  --color-kumo-control: #0b2222;
   --color-kumo-contrast: var(--color-kumo-brand);
   --color-kumo-strong: var(--color-kumo-brand-hover);
-  --color-kumo-fill: oklch(0.225 0.025 285);
-  --color-kumo-fill-hover: oklch(0.295 0.045 285);
-  --color-kumo-interact: oklch(0.34 0.022 285);
-  --color-kumo-line: oklch(0.34 0.022 285);
-  --color-kumo-ring: oklch(0.52 0.065 285);
-  --color-kumo-bubble-user: oklch(0.225 0.025 285);
+  --color-kumo-fill: #10302e;
+  --color-kumo-fill-hover: #16433e;
+  --color-kumo-interact: #214242;
+  --color-kumo-line: #214242;
+  --color-kumo-ring: #2f5a51;
+  --color-kumo-bubble-user: #10302e;
 
-  --color-kumo-brand: #b84e00;
-  --color-kumo-brand-hover: #a54200;
+  --color-kumo-brand: #00bb66;
+  --color-kumo-brand-hover: #009e58;
 
-  --color-kumo-info: oklch(62.3% 0.214 259.815);
-  --color-kumo-info-tint: oklch(0.25 0.065 259.815);
+  --color-kumo-info: #3ac6a0;
+  --color-kumo-info-tint: #0b4f45;
   --color-kumo-warning: oklch(55.5% 0.163 48.998);
   --color-kumo-warning-tint: oklch(0.27 0.06 84.429);
   --color-kumo-danger: oklch(50.5% 0.213 27.518);
   --color-kumo-danger-tint: oklch(0.25 0.065 25.331);
-  --color-kumo-success: oklch(52.7% 0.154 150.069);
-  --color-kumo-success-tint: oklch(0.25 0.06 150.069);
+  --color-kumo-success: #00bb66;
+  --color-kumo-success-tint: #00bb662e;
 
-  --color-kumo-tip-shadow: #00000066;
-  --color-kumo-tip-stroke: oklch(0.34 0.022 285);
+  --color-kumo-tip-shadow: #0000005c;
+  --color-kumo-tip-stroke: #214242;
 
-  --text-color-kumo-default: oklch(0.92 0.01 285);
-  --text-color-kumo-default-hover: oklch(0.97 0.006 285);
-  --text-color-kumo-inverse: #ffffff;
-  --text-color-kumo-strong: oklch(0.92 0.01 285);
-  --text-color-kumo-subtle: oklch(0.66 0.02 285);
-  --text-color-kumo-inactive: oklch(0.58 0.025 285);
-  --text-color-kumo-brand: #ff8a5c;
-  --text-color-kumo-link: #ff8a5c;
-  --text-color-kumo-success: oklch(79.2% 0.209 151.711);
+  --text-color-kumo-default: #f2fff8;
+  --text-color-kumo-default-hover: #ffffff;
+  --text-color-kumo-inverse: #081919;
+  --text-color-kumo-strong: #f2fff8;
+  --text-color-kumo-subtle: #8bb6a4;
+  --text-color-kumo-inactive: #6f9888;
+  --text-color-kumo-brand: #7de0ae;
+  --text-color-kumo-link: #7de0ae;
+  --text-color-kumo-success: #35cf80;
   --text-color-kumo-danger: oklch(70.4% 0.191 22.216);
   --text-color-kumo-warning: oklch(82.8% 0.189 84.429);
 
-  --color-accent-100: #b84e00;
-  --color-accent-200: #ff8a5c;
-  --color-background-100: oklch(0.115 0.012 285);
-  --color-background-200: oklch(0.155 0.011 285);
-  --color-background-300: oklch(0.225 0.025 285);
-  --color-foreground-100: oklch(0.92 0.01 285);
-  --color-foreground-200: oklch(0.78 0.018 285);
-  --color-foreground-300: oklch(0.66 0.02 285);
-  --color-border-100: oklch(0.34 0.022 285);
-  --color-border-100-50: oklch(0.34 0.022 285 / 0.5);
-  --color-selection-bg: color-mix(in srgb, var(--color-kumo-brand) 28%, transparent);
-  --color-selection-text: oklch(0.97 0.006 285);
-  --color-shadow-accent-light: #ff663355;
+  --color-accent-100: #00bb66;
+  --color-accent-200: #7de0ae;
+  --color-background-100: #081919;
+  --color-background-200: #0b2222;
+  --color-background-300: #10302e;
+  --color-foreground-100: #f2fff8;
+  --color-foreground-200: #c4f1da;
+  --color-foreground-300: #8bb6a4;
+  --color-border-100: #214242;
+  --color-border-100-50: #21424280;
+  --color-selection-bg: #00bb66;
+  --color-selection-text: #081919;
+  --color-shadow-accent-light: #00bb6655;
   --color-shadow-accent-dark: #00000080;
 
-  --color-compute-100: oklch(74% 0.16 250);
-  --color-compute-200: oklch(0.25 0.065 250);
+  --color-compute-100: #44d7c4;
+  --color-compute-200: #0b4f45;
   --color-storage-100: oklch(78% 0.22 325);
   --color-storage-200: oklch(0.25 0.07 325);
-  --color-ai-100: oklch(79.2% 0.209 151.711);
-  --color-ai-200: oklch(0.25 0.06 150);
+  --color-ai-100: #35cf80;
+  --color-ai-200: #00472d;
   --color-media-100: oklch(78% 0.19 300);
   --color-media-200: oklch(0.25 0.07 300);
 
-  --color-status-live: oklch(79.2% 0.209 151.711);
+  --color-status-live: #35cf80;
   --color-status-draft: oklch(82.8% 0.189 84.429);
-  --color-status-building: oklch(74% 0.16 250);
+  --color-status-building: #44d7c4;
 
   --shadow-stack: 1px 6px 6px 0 #ffffff08 inset, 0 0 0 1px #ffffff05 inset,
-    0 18px 40px 0 #00000033, 0 4px 12px 0 #0000002e;
+    0 18px 40px 0 #0000005c, 0 4px 12px 0 #00000052;
 }
 
 body {
@@ -226,6 +231,11 @@ body {
 ::selection {
   background-color: var(--color-selection-bg);
   color: var(--color-selection-text);
+}
+
+/* Green Hat: the CRM's lime focus ring on the dark theme, where green-on-green would vanish. */
+[data-mode="dark"] *:focus-visible {
+  outline-color: #b9f244;
 }
 
 code {
