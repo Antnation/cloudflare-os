@@ -1,6 +1,83 @@
 import { AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS } from "@gadgets/workshop-shared/api";
 import { UserAiModelRecord } from "./user.js";
 
+/**
+ * A deployment-managed model that bypasses the gateway: the Workshop calls `baseUrl` itself,
+ * speaking the named provider's native API, with the key held in the Worker secret `secret`.
+ * Listed ahead of the gateway catalog, so the first one is what a new chat starts on. This is how
+ * a deployment offers a model AI Gateway has no route for (a Z.AI coding plan, say) without any
+ * user ever holding the key. Parsed from the DIRECT_MODELS JSON array.
+ */
+export type DirectModel = {
+  /** Model id as the provider's API spells it; also the id the picker uses. */
+  id: string;
+  /** Display name. */
+  name: string;
+  /** Which native API `baseUrl` speaks. */
+  provider: "anthropic" | "openai";
+  /** API base URL, no trailing slash, e.g. https://api.z.ai/api/anthropic. */
+  baseUrl: string;
+  /** Name of the Worker secret holding the API key. */
+  secret: string;
+  contextWindow?: number;
+  outputLimit?: number;
+};
+
+const DIRECT_MODEL_PROVIDERS = new Set(["anthropic", "openai"]);
+
+/** Parse and validate DIRECT_MODELS. Throws on any malformed entry: a bad list must not deploy. */
+export function parseDirectModels(raw: string | undefined): DirectModel[] {
+  if (!raw || !raw.trim()) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error("DIRECT_MODELS is not valid JSON.", { cause: err });
+  }
+  if (!Array.isArray(parsed)) throw new Error("DIRECT_MODELS must be a JSON array.");
+  const seen = new Set<string>();
+  return parsed.map((entry, index) => {
+    const where = `DIRECT_MODELS[${index}]`;
+    if (!entry || typeof entry !== "object") throw new Error(`${where} must be an object.`);
+    const e = entry as Record<string, unknown>;
+    for (const key of ["id", "name", "provider", "baseUrl", "secret"]) {
+      if (typeof e[key] !== "string" || !(e[key] as string).trim()) {
+        throw new Error(`${where}.${key} must be a non-empty string.`);
+      }
+    }
+    if (!DIRECT_MODEL_PROVIDERS.has(e.provider as string)) {
+      throw new Error(
+          `${where}.provider must be one of: ${[...DIRECT_MODEL_PROVIDERS].join(", ")}.`);
+    }
+    let baseUrl: URL;
+    try {
+      baseUrl = new URL(e.baseUrl as string);
+    } catch {
+      throw new Error(`${where}.baseUrl is not a URL.`);
+    }
+    if (baseUrl.protocol !== "https:") throw new Error(`${where}.baseUrl must be HTTPS.`);
+    for (const key of ["contextWindow", "outputLimit"]) {
+      if (e[key] !== undefined && !(Number.isInteger(e[key]) && (e[key] as number) > 0)) {
+        throw new Error(`${where}.${key} must be a positive integer when present.`);
+      }
+    }
+    const id = (e.id as string).trim();
+    if (seen.has(id)) throw new Error(`${where}.id "${id}" is listed twice.`);
+    seen.add(id);
+    let normalizedBase = e.baseUrl as string;
+    while (normalizedBase.endsWith("/")) normalizedBase = normalizedBase.slice(0, -1);
+    return {
+      id,
+      name: (e.name as string).trim(),
+      provider: e.provider as DirectModel["provider"],
+      baseUrl: normalizedBase,
+      secret: (e.secret as string).trim(),
+      ...(e.contextWindow !== undefined ? { contextWindow: e.contextWindow as number } : {}),
+      ...(e.outputLimit !== undefined ? { outputLimit: e.outputLimit as number } : {}),
+    };
+  });
+}
+
 // The model used for quick tasks like title generation when AI Gateway mode is active.
 //
 // This 70B model is quite fast and cheap and produces pretty good titles. The cost is insignificant
@@ -47,8 +124,13 @@ export class AiGatewayConfig {
    */
   readonly binding?: Ai;
   readonly providers: Set<string>;
+  /** Deployment-managed models the Workshop calls directly; see {@link DirectModel}. */
+  readonly directModels: DirectModel[];
+  readonly #env: Cloudflare.Env;
 
   constructor(env: Cloudflare.Env) {
+    this.#env = env;
+    this.directModels = parseDirectModels(env.DIRECT_MODELS);
     this.gateway = env.CF_AI_GATEWAY!;
     if (!env.CF_AI_GATEWAY_ACCOUNT_ID) {
       throw new Error("CF_AI_GATEWAY_ACCOUNT_ID is required when CF_AI_GATEWAY is set.");
@@ -99,6 +181,10 @@ export class AiGatewayConfig {
    */
   getModelList(): AiChatAuthorInfo[] {
     let result: AiChatAuthorInfo[] = [];
+    // Direct models lead: the first entry is the model a new chat starts on.
+    for (let model of this.directModels) {
+      result.push({ type: "agent", id: model.id, name: model.name });
+    }
     for (let [provider, models] of Object.entries(SUGGESTED_MODELS)) {
       if (this.providers.has(provider)) {
         for (let [id, model] of Object.entries(models)) {
@@ -114,6 +200,26 @@ export class AiGatewayConfig {
    * SUGGESTED_MODEL for an enabled gateway provider, or undefined otherwise.
    */
   resolveModel(modelId: string): UserAiModelRecord | undefined {
+    let direct = this.directModels.find(model => model.id === modelId);
+    if (direct) {
+      let apiToken = (this.#env as unknown as Record<string, unknown>)[direct.secret];
+      if (typeof apiToken !== "string" || !apiToken) {
+        throw new Error(
+            `Direct model "${direct.id}" needs the Worker secret ${direct.secret}, which is unset.`);
+      }
+      return {
+        profile: { type: "agent", id: direct.id, name: direct.name },
+        // `apiUrl` is what routes this past the gateway; see getModel() in ai-models.ts.
+        config: {
+          provider: direct.provider,
+          model: direct.id,
+          apiToken,
+          apiUrl: direct.baseUrl,
+          ...(direct.contextWindow !== undefined ? { contextWindow: direct.contextWindow } : {}),
+          ...(direct.outputLimit !== undefined ? { outputLimit: direct.outputLimit } : {}),
+        },
+      };
+    }
     for (let [provider, models] of Object.entries(SUGGESTED_MODELS)) {
       if (this.providers.has(provider) && modelId in models) {
         return {

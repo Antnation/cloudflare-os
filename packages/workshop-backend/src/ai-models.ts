@@ -145,8 +145,9 @@ function modelTokenWindow(config: AiModelConfig, catalog: Model<Api> | undefined
     : { contextWindow: number, maxTokens: number } {
   const suggested = SUGGESTED_MODELS[config.provider]?.[config.model];
   return {
-    contextWindow: suggested?.contextWindow ?? catalog?.contextWindow ?? 128_000,
-    maxTokens: suggested?.outputLimit ??
+    contextWindow: config.contextWindow ?? suggested?.contextWindow ?? catalog?.contextWindow
+        ?? 128_000,
+    maxTokens: config.outputLimit ?? suggested?.outputLimit ??
         (config.provider === "cloudflare" ? WORKERS_AI_OUTPUT_LIMIT : undefined) ??
         catalog?.maxTokens ?? 4096,
   };
@@ -366,9 +367,12 @@ export function getModel(env: Cloudflare.Env, config: AiModelConfig,
   }
 
   // Otherwise: when a platform AI Gateway is configured, route through it (platform-funded free
-  // tier). The config's apiToken/apiUrl are ignored in that mode.
+  // tier), and the config's apiToken/apiUrl are ignored -- except for a deployment-managed direct
+  // model (DIRECT_MODELS, see ai-gateway.ts), whose resolved config carries the apiUrl the
+  // Workshop must call itself. User-added models never carry one in gateway mode (the client
+  // strips it), so this cannot let a user route around the gateway.
   let gwConfig = getAiGatewayConfig(env);
-  if (gwConfig) {
+  if (gwConfig && !config.apiUrl) {
     return getModelViaGateway(gwConfig, config, initiator, options);
   }
 

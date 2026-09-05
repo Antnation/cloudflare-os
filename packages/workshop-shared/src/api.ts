@@ -1166,6 +1166,13 @@ export type AiModelConfig = {
    * alternative provider that provides a compatible API.
    */
   apiUrl?: string;
+
+  /**
+   * Token limits for a model outside SUGGESTED_MODELS and pi's catalog, e.g. a deployment-managed
+   * direct model (see DIRECT_MODELS in the Workshop). Absent means "look them up as usual".
+   */
+  contextWindow?: number;
+  outputLimit?: number;
 };
 
 /**
@@ -1184,11 +1191,6 @@ export const SUGGESTED_MODELS: Record<
   Record<string, {name: string, contextWindow: number, outputLimit?: number}>
 > = {
   "cloudflare": {
-    // First entry is what a new chat starts on. GLM 5.3 finishes tool discovery in one step where
-    // Kimi K2.7 spends minutes guessing method names, so it leads. (Green Hat fork.)
-    "@cf/zai-org/glm-5.3": {
-      name: "GLM 5.3 (Workers AI)", contextWindow: 262144, outputLimit: WORKERS_AI_OUTPUT_LIMIT,
-    },
     "@cf/moonshotai/kimi-k2.7-code": {
       name: "Kimi K2.7 Code (Workers AI)", contextWindow: 262144,
       outputLimit: WORKERS_AI_OUTPUT_LIMIT,
