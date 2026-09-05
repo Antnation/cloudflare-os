@@ -1173,6 +1173,14 @@ export type AiModelConfig = {
    */
   contextWindow?: number;
   outputLimit?: number;
+
+  /**
+   * How `apiToken` is presented. `provider` (default) is the provider's native scheme (Anthropic
+   * `x-api-key`, OpenAI bearer). `bearer` sends `Authorization: Bearer <apiToken>` regardless of
+   * provider, for an API reached through a gateway that authenticates the caller itself and
+   * injects the provider credential upstream (see DIRECT_MODELS in the Workshop).
+   */
+  authScheme?: "provider" | "bearer";
 };
 
 /**

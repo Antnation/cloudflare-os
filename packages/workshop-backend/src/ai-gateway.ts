@@ -19,11 +19,18 @@ export type DirectModel = {
   baseUrl: string;
   /** Name of the Worker secret holding the API key. */
   secret: string;
+  /**
+   * `provider` (default): the secret is the provider's own API key, sent the provider's way.
+   * `bearer`: the secret is a credential for a gateway in front of the provider (GreenGateway
+   * service token), sent as `Authorization: Bearer`; the gateway injects the provider key.
+   */
+  auth?: "provider" | "bearer";
   contextWindow?: number;
   outputLimit?: number;
 };
 
 const DIRECT_MODEL_PROVIDERS = new Set(["anthropic", "openai"]);
+const DIRECT_MODEL_AUTH = new Set(["provider", "bearer"]);
 
 /** Parse and validate DIRECT_MODELS. Throws on any malformed entry: a bad list must not deploy. */
 export function parseDirectModels(raw: string | undefined): DirectModel[] {
@@ -61,6 +68,9 @@ export function parseDirectModels(raw: string | undefined): DirectModel[] {
         throw new Error(`${where}.${key} must be a positive integer when present.`);
       }
     }
+    if (e.auth !== undefined && !DIRECT_MODEL_AUTH.has(e.auth as string)) {
+      throw new Error(`${where}.auth must be one of: ${[...DIRECT_MODEL_AUTH].join(", ")}.`);
+    }
     const id = (e.id as string).trim();
     if (seen.has(id)) throw new Error(`${where}.id "${id}" is listed twice.`);
     seen.add(id);
@@ -72,6 +82,7 @@ export function parseDirectModels(raw: string | undefined): DirectModel[] {
       provider: e.provider as DirectModel["provider"],
       baseUrl: normalizedBase,
       secret: (e.secret as string).trim(),
+      ...(e.auth !== undefined ? { auth: e.auth as DirectModel["auth"] } : {}),
       ...(e.contextWindow !== undefined ? { contextWindow: e.contextWindow as number } : {}),
       ...(e.outputLimit !== undefined ? { outputLimit: e.outputLimit as number } : {}),
     };
@@ -215,6 +226,7 @@ export class AiGatewayConfig {
           model: direct.id,
           apiToken,
           apiUrl: direct.baseUrl,
+          ...(direct.auth === "bearer" ? { authScheme: "bearer" as const } : {}),
           ...(direct.contextWindow !== undefined ? { contextWindow: direct.contextWindow } : {}),
           ...(direct.outputLimit !== undefined ? { outputLimit: direct.outputLimit } : {}),
         },

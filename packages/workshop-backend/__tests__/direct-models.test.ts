@@ -53,6 +53,7 @@ describe("parseDirectModels", () => {
       .toThrow(/not a URL/);
     expect(() => parseDirectModels(JSON.stringify([{ ...ZAI, outputLimit: -1 }])))
       .toThrow(/outputLimit/);
+    expect(() => parseDirectModels(JSON.stringify([{ ...ZAI, auth: "basic" }]))).toThrow(/auth/);
     expect(() => parseDirectModels(JSON.stringify([ZAI, ZAI]))).toThrow(/twice/);
   });
 });
@@ -82,6 +83,21 @@ describe("AiGatewayConfig direct models", () => {
     // Gateway models still resolve as before, with no apiUrl.
     expect(config.resolveModel("@cf/moonshotai/kimi-k2.7-code")?.config.apiUrl).toBeUndefined();
     expect(config.resolveModel("does-not-exist")).toBeUndefined();
+  });
+
+  it("carries the bearer auth scheme through to the resolved config", () => {
+    const config = new AiGatewayConfig(gatewayEnv({
+      DIRECT_MODELS: JSON.stringify([{ ...ZAI, auth: "bearer", secret: "GATEWAY_LLM_TOKEN" }]),
+      GATEWAY_LLM_TOKEN: "ggw_token",
+    }));
+    const resolved = config.resolveModel("glm-5.3");
+    expect(resolved?.config.authScheme).toBe("bearer");
+    expect(resolved?.config.apiToken).toBe("ggw_token");
+    // The default scheme is the provider's own and is left implicit.
+    const plain = new AiGatewayConfig(gatewayEnv({
+      DIRECT_MODELS: JSON.stringify([ZAI]), ZAI_API_KEY: "k",
+    }));
+    expect(plain.resolveModel("glm-5.3")?.config.authScheme).toBeUndefined();
   });
 
   it("refuses to resolve a direct model whose secret is missing", () => {

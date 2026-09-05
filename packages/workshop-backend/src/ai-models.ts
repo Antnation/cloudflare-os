@@ -508,6 +508,16 @@ function getModelViaGateway(
   });
 }
 
+// Credential presentation for a direct model. The default lets the provider adapter send its own
+// scheme; `bearer` puts the token in `Authorization` for a gateway that authenticates the caller
+// and injects the real provider key upstream, so the adapter's own header carries a placeholder
+// that the gateway strips.
+function directCredential(config: AiModelConfig): Pick<HandleArgs, "apiKey" | "headers"> {
+  return config.authScheme === "bearer"
+      ? { apiKey: "unused", headers: { Authorization: `Bearer ${config.apiToken}` } }
+      : { apiKey: config.apiToken };
+}
+
 // Direct provider access using the credentials in the model config itself (no AI Gateway).
 function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelHandle {
   const catalog = catalogModel(config.provider, config.model);
@@ -529,7 +539,7 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
           // Catalog compat verbatim -- see the gateway-path comment on forceAdaptiveThinking.
           compat: catalog?.compat,
         },
-        apiKey: config.apiToken,
+        ...directCredential(config),
         sessionAffinity,
       });
     case "cloudflare": {
@@ -640,7 +650,7 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
           thinkingLevelMap: catalog?.thinkingLevelMap,
           compat: catalog?.compat,
         },
-        apiKey: config.apiToken,
+        ...directCredential(config),
         sessionAffinity,
       });
     default:
