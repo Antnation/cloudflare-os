@@ -1,12 +1,12 @@
 import { Link } from '@tanstack/react-router'
-import { Hexagon, List, X } from '@phosphor-icons/react'
+import { List, X } from '@phosphor-icons/react'
 import { useOptionalAuthenticatedApi } from '../AuthContext'
 import { useGatekeeperApps } from '../useGatekeeperApps'
 import { useSiteName } from '../ServerConfigContext'
 import { useState, useEffect, useRef } from 'react'
 import UserMenu from './UserMenu'
 import TopBarNotice from '../TopBarNotice'
-import SiteLogo from './SiteLogo'
+import BrandWordmark from './BrandWordmark'
 
 export default function Header() {
   const auth = useOptionalAuthenticatedApi()
@@ -45,13 +45,9 @@ export default function Header() {
         <TopBarNotice />
         {/* Logo */}
         <div className="flex items-center gap-6">
-          <Link to="/" className="flex items-center gap-2">
-            <SiteLogo size={22} className="shrink-0">
-              <Hexagon size={22} className="text-kumo-brand" weight="bold" />
-            </SiteLogo>
-            <span className="text-base font-semibold tracking-tight text-kumo-default">
-              {siteName}
-            </span>
+          <Link to="/" aria-label={siteName} className="flex items-center gap-2">
+            {/* Green Hat fork: the wordmark is the brand. */}
+            <BrandWordmark height={24} className="shrink-0" />
           </Link>
 
           {/* Desktop nav links */}
