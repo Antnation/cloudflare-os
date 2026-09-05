@@ -1,6 +1,6 @@
 // The Greenhat OS wordmark, as shipped in `public/brand/` (Green Hat fork).
 //
-// Two renderings of the same artwork: white lettering for the dark theme and evergreen lettering
+// Two renderings of the same artwork: white lettering for the dark theme and jet-black lettering
 // for the light one, swapped by the `dark` variant so the mark never fights its surface. The
 // green "OS" badge is identical in both. The image carries the site name as its alt text, so the
 // brand row still reads as the deployment's name to assistive technology.
