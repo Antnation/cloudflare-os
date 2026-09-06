@@ -13,6 +13,11 @@ function makeUserWithAccount(vendorId: string) {
   } as Fetcher<GatekeeperUser>;
   const user = Object.create(UserDurableObject.prototype) as UserDurableObject;
   Object.assign(user, {
+    env: {
+      BLUEPRINTS: {
+        get: async () => null,
+      },
+    },
     storage: {
       connectedAccounts: {
         get: (accountId: number) => accountId === 7
