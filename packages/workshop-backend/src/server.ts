@@ -9,7 +9,12 @@ import { getAuthVendorBinding } from "./auth/auth-vendors.js";
 import { getUsageInfo } from "./ai-gateway-billing/limits/usage-checker.js";
 import { listConnectedAccounts, selectAccount } from "./ai-gateway-billing/cloudflare/connection-service.js";
 import { PendingLogin, LoginConnectCallbackImpl } from "./auth/login-flow.js";
-import { deploymentOutputForBlueprint, listFormatOffers, readAdminConfig } from "./admin-config.js";
+import {
+  deploymentOutputForBlueprint,
+  listFormatOffers,
+  readAdminConfig,
+  readAdminConfigForAuthority,
+} from "./admin-config.js";
 
 // Re-export the optional-feature Durable Objects + entrypoints so they can be bound in wrangler.
 export { PendingLogin, LoginConnectCallbackImpl };
@@ -701,7 +706,7 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
 
     let email = this.accessPayload.email as string;
     let userId = this.users.idFromName(email);
-    let signupsEnabled = (await readAdminConfig(this.env)).signupsEnabled;
+    let signupsEnabled = (await readAdminConfigForAuthority(this.env)).signupsEnabled;
     let accountCreated =
         await this.users.get(userId).authenticateFromCfAccess(email, signupsEnabled);
     if (accountCreated) {
@@ -750,7 +755,7 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     if (!isPasswordAuthEnabled(this.env)) {
       throw new Error("Password signup is disabled on this deployment. Use a sign-in option.");
     }
-    if (!(await readAdminConfig(this.env)).signupsEnabled) {
+    if (!(await readAdminConfigForAuthority(this.env)).signupsEnabled) {
       throw new Error("New signups are currently disabled on this deployment.");
     }
 

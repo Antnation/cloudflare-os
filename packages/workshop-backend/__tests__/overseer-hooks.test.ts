@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
+import {RpcTarget} from "capnweb";
 import { DEFAULT_ADMIN_CONFIG, gatekeeperAvailabilityBlock, parseAdminConfig, serializeAdminConfig } from "../src/admin-config.js";
 import { OverseerDurableObject, overseerTestInternals } from "../src/overseer.js";
 import {makeRevalidatingRpcStub} from "../src/revalidating-rpc.js";
@@ -185,15 +186,40 @@ describe("revalidating RPC membrane", () => {
   it("blocks an existing session before another provider call after policy changes", async () => {
     let enabled = true;
     let read = vi.fn(async () => "calendar data");
-    let session = makeRevalidatingRpcStub(async () => {
-      if (!enabled) throw new Error("Calendar is disabled.");
-      return {read} as any;
-    });
+    let session = makeRevalidatingRpcStub(
+        () => ({read}) as any,
+        async () => {
+          if (!enabled) throw new Error("Calendar is disabled.");
+        });
 
     await expect((session as any).read()).resolves.toBe("calendar data");
     enabled = false;
     await expectRejection((session as any).read(), /Calendar is disabled/);
     expect(read).toHaveBeenCalledTimes(1);
+  });
+
+  it("disposes each dynamic legacy-hook entrypoint after its forwarded call", async () => {
+    let disposeEntrypoint = vi.fn();
+    class Entrypoint extends RpcTarget {
+      ping() {
+        return "pong";
+      }
+
+      [Symbol.dispose]() {
+        disposeEntrypoint();
+      }
+    }
+    let overseer = Object.create(OverseerDurableObject.prototype) as OverseerDurableObject;
+    Object.assign(overseer, {
+      impl: {
+        assertGatekeeperAvailable: async () => {},
+        getGadgetHookEntrypoint: () => new Entrypoint(),
+      },
+    });
+
+    using callback = await overseer.startGatekeeperHook(1);
+    await expect((callback as any).ping()).resolves.toBe("pong");
+    expect(disposeEntrypoint).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -232,6 +258,35 @@ describe("observation authority", () => {
 
     await expect(pending).rejects.toThrow(/Calendar is disabled/);
     expect(putProhibitAllSharing).not.toHaveBeenCalled();
+  });
+
+  it("coalesces only overlapping deployment-policy reads", async () => {
+    let releaseConfig!: (value: string) => void;
+    let reads = 0;
+    let firstConfig = new Promise<string>(resolve => { releaseConfig = resolve; });
+    let impl = Object.create(
+        overseerTestInternals.OverseerImpl.prototype) as OverseerImplForTest;
+    Object.assign(impl, {
+      env: {BLUEPRINTS: {get: async () => {
+        reads++;
+        return reads === 1
+          ? firstConfig
+          : serializeAdminConfig(DEFAULT_ADMIN_CONFIG);
+      }}},
+      storage: {
+        gatekeepers: {get: () => ({id: 1, resourceUrl: "https://example.com"})},
+      },
+    });
+
+    let first = impl.assertGatekeeperAvailable(1, "email");
+    let second = impl.assertGatekeeperAvailable(1, "email");
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(reads).toBe(1);
+    releaseConfig(serializeAdminConfig(DEFAULT_ADMIN_CONFIG));
+    await Promise.all([first, second]);
+
+    await impl.assertGatekeeperAvailable(1, "email");
+    expect(reads).toBe(2);
   });
 });
 
@@ -419,6 +474,9 @@ describe("disabled connection recovery", () => {
           actions: {get: () => action, put: putAction},
         },
         applyPendingAction,
+        assertGatekeeperAvailable: async () => {
+          throw new Error("Google Calendar is disabled.");
+        },
         getGatekeeperFacet: () => ({rejectAction}),
         drainAutoApprovals,
       },
@@ -432,9 +490,9 @@ describe("disabled connection recovery", () => {
     expect(rejectAction).not.toHaveBeenCalled();
 
     await expect(client.rejectAction(7)).resolves.toBeUndefined();
-    expect(rejectAction).toHaveBeenCalledWith(41);
+    expect(rejectAction).not.toHaveBeenCalled();
     expect(action.state).toBe("rejected");
     expect(putAction).toHaveBeenCalled();
-    expect(drainAutoApprovals).toHaveBeenCalledWith(1);
+    expect(drainAutoApprovals).not.toHaveBeenCalled();
   });
 });

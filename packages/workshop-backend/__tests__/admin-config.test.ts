@@ -163,6 +163,9 @@ describe("gatekeeper resource policy", () => {
     expect(() => parseAdminConfigForAuthority(JSON.stringify({
       disabledGatekeepers: ["google", 7],
     }))).toThrow(/gatekeeper policy is malformed/);
+    expect(() => parseAdminConfigForAuthority(JSON.stringify({
+      signupsEnabled: "false",
+    }))).toThrow(/signup policy is malformed/);
   });
 
   it("blocks retained ordinary, ambient, and legacy capabilities", () => {

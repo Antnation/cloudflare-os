@@ -5,6 +5,7 @@ import type {
 import {
   collectSlashCommands, invokeSlashCommand,
 } from "../src/slash-commands";
+import {overseerTestInternals} from "../src/overseer.js";
 
 function rpcPromise<T>(promise: Promise<T>, onDispose?: () => void): Promise<T> & Disposable {
   return Object.assign(promise, {[Symbol.dispose]() { onDispose?.(); }});
@@ -130,5 +131,27 @@ describe("slash command helpers", () => {
     release([deploy]);
     await expect(result).resolves.toHaveLength(1);
     expect(disposals).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not release a command result when its resource is disabled in flight", async () => {
+    let release!: (result: SlashCommandResult) => void;
+    let value = gatekeeper({
+      invoke: () => new Promise<SlashCommandResult>(resolve => { release = resolve; }),
+    });
+    let enabled = true;
+    let request = {
+      id: {gatekeeperId: 1, commandId: "deploy"},
+      args: "production",
+    };
+    let pending = overseerTestInternals.invokeSlashCommandWithRevalidation(
+        value as never,
+        request,
+        {} as never,
+        async () => { if (!enabled) throw new Error("Calendar is disabled."); });
+    await vi.waitFor(() => expect(release).toBeDefined());
+    enabled = false;
+    release({message: "private provider result"});
+
+    await expect(pending).rejects.toThrow(/Calendar is disabled/);
   });
 });

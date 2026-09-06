@@ -11,13 +11,13 @@ import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-bi
 import type { AdminSettings } from "./admin-settings.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./blueprint-archive.js";
 import {
+  type AdminConfig,
   accountGrantIncludesDisabledResource,
   filterEnabledResources,
   gatekeeperAvailabilityBlock,
   isGatekeeperDisabled,
   isResourceDisabled,
   normalizeResourceGrantSelection,
-  readAdminConfig,
   readAdminConfigForAuthority,
 } from "./admin-config.js";
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
@@ -34,6 +34,9 @@ type ConnectedAccountRecord = {
   account: Fetcher<GatekeeperUser>;
   description: AccountDescription;
   vendorId: string;   // Derived from the GATEKEEPER_ binding name (e.g. "google", "email").
+  // Monotonic incarnation of the provider capability stored under this stable account id. Records
+  // written before this field existed are generation zero.
+  accountGeneration?: number;
   credentialExpiresAt?: Date;    // When credentials are expected to expire, if known.
   credentialsExpired?: boolean;  // Set true by async notification from gatekeeper.
   // True if the Workshop created this account automatically via GatekeeperVendor.createAccount()
@@ -70,6 +73,21 @@ function areCredentialsValid(record: ConnectedAccountRecord): boolean {
   if (record.credentialsExpired) return false;
   if (record.credentialExpiresAt && record.credentialExpiresAt.valueOf() < Date.now()) return false;
   return true;
+}
+
+function accountGeneration(record: ConnectedAccountRecord): number {
+  return record.accountGeneration ?? 0;
+}
+
+function disposeRpcCapability(value: unknown): void {
+  if ((typeof value === "object" && value !== null) || typeof value === "function") {
+    try {
+      let disposer = (value as {[Symbol.dispose]?: () => void})[Symbol.dispose];
+      if (typeof disposer === "function") disposer.call(value);
+    } catch {
+      // Disposal is best-effort cleanup and must not hide the authority failure that prompted it.
+    }
+  }
 }
 
 /**
@@ -295,6 +313,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   private storage: UserStorage;
   private vendors: Map<string, Service<GatekeeperVendor>>;
   private adminSettings: DurableObjectNamespace<AdminSettings>;
+  // Share only concurrent authority reads. The entry clears as soon as the KV promise settles, so
+  // a later operation never inherits a stale deployment policy snapshot.
+  private authorityConfigRead?: Promise<AdminConfig>;
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
@@ -311,6 +332,27 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.adminSettings = this.ctx.exports.AdminSettings;
 
     this.vendors = buildGatekeeperVendorMap(env);
+  }
+
+  private readAuthorityConfig(): Promise<AdminConfig> {
+    let existing = this.authorityConfigRead;
+    if (existing) return existing;
+
+    let read = readAdminConfigForAuthority(this.env);
+    let tracked = read.finally(() => {
+      if (this.authorityConfigRead === tracked) this.authorityConfigRead = undefined;
+    });
+    this.authorityConfigRead = tracked;
+    return tracked;
+  }
+
+  private requireAccountIncarnation(
+      accountId: number, vendorId: string, generation: number): ConnectedAccountRecord {
+    let current = this.storage.connectedAccounts.get(accountId);
+    if (!current || current.vendorId !== vendorId || accountGeneration(current) !== generation) {
+      throw new Error("The connected account changed while this operation was in progress.");
+    }
+    return current;
   }
 
   async authenticate(token: string): Promise<void> {
@@ -1111,7 +1153,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
     // Admin-disabled resources/gatekeepers are filtered out here, which also covers the agent (the
     // Overseer's connectable-vendor/resource list is sourced from this method).
-    let config = await readAdminConfigForAuthority(this.env);
+    let config = await this.readAuthorityConfig();
     let disabledGatekeeperSet = new Set(config.disabledGatekeepers);
 
     let promises: Promise<GatekeeperVendorInfo | null>[] = [];
@@ -1155,7 +1197,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (!vendor) {
       throw new Error("No such service: " + vendorId);
     }
-    let config = await readAdminConfigForAuthority(this.env);
+    let config = await this.readAuthorityConfig();
     if (isGatekeeperDisabled(config, vendorId)) {
       throw new Error(`The "${vendorId}" gatekeeper is disabled on this deployment.`);
     }
@@ -1169,7 +1211,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       let supportedResources = await vendor.getSupportedResources({
         userId: this.storage.profile.get().id,
       });
-      config = await readAdminConfigForAuthority(this.env);
+      config = await this.readAuthorityConfig();
       if (isGatekeeperDisabled(config, vendorId)) {
         throw new Error(`The "${vendorId}" gatekeeper is disabled on this deployment.`);
       }
@@ -1184,6 +1226,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       userId: this.ctx.id.toString(),
       accountId,
       vendorId,
+      accountGeneration: 0,
       resourceUrlPatterns: normalizedResourceUrlPatterns,
     };
 
@@ -1193,7 +1236,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         callback, {resourceUrlPatterns: normalizedResourceUrlPatterns});
     // The provider may take time to mint its authorization URL. Do not return a flow whose scope
     // became forbidden while that RPC was in flight; its completion callback is checked again.
-    config = await readAdminConfigForAuthority(this.env);
+    config = await this.readAuthorityConfig();
     if (isGatekeeperDisabled(config, vendorId) ||
         (normalizedResourceUrlPatterns === undefined &&
           (config.disabledResources[vendorId.toLowerCase()]?.length ?? 0) > 0) ||
@@ -1263,7 +1306,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * offered.)
    */
   async listAddableGatekeepers(): Promise<GatekeeperVendorInfo[]> {
-    let config = await readAdminConfigForAuthority(this.env);
+    let config = await this.readAuthorityConfig();
     return (await this.#ambientVendors())
         .filter(({vendorId}) =>
             !isGatekeeperDisabled(config, vendorId) &&
@@ -1356,12 +1399,13 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       account,
       description,
       vendorId,
+      accountGeneration: 0,
       autoProvisioned: true,
     });
   }
 
   async #assertAmbientVendorAvailable(vendorId: string, requireForced = false): Promise<void> {
-    let config = await readAdminConfigForAuthority(this.env);
+    let config = await this.readAuthorityConfig();
     let block = gatekeeperAvailabilityBlock(
         config,
         {type: "ambient", vendorId, accountId: 0});
@@ -1397,7 +1441,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       if (rec.autoProvisioned) provisioned.add(rec.vendorId);
     }
 
-    let config = await readAdminConfigForAuthority(this.env);
+    let config = await this.readAuthorityConfig();
     for (let {vendorId, vendor} of await this.#ambientVendors()) {
       if (provisioned.has(vendorId)) continue;
       // Only "enabled" (forced) vendors are auto-provisioned for everyone. "optional" vendors are
@@ -1425,7 +1469,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    */
   async listProvidedAccounts(): Promise<ProvidedAccountInfo[]> {
     await this.#ensureAutoProvisionedAccounts();
-    let config = await readAdminConfigForAuthority(this.env);
+    let config = await this.readAuthorityConfig();
     let result: ProvidedAccountInfo[] = [];
     for (let rec of this.#connectedAccountRecords()) {
       if (!rec.description.singleton && !rec.description.providesUi) continue;
@@ -1450,19 +1494,29 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     // Present only when description.singleton is set; gate on that, then call through the derived
     // SingletonAccountStub view (see its definition for why the cast is needed).
     if (!record?.description.singleton) return null;
+    let vendorId = record.vendorId;
+    let generation = accountGeneration(record);
     let block = gatekeeperAvailabilityBlock(
-        await readAdminConfigForAuthority(this.env),
-        {type: "ambient", vendorId: record.vendorId, accountId: record.id});
+        await this.readAuthorityConfig(),
+        {type: "ambient", vendorId, accountId: record.id});
     if (block) throw new Error("Gatekeeper is disabled on this deployment by an administrator.");
+    record = this.requireAccountIncarnation(accountId, vendorId, generation);
+    if (!record.description.singleton) throw new Error("No such account.");
     let cls = await (record.account as unknown as SingletonAccountStub)
         .getSingletonGatekeeperClass();
-    record = this.storage.connectedAccounts.get(accountId);
-    if (!record?.description.singleton) throw new Error("No such account.");
-    block = gatekeeperAvailabilityBlock(
-        await readAdminConfigForAuthority(this.env),
-        {type: "ambient", vendorId: record.vendorId, accountId: record.id});
-    if (block) throw new Error("Gatekeeper is disabled on this deployment by an administrator.");
-    return cls;
+    try {
+      record = this.requireAccountIncarnation(accountId, vendorId, generation);
+      if (!record.description.singleton) throw new Error("No such account.");
+      block = gatekeeperAvailabilityBlock(
+          await this.readAuthorityConfig(),
+          {type: "ambient", vendorId, accountId: record.id});
+      record = this.requireAccountIncarnation(accountId, vendorId, generation);
+      if (block) throw new Error("Gatekeeper is disabled on this deployment by an administrator.");
+      return cls;
+    } catch (error) {
+      disposeRpcCapability(cls);
+      throw error;
+    }
   }
 
   /**
@@ -1474,17 +1528,22 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record?.description.singleton) return null;
     if (!areCredentialsValid(record)) return null;
+    let vendorId = record.vendorId;
+    let generation = accountGeneration(record);
     let block = gatekeeperAvailabilityBlock(
-        await readAdminConfigForAuthority(this.env),
-        {type: "ambient", vendorId: record.vendorId, accountId: record.id});
+        await this.readAuthorityConfig(),
+        {type: "ambient", vendorId, accountId: record.id});
+    record = this.requireAccountIncarnation(accountId, vendorId, generation);
+    if (!record.description.singleton || !areCredentialsValid(record)) return null;
     if (block) return null;
     try {
       let details = await (record.account as unknown as DetailedAccountStub).getAccountDetails();
-      record = this.storage.connectedAccounts.get(accountId);
-      if (!record?.description.singleton || !areCredentialsValid(record)) return null;
+      record = this.requireAccountIncarnation(accountId, vendorId, generation);
+      if (!record.description.singleton || !areCredentialsValid(record)) return null;
       block = gatekeeperAvailabilityBlock(
-          await readAdminConfigForAuthority(this.env),
-          {type: "ambient", vendorId: record.vendorId, accountId: record.id});
+          await this.readAuthorityConfig(),
+          {type: "ambient", vendorId, accountId: record.id});
+      this.requireAccountIncarnation(accountId, vendorId, generation);
       return block ? null : details;
     } catch {
       return null;
@@ -1496,14 +1555,19 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * fresh by the caller so admin-gated features reflect the user's current status.
    */
   private async requireAccountAppUi(
-      accountId: number, vendorId?: string): Promise<ConnectedAccountRecord> {
+      accountId: number, vendorId?: string,
+      generation?: number): Promise<ConnectedAccountRecord> {
     let record = this.storage.connectedAccounts.get(accountId);
-    if (!record?.description.providesUi || vendorId && record.vendorId !== vendorId) {
+    if (!record?.description.providesUi ||
+        vendorId && record.vendorId !== vendorId ||
+        generation !== undefined && accountGeneration(record) !== generation) {
       throw new Error("No such app.");
     }
-    let config = await readAdminConfigForAuthority(this.env);
+    let config = await this.readAuthorityConfig();
     record = this.storage.connectedAccounts.get(accountId);
-    if (!record?.description.providesUi || vendorId && record.vendorId !== vendorId) {
+    if (!record?.description.providesUi ||
+        vendorId && record.vendorId !== vendorId ||
+        generation !== undefined && accountGeneration(record) !== generation) {
       throw new Error("No such app.");
     }
     let block = gatekeeperAvailabilityBlock(
@@ -1516,9 +1580,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async startAccountAppUi(accountId: number, context: AppUiContext): Promise<GatekeeperUiFrame> {
     let record = await this.requireAccountAppUi(accountId);
     let vendorId = record.vendorId;
+    let generation = accountGeneration(record);
     let frame = await (record.account as unknown as SingletonAccountStub).startAppUi(context);
     try {
-      await this.requireAccountAppUi(accountId, vendorId);
+      await this.requireAccountAppUi(accountId, vendorId, generation);
     } catch (error) {
       frame.ui[Symbol.dispose]();
       throw error;
@@ -1526,10 +1591,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return {
       ...frame,
       ui: makeRevalidatingRpcStub(
-          async () => {
-            await this.requireAccountAppUi(accountId, vendorId);
-            return frame.ui as any;
-          },
+          () => frame.ui,
+          async () => { await this.requireAccountAppUi(accountId, vendorId, generation); },
           () => frame.ui[Symbol.dispose]()),
     };
   }
@@ -1537,21 +1600,39 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async ensureAccountResources(accountId: number, resourceUrlPatterns: string[]): Promise<{url?: string}> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record) throw new Error("No such account.");
-    let config = await readAdminConfigForAuthority(this.env);
-    if (isGatekeeperDisabled(config, record.vendorId)) {
-      throw new Error(`The "${record.vendorId}" gatekeeper is disabled on this deployment.`);
+    let vendorId = record.vendorId;
+    let generation = accountGeneration(record);
+    let config = await this.readAuthorityConfig();
+    record = this.requireAccountIncarnation(accountId, vendorId, generation);
+    if (isGatekeeperDisabled(config, vendorId)) {
+      throw new Error(`The "${vendorId}" gatekeeper is disabled on this deployment.`);
     }
     let supportedResources = await record.account.getSupportedResources();
-    config = await readAdminConfigForAuthority(this.env);
-    if (isGatekeeperDisabled(config, record.vendorId)) {
-      throw new Error(`The "${record.vendorId}" gatekeeper is disabled on this deployment.`);
+    record = this.requireAccountIncarnation(accountId, vendorId, generation);
+    config = await this.readAuthorityConfig();
+    record = this.requireAccountIncarnation(accountId, vendorId, generation);
+    if (isGatekeeperDisabled(config, vendorId)) {
+      throw new Error(`The "${vendorId}" gatekeeper is disabled on this deployment.`);
     }
     let normalized = normalizeResourceGrantSelection(
-        config, record.vendorId, supportedResources, resourceUrlPatterns);
+        config, vendorId, supportedResources, resourceUrlPatterns);
+    // Providers such as Google preserve the union of an existing grant and newly-requested scopes.
+    // Refuse to expand a grant that already contains a disabled resource: selecting only enabled
+    // additions cannot make that upstream union safe.
+    if (accountGrantIncludesDisabledResource(
+        config, vendorId, record.description.grantedResourceUrlPatterns)) {
+      throw new Error(
+          "This account still grants a resource disabled by an administrator. Replace the " +
+          "provider grant before adding more resources.");
+    }
     let result = await record.account.ensureResources(normalized ?? []);
-    config = await readAdminConfigForAuthority(this.env);
-    if (isGatekeeperDisabled(config, record.vendorId) ||
-        normalized?.some(pattern => isResourceDisabled(config, record.vendorId, pattern))) {
+    record = this.requireAccountIncarnation(accountId, vendorId, generation);
+    config = await this.readAuthorityConfig();
+    record = this.requireAccountIncarnation(accountId, vendorId, generation);
+    if (isGatekeeperDisabled(config, vendorId) ||
+        accountGrantIncludesDisabledResource(
+            config, vendorId, record.description.grantedResourceUrlPatterns) ||
+        normalized?.some(pattern => isResourceDisabled(config, vendorId, pattern))) {
       throw new Error(
           "This resource authorization was disabled by an administrator while it was starting.");
     }
@@ -1573,7 +1654,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
     // Snapshot the admin config once for this subscription. Changes take effect when the client
     // re-subscribes (e.g. on reconnect), matching other deployment config.
-    let config = await readAdminConfigForAuthority(this.env);
+    let config = await this.readAuthorityConfig();
     let disabledGatekeeperSet = new Set(config.disabledGatekeepers);
 
     async function notifyAdd(record: ConnectedAccountRecord) {
@@ -1684,9 +1765,13 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async disconnectAccount(accountId: number): Promise<void> {
     let account = this.storage.connectedAccounts.get(accountId);
     if (account) {
+      let vendorId = account.vendorId;
+      let generation = accountGeneration(account);
       if (account.autoProvisioned) {
         // A forced ("enabled") ambient account can't be removed by the user — the admin controls it.
-        if (shouldAutoProvisionAccount(await readAdminConfig(this.env), account.vendorId)) {
+        let config = await this.readAuthorityConfig();
+        account = this.requireAccountIncarnation(accountId, vendorId, generation);
+        if (shouldAutoProvisionAccount(config, vendorId)) {
           throw new Error("This account is provided automatically and can't be disconnected.");
         }
         // An opt-in ("optional") ambient account: the user added it, so let them remove it. revoke()
@@ -1701,6 +1786,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
             vendorId: account.vendorId, accountId, error: err,
           });
         }
+        this.requireAccountIncarnation(accountId, vendorId, generation);
         this.storage.connectedAccounts.delete(accountId);
         logger.info("account disconnected", {
           event: "account.disconnected",
@@ -1709,10 +1795,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         return;
       }
       await account.account.revoke();
+      this.requireAccountIncarnation(accountId, vendorId, generation);
       this.storage.connectedAccounts.delete(accountId);
       // Disconnecting the Cloudflare account also clears the AI Gateway billing state (selected
       // account + cached balance), which is meaningless without the underlying grant.
-      if (account.vendorId === CLOUDFLARE_VENDOR_ID) {
+      if (vendorId === CLOUDFLARE_VENDOR_ID) {
         this.storage.cloudflareBilling.put(null);
       }
       logger.info("account disconnected", {
@@ -1725,17 +1812,21 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async reconnectAccount(accountId: number): Promise<{url: string}> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record) throw new Error("No such account.");
-    let config = await readAdminConfigForAuthority(this.env);
-    if (isGatekeeperDisabled(config, record.vendorId)) {
-      throw new Error(`The "${record.vendorId}" gatekeeper is disabled on this deployment.`);
+    let vendorId = record.vendorId;
+    let generation = accountGeneration(record);
+    let config = await this.readAuthorityConfig();
+    record = this.requireAccountIncarnation(accountId, vendorId, generation);
+    if (isGatekeeperDisabled(config, vendorId)) {
+      throw new Error(`The "${vendorId}" gatekeeper is disabled on this deployment.`);
     }
     // Reconnect cannot be narrowed generically: providers such as Google preserve scopes from the
     // existing grant. Runtime policy still blocks disabled resources; replacing the provider grant
     // is an explicit account migration because it also invalidates still-enabled bindings.
     let result = await record.account.reconnect();
-    config = await readAdminConfigForAuthority(this.env);
-    record = this.storage.connectedAccounts.get(accountId);
-    if (!record || isGatekeeperDisabled(config, record.vendorId)) {
+    this.requireAccountIncarnation(accountId, vendorId, generation);
+    config = await this.readAuthorityConfig();
+    this.requireAccountIncarnation(accountId, vendorId, generation);
+    if (isGatekeeperDisabled(config, vendorId)) {
       throw new Error("The gatekeeper was disabled while reconnection was starting.");
     }
     return result;
@@ -1747,17 +1838,22 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record) throw new Error("No such account.");
     let vendorId = record.vendorId;
-    await this.requireResourceConfigurator(accountId, vendorId, resourceUrlPattern);
+    let generation = accountGeneration(record);
+    await this.requireResourceConfigurator(
+        accountId, vendorId, generation, resourceUrlPattern);
+    record = this.requireAccountIncarnation(accountId, vendorId, generation);
     let supportedResources = await record.account.getSupportedResources();
     if (!supportedResources.some(resource => resource.urlPattern === resourceUrlPattern)) {
       throw new Error("Unknown resource type.");
     }
     // Catalog lookup above is an RPC await. Do not start a provider UI from the stale policy or
     // account record captured before it.
-    record = await this.requireResourceConfigurator(accountId, vendorId, resourceUrlPattern);
+    record = await this.requireResourceConfigurator(
+        accountId, vendorId, generation, resourceUrlPattern);
     let frame = await record.account.startResourceConfigurator(resourceUrlPattern);
     try {
-      await this.requireResourceConfigurator(accountId, vendorId, resourceUrlPattern);
+      await this.requireResourceConfigurator(
+          accountId, vendorId, generation, resourceUrlPattern);
     } catch (error) {
       frame.ui[Symbol.dispose]();
       throw error;
@@ -1765,22 +1861,27 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return {
       ...frame,
       ui: makeRevalidatingRpcStub(
+          () => frame.ui,
           async () => {
-            await this.requireResourceConfigurator(accountId, vendorId, resourceUrlPattern);
-            return frame.ui as any;
+            await this.requireResourceConfigurator(
+                accountId, vendorId, generation, resourceUrlPattern);
           },
           () => frame.ui[Symbol.dispose]()),
     };
   }
 
   private async requireResourceConfigurator(
-      accountId: number, vendorId: string,
+      accountId: number, vendorId: string, generation: number,
       resourceUrlPattern: string): Promise<ConnectedAccountRecord> {
     let record = this.storage.connectedAccounts.get(accountId);
-    if (!record || record.vendorId !== vendorId) throw new Error("No such account.");
-    let config = await readAdminConfigForAuthority(this.env);
+    if (!record || record.vendorId !== vendorId || accountGeneration(record) !== generation) {
+      throw new Error("No such account.");
+    }
+    let config = await this.readAuthorityConfig();
     record = this.storage.connectedAccounts.get(accountId);
-    if (!record || record.vendorId !== vendorId) throw new Error("No such account.");
+    if (!record || record.vendorId !== vendorId || accountGeneration(record) !== generation) {
+      throw new Error("No such account.");
+    }
     if (isGatekeeperDisabled(config, record.vendorId)) {
       throw new Error(`The "${record.vendorId}" gatekeeper is disabled on this deployment.`);
     }
@@ -1810,6 +1911,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (uniqueName) {
       let existing = this.#findConnectedAccountByIdentity(vendorId, uniqueName);
       if (existing) {
+        let generation = accountGeneration(existing);
         // Drop the now-stale grant (a separate gatekeeper-side object from the fresh one), then point
         // the existing record — keeping its id, so UI references stay stable — at the fresh grant.
         try {
@@ -1820,10 +1922,14 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
             accountId: existing.id, vendorId, error: err,
           });
         }
+        // Another sign-in may have replaced this stable account id while revoke() was in flight.
+        // Never let this older continuation overwrite the newer provider capability.
+        existing = this.requireAccountIncarnation(existing.id, vendorId, generation);
         existing.account = account;
         existing.description = description;
         existing.credentialExpiresAt = expiresAt;
         existing.credentialsExpired = false;
+        existing.accountGeneration = generation + 1;
         this.storage.connectedAccounts.put(existing);
         return;
       }
@@ -1836,6 +1942,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       account,
       description,
       vendorId,
+      accountGeneration: 0,
       credentialExpiresAt: expiresAt,
     });
   }
@@ -1868,7 +1975,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   private async assertRequestedGrantAvailable(
       vendorId: string, resourceUrlPatterns: string[] | undefined): Promise<void> {
-    let config = await readAdminConfigForAuthority(this.env);
+    let config = await this.readAuthorityConfig();
     if (isGatekeeperDisabled(config, vendorId) ||
         (resourceUrlPatterns === undefined &&
           (config.disabledResources[vendorId.toLowerCase()]?.length ?? 0) > 0) ||
@@ -1895,12 +2002,13 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       account,
       description,
       vendorId,
+      accountGeneration: 0,
       credentialExpiresAt: expiresAt,
     });
   }
 
   async putConnectedAccount(record: ConnectedAccountRecord) {
-    let config = await readAdminConfigForAuthority(this.env);
+    let config = await this.readAuthorityConfig();
     let vendorDisabled = isGatekeeperDisabled(config, record.vendorId);
     let resourceDisabled = !vendorDisabled && accountGrantIncludesDisabledResource(
         config, record.vendorId, record.description.grantedResourceUrlPatterns);
@@ -1924,12 +2032,14 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       return;
     }
 
-    this.storage.connectedAccounts.put(record);
+    this.storage.connectedAccounts.put({...record, accountGeneration: accountGeneration(record)});
   }
 
-  async markCredentialsExpired(accountId: number) {
+  async markCredentialsExpired(accountId: number, expectedGeneration = 0) {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record) throw new Error("No such account.");
+    record = this.requireAccountIncarnation(
+        accountId, record.vendorId, expectedGeneration);
 
     if (!record.credentialsExpired) {
       record.credentialsExpired = true;
@@ -1937,12 +2047,16 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
   }
 
-  async markCredentialsRestored(accountId: number, expiresAt?: Date) {
+  async markCredentialsRestored(
+      accountId: number, expiresAt?: Date, expectedGeneration = 0) {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record) throw new Error("No such account.");
+    let vendorId = record.vendorId;
+    record = this.requireAccountIncarnation(accountId, vendorId, expectedGeneration);
 
-    let config = await readAdminConfigForAuthority(this.env);
-    if (isGatekeeperDisabled(config, record.vendorId)) {
+    let config = await this.readAuthorityConfig();
+    record = this.requireAccountIncarnation(accountId, vendorId, expectedGeneration);
+    if (isGatekeeperDisabled(config, vendorId)) {
       // Covers a reconnect flow already in progress when the whole integration was disabled. Keep
       // the existing account for explicit disconnect/recovery: OAuth providers generally revoke
       // every service on a grant together.
@@ -1958,16 +2072,18 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     // expanded the grant while its OAuth tab was open, and the returned description is the source
     // of truth for what was granted.
     let description = await record.account.describe();
-    config = await readAdminConfigForAuthority(this.env);
-    if (isGatekeeperDisabled(config, record.vendorId)) {
+    record = this.requireAccountIncarnation(accountId, vendorId, expectedGeneration);
+    config = await this.readAuthorityConfig();
+    record = this.requireAccountIncarnation(accountId, vendorId, expectedGeneration);
+    if (isGatekeeperDisabled(config, vendorId)) {
       record.credentialsExpired = true;
       this.storage.connectedAccounts.put(record);
       throw new Error(
           "The integration was disabled by an administrator while it was reconnecting.");
     }
-    if ((config.disabledResources[record.vendorId.toLowerCase()]?.length ?? 0) > 0) {
+    if ((config.disabledResources[vendorId.toLowerCase()]?.length ?? 0) > 0) {
       if (accountGrantIncludesDisabledResource(
-          config, record.vendorId, description.grantedResourceUrlPatterns)) {
+          config, vendorId, description.grantedResourceUrlPatterns)) {
         record.credentialsExpired = true;
         this.storage.connectedAccounts.put(record);
         throw new Error(
@@ -1986,31 +2102,40 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
                   typeUrlPattern: string}> {
     let account = this.storage.connectedAccounts.get(accountId);
     if (!account) throw new Error("No such account.");
-    let config = await readAdminConfigForAuthority(this.env);
-    if (isGatekeeperDisabled(config, account.vendorId)) {
+    let vendorId = account.vendorId;
+    let generation = accountGeneration(account);
+    let config = await this.readAuthorityConfig();
+    account = this.requireAccountIncarnation(accountId, vendorId, generation);
+    if (isGatekeeperDisabled(config, vendorId)) {
       throw new Error(
-          `The "${account.vendorId}" gatekeeper is disabled on this deployment by an administrator.`);
+          `The "${vendorId}" gatekeeper is disabled on this deployment by an administrator.`);
     }
     let {class: cls, resource} = await account.account.getGatekeeperClassFor(url);
 
     // Block whole gatekeepers + disabled resources at this single core-side chokepoint where a
     // resourceUrl becomes a capability (reached only via the user/UI-facing Overseer.newGatekeeper
     // and blueprint instantiation — never from gadget or agent code).
-    config = await readAdminConfigForAuthority(this.env);
-    let vendorId = account.vendorId.toLowerCase();
-    if (isGatekeeperDisabled(config, vendorId)) {
-      throw new Error(
-          `The "${account.vendorId}" gatekeeper is disabled on this deployment by an administrator.`);
-    }
+    try {
+      this.requireAccountIncarnation(accountId, vendorId, generation);
+      config = await this.readAuthorityConfig();
+      this.requireAccountIncarnation(accountId, vendorId, generation);
+      if (isGatekeeperDisabled(config, vendorId)) {
+        throw new Error(
+            `The "${vendorId}" gatekeeper is disabled on this deployment by an administrator.`);
+      }
 
-    // Blocking here prevents minting a new capability to a disabled resource even if the request
-    // bypasses the (separately filtered) picker/agent listings.
-    if (isResourceDisabled(config, vendorId, resource.urlPattern)) {
-      throw new Error(
-          `The "${resource.title}" resource is disabled on this deployment by an administrator.`);
-    }
+      // Blocking here prevents minting a new capability to a disabled resource even if the request
+      // bypasses the (separately filtered) picker/agent listings.
+      if (isResourceDisabled(config, vendorId, resource.urlPattern)) {
+        throw new Error(
+            `The "${resource.title}" resource is disabled on this deployment by an administrator.`);
+      }
 
-    return {class: cls, vendorId: account.vendorId, typeUrlPattern: resource.urlPattern};
+      return {class: cls, vendorId, typeUrlPattern: resource.urlPattern};
+    } catch (error) {
+      disposeRpcCapability(cls);
+      throw error;
+    }
   }
 
   /**
@@ -2034,23 +2159,25 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
           `!= expected "${expectedVendorId}"`);
       throw new Error("Invalid account selection for this service.");
     }
-    let config = await readAdminConfigForAuthority(this.env);
-    account = this.storage.connectedAccounts.get(accountId);
-    if (!account) return null;
-    if (account.vendorId !== expectedVendorId) {
-      throw new Error("Invalid account selection for this service.");
-    }
+    let generation = accountGeneration(account);
+    let config = await this.readAuthorityConfig();
+    account = this.requireAccountIncarnation(accountId, expectedVendorId, generation);
     if (isGatekeeperDisabled(config, account.vendorId)) {
       throw new Error("The gatekeeper is disabled on this deployment by an administrator.");
     }
     let verifier = await account.account.getVerifier();
-    config = await readAdminConfigForAuthority(this.env);
-    account = this.storage.connectedAccounts.get(accountId);
-    if (!account || account.vendorId !== expectedVendorId ||
-        isGatekeeperDisabled(config, account.vendorId)) {
-      throw new Error("The gatekeeper was disabled while observer verification was starting.");
+    try {
+      this.requireAccountIncarnation(accountId, expectedVendorId, generation);
+      config = await this.readAuthorityConfig();
+      account = this.requireAccountIncarnation(accountId, expectedVendorId, generation);
+      if (isGatekeeperDisabled(config, account.vendorId)) {
+        throw new Error("The gatekeeper was disabled while observer verification was starting.");
+      }
+      return verifier;
+    } catch (error) {
+      disposeRpcCapability(verifier);
+      throw error;
     }
-    return verifier;
   }
 
   /**
@@ -2068,6 +2195,7 @@ type GatekeeperConnectCallbackProps = {
   userId: string;
   accountId: number;
   vendorId: string;
+  accountGeneration?: number;
   resourceUrlPatterns?: string[];
 }
 
@@ -2091,12 +2219,14 @@ export class GatekeeperConnectCallbackImpl
 
   async credentialsExpired(): Promise<void> {
     let userStub = this.#getUserStub();
-    await userStub.markCredentialsExpired(this.ctx.props.accountId);
+    await userStub.markCredentialsExpired(
+        this.ctx.props.accountId, this.ctx.props.accountGeneration ?? 0);
   }
 
   async credentialsRestored(expiresAt?: Date): Promise<void> {
     let userStub = this.#getUserStub();
-    await userStub.markCredentialsRestored(this.ctx.props.accountId, expiresAt);
+    await userStub.markCredentialsRestored(
+        this.ctx.props.accountId, expiresAt, this.ctx.props.accountGeneration ?? 0);
   }
 }
 

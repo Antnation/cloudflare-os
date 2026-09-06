@@ -38,7 +38,7 @@ async function expectRejection(call: PromiseLike<unknown>, pattern: RegExp): Pro
 }
 
 function makeUser() {
-  let activeConfig: AdminConfig = {
+  let activeConfig: AdminConfig | string = {
     ...DEFAULT_ADMIN_CONFIG,
     disabledResources: {google: [CALENDAR_PATTERN]},
   };
@@ -85,10 +85,14 @@ function makeUser() {
     },
     credentialsExpired: false,
   };
+  let currentRecord: typeof connectedRecord | Record<string, unknown> | undefined = connectedRecord;
   let putConnectedAccount = vi.fn();
+  let deleteConnectedAccount = vi.fn();
   let user = Object.create(UserDurableObject.prototype) as UserDurableObject;
   Object.assign(user, {
-    env: {BLUEPRINTS: {get: async () => serializeAdminConfig(activeConfig)}},
+    env: {BLUEPRINTS: {get: async () => typeof activeConfig === "string"
+      ? activeConfig
+      : serializeAdminConfig(activeConfig)}},
     vendors: new Map([["google", {
       getSupportedResources: getVendorSupportedResources,
       connectAccount,
@@ -96,7 +100,11 @@ function makeUser() {
     storage: {
       profile: {get: () => ({id: "user@example.com"})},
       nextAccountId: {get: () => 4, put: vi.fn()},
-      connectedAccounts: {get: () => connectedRecord, put: putConnectedAccount},
+      connectedAccounts: {
+        get: () => currentRecord,
+        put: putConnectedAccount,
+        delete: deleteConnectedAccount,
+      },
     },
     ctx: {
       id: {toString: () => "user-do-id"},
@@ -111,6 +119,7 @@ function makeUser() {
     reconnect,
     describeAccount,
     putConnectedAccount,
+    deleteConnectedAccount,
     connectedRecord,
     listCalendars,
     disposeConfiguratorUi,
@@ -122,6 +131,12 @@ function makeUser() {
     getAccountSupportedResources,
     setConfig(config: AdminConfig) {
       activeConfig = config;
+    },
+    setRawConfig(config: string) {
+      activeConfig = config;
+    },
+    replaceConnectedRecord(record: Record<string, unknown> | undefined) {
+      currentRecord = record;
     },
   };
 }
@@ -208,6 +223,39 @@ describe("UserDurableObject resource policy", () => {
     releaseCatalog();
 
     await expect(pending).rejects.toThrow(/disabled/);
+    expect(ensureResources).not.toHaveBeenCalled();
+  });
+
+  it("refuses expansion when the provider would union in an already-disabled grant", async () => {
+    let {user, ensureResources, getAccountSupportedResources} = makeUser();
+
+    await expect(user.ensureAccountResources(3, [GMAIL_PATTERN]))
+        .rejects.toThrow(/still grants a resource disabled/);
+    expect(getAccountSupportedResources).toHaveBeenCalledTimes(1);
+    expect(ensureResources).not.toHaveBeenCalled();
+  });
+
+  it("does not expand through an account capability replaced during provider discovery", async () => {
+    let {
+      user, ensureResources, getAccountSupportedResources, connectedRecord, setConfig,
+      replaceConnectedRecord,
+    } = makeUser();
+    setConfig(DEFAULT_ADMIN_CONFIG);
+    let releaseCatalog!: () => void;
+    let catalogEntered!: () => void;
+    let entered = new Promise<void>(resolve => { catalogEntered = resolve; });
+    getAccountSupportedResources.mockImplementationOnce(async () => {
+      catalogEntered();
+      await new Promise<void>(resolve => { releaseCatalog = resolve; });
+      return RESOURCES;
+    });
+
+    let pending = user.ensureAccountResources(3, [GMAIL_PATTERN]);
+    await entered;
+    replaceConnectedRecord({...connectedRecord, accountGeneration: 1, account: {}});
+    releaseCatalog();
+
+    await expect(pending).rejects.toThrow(/account changed/);
     expect(ensureResources).not.toHaveBeenCalled();
   });
 
@@ -345,6 +393,74 @@ describe("UserDurableObject resource policy", () => {
     await expect(pending).rejects.toThrow(/gained a resource disabled/);
     expect(connectedRecord.credentialsExpired).toBe(true);
     expect(putConnectedAccount).toHaveBeenCalledWith(connectedRecord);
+  });
+
+  it("does not overwrite a replacement account when an older restore callback settles", async () => {
+    let {
+      user, describeAccount, connectedRecord, putConnectedAccount, setConfig,
+      replaceConnectedRecord,
+    } = makeUser();
+    setConfig(DEFAULT_ADMIN_CONFIG);
+    let releaseDescription!: () => void;
+    let descriptionEntered!: () => void;
+    let entered = new Promise<void>(resolve => { descriptionEntered = resolve; });
+    describeAccount.mockImplementationOnce(async () => {
+      descriptionEntered();
+      await new Promise<void>(resolve => { releaseDescription = resolve; });
+      return {avatar: {url: "https://example.com/new.png"}};
+    });
+
+    let pending = user.markCredentialsRestored(3);
+    await entered;
+    let replacement = {
+      ...connectedRecord,
+      accountGeneration: 1,
+      account: {},
+      credentialsExpired: false,
+    };
+    replaceConnectedRecord(replacement);
+    releaseDescription();
+
+    await expect(pending).rejects.toThrow(/account changed/);
+    expect(putConnectedAccount).not.toHaveBeenCalled();
+    expect(replacement.credentialsExpired).toBe(false);
+  });
+
+  it("disposes a minted class when its account is replaced before publication", async () => {
+    let {user, connectedRecord, setConfig, replaceConnectedRecord} = makeUser();
+    setConfig(DEFAULT_ADMIN_CONFIG);
+    let releaseClass!: () => void;
+    let classEntered!: () => void;
+    let entered = new Promise<void>(resolve => { classEntered = resolve; });
+    let disposeClass = vi.fn();
+    let cls = {[Symbol.dispose]: disposeClass};
+    (connectedRecord.account as any).getGatekeeperClassFor = vi.fn(async () => {
+      classEntered();
+      await new Promise<void>(resolve => { releaseClass = resolve; });
+      return {class: cls, resource: RESOURCES[0]};
+    });
+
+    let pending = user.getGatekeeperClassFor(3, "https://mail.google.com/inbox");
+    await entered;
+    replaceConnectedRecord({...connectedRecord, accountGeneration: 1, account: {}});
+    releaseClass();
+
+    await expect(pending).rejects.toThrow(/account changed/);
+    expect(disposeClass).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed before deleting a forced ambient account under malformed policy", async () => {
+    let {
+      user, connectedRecord, deleteConnectedAccount, setRawConfig,
+    } = makeUser();
+    let revoke = vi.fn();
+    connectedRecord.autoProvisioned = true;
+    connectedRecord.account.revoke = revoke;
+    setRawConfig("not json");
+
+    await expect(user.disconnectAccount(3)).rejects.toThrow(/policy is malformed/);
+    expect(revoke).not.toHaveBeenCalled();
+    expect(deleteConnectedAccount).not.toHaveBeenCalled();
   });
 
   it("does not contact the provider when a reconnect settles after whole-vendor disable", async () => {

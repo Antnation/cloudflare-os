@@ -347,6 +347,9 @@ export function parseAdminConfigForAuthority(raw: string | null): AdminConfig {
   }
 
   let policy = parsed as Record<string, unknown>;
+  if ("signupsEnabled" in policy && typeof policy.signupsEnabled !== "boolean") {
+    throw new Error("The deployment signup policy is malformed.");
+  }
   if ("disabledGatekeepers" in policy &&
       (!Array.isArray(policy.disabledGatekeepers) ||
        policy.disabledGatekeepers.some(value => typeof value !== "string"))) {

@@ -23,7 +23,7 @@ import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { GatekeeperConnectCallback, GatekeeperUser } from "@gadgets/workshop-shared/gatekeeper";
 import { createWorkshopLogger } from "../observability";
 import { CLOUDFLARE_VENDOR_ID } from "../user.js";
-import { readAdminConfig } from "../admin-config.js";
+import { readAdminConfigForAuthority } from "../admin-config.js";
 
 const logger = createWorkshopLogger("workshop.auth");
 
@@ -111,7 +111,7 @@ export class LoginConnectCallbackImpl
           this.ctx.exports.UserDurableObject.idFromName(email));
       // Closed signups block first-time account creation here too (not just password signup); an
       // existing user signing in is unaffected.
-      const signupsEnabled = (await readAdminConfig(this.env)).signupsEnabled;
+      const signupsEnabled = (await readAdminConfigForAuthority(this.env)).signupsEnabled;
       const secret = await userStub.loginOrCreateViaGatekeeper(email, signupsEnabled);
       if (secret === null) {
         loginLogger.info("gatekeeper login finished", {
