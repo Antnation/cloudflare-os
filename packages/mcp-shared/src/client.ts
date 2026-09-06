@@ -86,6 +86,16 @@ const MAX_TOOL_DESCRIPTION_CHARS = 4000;
 // lets ordinary twenty-result searches stay well below the catalog byte budget.
 const MAX_TOOL_SEARCH_SUMMARY_CHARS = 256;
 const MAX_TOOL_SCHEMA_CHARS = 20_000;
+// Green Hat fork: a schema over MAX_TOOL_SCHEMA_CHARS is abbreviated to its top-level fields rather
+// than dropped. Dropping it rendered the tool as taking NO arguments, so agents guessed field names
+// and a strict server (GreenGateway validates every call against the full schema, unknown fields
+// included) refused each guess. The abbreviation keeps every field name, its type, a clipped
+// description and, for nested objects, the names of their fields; it is bounded so the catalog
+// budget below still holds for a Connection with many wide objects (a Twenty CRM company has 53
+// fields and a 20.7 K schema).
+const MAX_ABBREVIATED_SCHEMA_CHARS = 4_000;
+const MAX_ABBREVIATED_DESCRIPTION_CHARS = 100;
+const MAX_ABBREVIATED_NESTED_NAMES = 12;
 const MAX_CATALOG_BYTES = 96 * 1024;
 // Filtered discovery can skip every tool on a page, so its retained-result budget would otherwise
 // permit fifty maximum-sized responses. Bound what was inspected independently of what matched.
@@ -182,6 +192,19 @@ export class McpCallNotDispatchedError extends Error {
  */
 export type CallOutcome = "declined" | "unknown";
 
+/**
+ * Green Hat fork. Thrown by the action store when an approved call was declined by the server
+ * before it ran: the message carries the server's reason and is safe to show in chat. Keeps the
+ * `declined` outcome so `callMayHaveTakenEffect` stays false for it.
+ */
+export class McpDeclinedCallError extends Error {
+  readonly outcome: CallOutcome = "declined";
+  constructor(message: string, cause: unknown) {
+    super(message, { cause });
+    this.name = "McpDeclinedCallError";
+  }
+}
+
 /** Thrown for JSON-RPC error responses and transport-level failures. */
 export class McpProtocolError extends Error {
   readonly code: number | undefined;
@@ -198,6 +221,20 @@ export class McpProtocolError extends Error {
   }
 }
 
+// Green Hat fork. JSON-RPC's own rejection codes for a malformed request, an unknown method and
+// invalid params mean the server refused the request before dispatching it to a tool, so nothing
+// was performed and the call is safe to stage again with corrected arguments. Any other error code
+// (internal error, server-defined codes) stays unknown: the tool may have run. The one exception is
+// a composite tool that fails part-way with invalid params; GreenGateway marks those with a
+// `failed_step`, and the step that ran may have changed something.
+function toolCallErrorOutcome(error: { code: number; data?: unknown }): CallOutcome {
+  if (error.code === -32600 || error.code === -32601) return "declined";
+  if (error.code !== -32602) return "unknown";
+  const data = error.data;
+  const partial = typeof data === "object" && data !== null && "failed_step" in data;
+  return partial ? "unknown" : "declined";
+}
+
 /**
  * Whether a failed call might already have taken effect on the server.
  *
@@ -207,6 +244,7 @@ export class McpProtocolError extends Error {
  */
 export function callMayHaveTakenEffect(err: unknown): boolean {
   if (err instanceof McpCallNotDispatchedError) return false;
+  if (err instanceof McpDeclinedCallError) return false;
   // The server demanded authorization, so it never reached the tool.
   if (err instanceof McpAuthRequiredError) return false;
   // A genuine MCP session-expiry response means the server rejected the request before dispatch,
@@ -314,9 +352,106 @@ function clampText(value: unknown, max: number): string | undefined {
   return value.length > max ? `${value.slice(0, max)}\u2026` : value;
 }
 
+// Green Hat fork. Summarizes one property of an oversized schema: type, a clipped description, a
+// small enum, and for objects and arrays the shape one level down, expressed as names in the
+// description rather than as nested schemas (which is what made the original too large).
+type AbbreviatedProperty = {
+  schema: JsonSchema;
+  /** The server's own description, clipped; the first thing dropped when space runs out. */
+  prose?: string;
+  /** What lies one level down, as names; kept as long as the property itself is. */
+  shape?: string;
+};
+
+function abbreviateProperty(property: JsonSchema): AbbreviatedProperty {
+  const schema: JsonSchema = {};
+  if (property.type !== undefined) schema.type = property.type;
+  const prose = clampText(property.description, MAX_ABBREVIATED_DESCRIPTION_CHARS);
+  if (Array.isArray(property.enum) && JSON.stringify(property.enum).length <= 300) {
+    schema.enum = property.enum;
+  }
+  const shapes: string[] = [];
+  const nested = isPlainObjectValue(property.properties) ? Object.keys(property.properties) : [];
+  if (nested.length > 0) {
+    const shown = nested.slice(0, MAX_ABBREVIATED_NESTED_NAMES).join(", ");
+    const more = nested.length > MAX_ABBREVIATED_NESTED_NAMES
+      ? ` and ${nested.length - MAX_ABBREVIATED_NESTED_NAMES} more` : "";
+    shapes.push(`Object with fields: ${shown}${more}.`);
+    if (schema.type === undefined) schema.type = "object";
+  }
+  if (property.items && !Array.isArray(property.items)) {
+    const items = property.items;
+    const itemFields = isPlainObjectValue(items.properties) ? Object.keys(items.properties) : [];
+    schema.items = items.type !== undefined ? { type: items.type } : {};
+    if (itemFields.length > 0) {
+      shapes.push(`Array items are objects with fields: ${
+        itemFields.slice(0, MAX_ABBREVIATED_NESTED_NAMES).join(", ")}.`);
+    }
+    if (schema.type === undefined) schema.type = "array";
+  }
+  return {
+    schema,
+    ...(prose ? { prose } : {}),
+    ...(shapes.length > 0 ? { shape: shapes.join(" ") } : {}),
+  };
+}
+
+function isPlainObjectValue(value: unknown): value is Record<string, JsonSchema> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// Green Hat fork. The bounded stand-in for an input schema too large to keep: the same top-level
+// field names, types and requiredness, so the generated method stays typed on what the agent
+// actually passes, with the nesting reduced to prose. Returns undefined when there is nothing to
+// abbreviate (no top-level properties), which keeps the old behaviour for such schemas.
+export function abbreviateSchema(schema: JsonSchema, originalChars: number): JsonSchema | undefined {
+  if (!isPlainObjectValue(schema.properties)) return undefined;
+  const required = Array.isArray(schema.required)
+    ? schema.required.filter((name): name is string => typeof name === "string") : [];
+  const names = Object.keys(schema.properties);
+  // Required fields first, so trimming for size drops the optional tail.
+  names.sort((a, b) => Number(required.includes(b)) - Number(required.includes(a)));
+  const summaries = new Map<string, AbbreviatedProperty>();
+  for (const name of names) {
+    const property = schema.properties[name];
+    summaries.set(name, isPlainObjectValue(property) ? abbreviateProperty(property) : { schema: {} });
+  }
+  const build = (withProse: boolean): JsonSchema => {
+    const properties: Record<string, JsonSchema> = {};
+    for (const [name, summary] of summaries) {
+      const description = [withProse ? summary.prose : undefined, summary.shape]
+        .filter((part): part is string => part !== undefined).join(" ");
+      properties[name] = { ...summary.schema, ...(description ? { description } : {}) };
+    }
+    return {
+      type: "object",
+      description:
+        `Abbreviated: the server's full schema (${originalChars} characters) is too large to ` +
+        "include, so nested fields are described in prose. The server validates every call " +
+        "against the full schema and rejects unknown fields.",
+      properties,
+      ...(required.length > 0 ? { required } : {}),
+      ...(schema.additionalProperties !== undefined
+        ? { additionalProperties: schema.additionalProperties } : {}),
+    };
+  };
+  let abbreviated = build(true);
+  if (JSON.stringify(abbreviated).length <= MAX_ABBREVIATED_SCHEMA_CHARS) return abbreviated;
+  // Still too big: drop the prose (the nested-field names stay, they are what an agent needs to
+  // write a valid call), then optional properties from the end.
+  abbreviated = build(false);
+  const optionalNames = names.filter(name => !required.includes(name));
+  while (JSON.stringify(abbreviated).length > MAX_ABBREVIATED_SCHEMA_CHARS
+      && optionalNames.length > 0) {
+    summaries.delete(optionalNames.pop()!);
+    abbreviated = build(false);
+  }
+  return abbreviated;
+}
+
 // Trims one tool down to what is worth keeping, before it reaches storage or the agent. A schema too
-// large to render is dropped rather than clipped, so the generated method degrades to
-// `Record<string, unknown>`.
+// large to render is abbreviated to its top-level fields (Green Hat fork; upstream dropped it, so
+// the generated method degraded to taking no arguments).
 // Keeps only the hints this gatekeeper understands, so a server cannot attach unbounded text to a
 // tool under `annotations` and have it stored or rendered. Each retained field is a boolean or
 // absent.
@@ -340,15 +475,15 @@ export function clampToolDefinition(tool: McpWireTool | McpTool): McpTool {
   const schema = tool.inputSchema && typeof tool.inputSchema === "object"
     ? tool.inputSchema as JsonSchema
     : undefined;
-  const oversized = schema !== undefined &&
-    JSON.stringify(schema).length > MAX_TOOL_SCHEMA_CHARS;
+  const schemaChars = schema === undefined ? 0 : JSON.stringify(schema).length;
+  const oversized = schema !== undefined && schemaChars > MAX_TOOL_SCHEMA_CHARS;
   return {
     // Pick known fields rather than spreading an untrusted JSON object. Unknown extensions are not
     // used anywhere, and retaining one would let it bypass every per-field cap before caching.
     name: tool.name,
     title: clampText(tool.title, MAX_TOOL_DESCRIPTION_CHARS),
     description: clampText(tool.description, MAX_TOOL_DESCRIPTION_CHARS),
-    inputSchema: oversized ? undefined : schema,
+    inputSchema: oversized ? abbreviateSchema(schema, schemaChars) : schema,
     annotations: clampAnnotations(tool.annotations),
   };
 }
@@ -507,7 +642,8 @@ export class McpClient {
     if (parsed.error) {
       throw new McpProtocolError(
         `MCP server rejected "${method}": ${this.#quoteServerText(parsed.error.message)}`,
-        parsed.error.code, method === "tools/call" ? "unknown" : "declined");
+        parsed.error.code,
+        method === "tools/call" ? toolCallErrorOutcome(parsed.error) : "declined");
     }
     return { result: parsed.result as T, responseBytes };
   }

@@ -6533,8 +6533,14 @@ type OverseerRestoreParams = {
 // mcp-shared's action store, whose messages are the only signal the Overseer gets.
 function gatekeeperActionIsTerminal(err: unknown): boolean {
   let message = err instanceof Error ? err.message : String(err);
-  return /failed after it had been sent|cannot be retried|is already failed|was already rejected|is already rejected|already applied/i
+  return /failed after it had been sent|declined this call before running it|cannot be retried|is already failed|was already rejected|is already rejected|already applied/i
       .test(message);
+}
+
+// A declined call never ran, so the follow-up is to fix the arguments, not to check the server.
+function gatekeeperActionWasDeclined(err: unknown): boolean {
+  let message = err instanceof Error ? err.message : String(err);
+  return /declined this call before running it/i.test(message);
 }
 
 export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
@@ -7866,10 +7872,17 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
         this.impl.storage.actions.put(action);
         if (action.caller.from === "agent") {
           let detail = err instanceof Error ? err.message : String(err);
-          this.impl.addChatMessages(action.caller.chatId, profile, [{
+          let followUp = gatekeeperActionWasDeclined(err)
+              ? "Nothing was changed; the server's reason is above."
+              : "Verify on the server, then ask for it to be staged again if it did not land.";
+          // Authored by the agent whose turn is suspended on this approval, when there is one: the
+          // frontend infers a chat's model from its last agent-authored message, and a note under
+          // the approver's name made the composer fall back to "No agent".
+          let meta = this.impl.storage.chatMeta.get(action.caller.chatId);
+          let author = meta?.activeAgent ?? profile;
+          this.impl.addChatMessages(action.caller.chatId, author, [{
             type: "message",
-            message: `"${action.description.title}" could not be applied: ${detail} ` +
-                `Verify on the server, then ask for it to be staged again if it did not land.`,
+            message: `"${action.description.title}" could not be applied: ${detail} ${followUp}`,
           }]);
         }
       }

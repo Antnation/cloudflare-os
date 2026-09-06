@@ -1,7 +1,7 @@
 // Durable lifecycle for approval-gated MCP tool calls. The owning facet supplies its isolated SQLite
 // database; claims are persisted before external I/O so an interrupted write is never replayed.
 
-import { callMayHaveTakenEffect, type McpClient, type McpToolCallResult } from "./client.js";
+import { callMayHaveTakenEffect, McpDeclinedCallError, type McpClient, type McpToolCallResult } from "./client.js";
 import type { McpLog } from "./log.js";
 import type { StoredAction } from "./session.js";
 import { toCallResult } from "./tools.js";
@@ -166,7 +166,15 @@ export class ActionStore {
         event: mayHaveLanded ? "action.apply.outcome-unknown" : "action.apply.failed",
         actionId: id, toolName: stored.toolName, error: err,
       });
-      throw mayHaveLanded ? new Error(stored.error, { cause: err }) : err;
+      if (mayHaveLanded) throw new Error(stored.error, { cause: err });
+      // Green Hat fork: say what is known (nothing ran) and why, in words the Overseer recognizes
+      // as terminal, so the record is closed and the reason reaches the chat instead of the
+      // approval wedging on a call that will fail the same way every time it is retried. The
+      // record stays retryable as upstream intended; it is the Overseer that closes its own.
+      throw new McpDeclinedCallError(
+        "The server declined this call before running it, so nothing changed: " +
+          `${stored.error} Stage it again with corrected arguments.`,
+        err);
     }
 
     stored.state = "applied";

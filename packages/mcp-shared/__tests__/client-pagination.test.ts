@@ -477,13 +477,21 @@ describe("McpClient.listTools", () => {
     expect(tool.description!.length).toBeLessThan(5000);
   });
 
-  it("drops a schema too large to render, rather than storing half of one", async () => {
+  it("abbreviates a schema too large to render, rather than storing half of one", async () => {
+    // Green Hat fork: upstream dropped the schema, which rendered the tool as taking no arguments;
+    // the abbreviation keeps the leading fields (required first) inside a fixed byte bound.
     const huge = { type: "object", properties: Object.fromEntries(
       Array.from({ length: 2000 }, (_, i) => [`field${i}`, { type: "string" }])) };
     stubPages([{ tools: [{ name: "a", inputSchema: huge }] }]);
     const client = new McpClient("https://mcp.example.com/mcp", async () => null);
     const { tools: [tool] } = await client.listTools(10);
-    expect(tool.inputSchema).toBeUndefined();
+    expect(tool.inputSchema).toBeDefined();
+    expect(JSON.stringify(tool.inputSchema).length).toBeLessThanOrEqual(4_000);
+    expect(tool.inputSchema!.description).toContain("Abbreviated");
+    const kept = Object.keys(tool.inputSchema!.properties!);
+    expect(kept.length).toBeGreaterThan(0);
+    expect(kept.length).toBeLessThan(2000);
+    expect(kept[0]).toBe("field0");
   });
 
   it("refuses a response too large to buffer", async () => {
