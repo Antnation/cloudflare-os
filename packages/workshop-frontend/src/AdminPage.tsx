@@ -797,8 +797,10 @@ export default function AdminPage() {
           <p className="text-sm text-kumo-subtle mb-5">
             Turn integrations and resource types on or off for each service. Auto-provisioned
             integrations (like the Context Library) have three modes &mdash; disabled, optional, or
-            enabled for everyone. Changes are soft: they don&rsquo;t revoke access a gadget already
-            holds.
+            enabled for everyone. Once the policy reaches the Workshop, existing sessions, pending
+            approvals, and hooks cannot return disabled results or apply writes. This does not
+            revoke permission at the upstream provider; replacing a legacy OAuth grant is a
+            separate account migration.
           </p>
 
           {resourceVendors.length === 0 && (
