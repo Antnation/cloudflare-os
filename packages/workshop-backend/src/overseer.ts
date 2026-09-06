@@ -6528,6 +6528,15 @@ type OverseerRestoreParams = {
   codeId?: string;
 };
 
+// Green Hat fork: does this error mean the gatekeeper's copy of an action is in a terminal state
+// (failed after being sent and not retryable, already rejected, already applied)? Those come from
+// mcp-shared's action store, whose messages are the only signal the Overseer gets.
+function gatekeeperActionIsTerminal(err: unknown): boolean {
+  let message = err instanceof Error ? err.message : String(err);
+  return /failed after it had been sent|cannot be retried|is already failed|was already rejected|is already rejected|already applied/i
+      .test(message);
+}
+
 export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   private impl: OverseerImpl;
 
@@ -7842,7 +7851,30 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // Resolve the approver's identity before applying, so a failed profile fetch can't leave the
     // action applied in the world but still "pending" in storage.
     let profile = await this.#getClientProfile();
-    await this.impl.applyPendingAction(action, profile, false);
+    try {
+      await this.impl.applyPendingAction(action, profile, false);
+    } catch (err) {
+      // Green Hat fork: when the gatekeeper reports the action as terminal (a call that failed
+      // after it had been sent is recorded there as failed and not retryable), leaving this record
+      // pending wedges the chat: Approve keeps throwing, Deny is refused as "already failed", and
+      // the composer stays locked on "Approve or reject the pending action above". Close the record
+      // as rejected, say so in the chat, and still surface the error to the caller.
+      if (gatekeeperActionIsTerminal(err)) {
+        action.state = "rejected";
+        action.appliedAt = new Date();
+        action.resolvedBy = profile;
+        this.impl.storage.actions.put(action);
+        if (action.caller.from === "agent") {
+          let detail = err instanceof Error ? err.message : String(err);
+          this.impl.addChatMessages(action.caller.chatId, profile, [{
+            type: "message",
+            message: `"${action.description.title}" could not be applied: ${detail} ` +
+                `Verify on the server, then ask for it to be staged again if it did not land.`,
+          }]);
+        }
+      }
+      throw err;
+    }
 
     // If this was an awaited agent action, resume only after all awaited actions in the turn are
     // approved. If applyPendingAction throws, the action stays pending and the turn stays suspended.
@@ -7993,7 +8025,21 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // can't leave the action rejected with the gatekeeper but still "pending" in storage.
     let profile = await this.#getClientProfile();
 
-    await gatekeeper.rejectAction(action.action);
+    try {
+      await gatekeeper.rejectAction(action.action);
+    } catch (err) {
+      // Green Hat fork: the gatekeeper refuses to reject an action it already recorded as failed
+      // (or rejected). That is a terminal state on its side, so the record here must close too or
+      // the chat stays locked; an action it already applied is recorded as approved instead.
+      if (!gatekeeperActionIsTerminal(err)) throw err;
+      if (/already applied/i.test(err instanceof Error ? err.message : String(err))) {
+        action.state = "approved";
+        action.appliedAt = new Date();
+        action.resolvedBy = profile;
+        this.impl.storage.actions.put(action);
+        return;
+      }
+    }
 
     action.state = "rejected";
     action.appliedAt = new Date();
