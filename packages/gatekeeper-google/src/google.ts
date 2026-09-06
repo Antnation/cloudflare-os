@@ -103,6 +103,11 @@ type Env = Cloudflare.Env & {
   // OAuth app credentials (wrangler secrets / .dev.vars); not in wrangler.jsonc.
   CLIENT_ID?: string;
   CLIENT_SECRET?: string;
+  // "true" makes every Google resource read-only for agents: the Gmail, Docs and Calendar write
+  // methods refuse before anything is queued for approval, applyAction() refuses records queued
+  // before the switch, and Docs edits stop being auto-approvable. Sheets, Drive and BigQuery have
+  // no write methods to begin with. A deployment-wide policy, not a per-user one.
+  READ_ONLY?: string;
 }
 
 // Well-known Gmail system label IDs — derived from GmailSystemLabel so the
@@ -162,6 +167,28 @@ function validateGmailQueryForGrouping(query: string): void {
 
 function getBaseUrl(env: Env) {
   return stripTrailingSlashes(env.BASE_URL || "http://localhost:8787/gatekeeper/google");
+}
+
+function isReadOnly(env: Env): boolean {
+  // Normalized so a stray " True " reads as set rather than silently leaving writes enabled.
+  return (env.READ_ONLY ?? "").trim().toLowerCase() === "true";
+}
+
+const READ_ONLY_MESSAGE =
+    "This deployment's Google integration is read-only: agents can read Gmail, Calendar, Docs, " +
+    "Sheets, Drive and BigQuery but cannot send, edit, create or change anything.";
+
+function requireWritable(env: Env): void {
+  if (isReadOnly(env)) throw new Error(READ_ONLY_MESSAGE);
+}
+
+// Prepended to a resource's type bundle in read-only mode so agents learn the rule from the types
+// instead of from the first refused call.
+function readOnlyTypes(env: Env, types: string): string {
+  if (!isReadOnly(env)) return types;
+  return "// READ-ONLY DEPLOYMENT: methods that send, edit, create or change anything " +
+      "(Gmail send/reply/replyAll/forward/archive/trash/markRead/markUnread, Docs " +
+      "replaceText/appendText, Calendar createEvent/updateEvent) throw. Read freely.\n\n" + types;
 }
 
 function getBasePath(env: Env) {
@@ -1264,6 +1291,8 @@ type GmailSessionContext = {
   labelId: string | undefined;
   labelName: string | undefined;
   resolveLabels: (labelIds: string[]) => Promise<GmailLabel[]>;
+  // Deployment-wide read-only policy (Env.READ_ONLY): submitGmailAction refuses when set.
+  readOnly: boolean;
 };
 
 // ── GmailSessionImpl ────────────────────────────────────────────────
@@ -1409,6 +1438,7 @@ async function submitGmailAction(
     ctx: GmailSessionContext,
     action: GmailAction,
     desc: { title: string; description: string }): Promise<void> {
+  if (ctx.readOnly) throw new Error(READ_ONLY_MESSAGE);
   if (ctx.pendingActions.list().length >= 100) {
     throw new Error("Too many pending Gmail actions. Resolve existing actions before adding more.");
   }
@@ -1855,7 +1885,7 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
   }
 
   async getTypeScriptTypes(): Promise<string> {
-    return TYPES_CODE;
+    return readOnlyTypes(this.env, TYPES_CODE);
   }
 
   async getAutoApprovableActions() {
@@ -1892,6 +1922,7 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
       labelName: this.ctx.props.labelName,
       resolveLabels: async (labelIds: string[]): Promise<GmailLabel[]> =>
         toLabelObjects(labelIds, await getLabelMap()),
+      readOnly: isReadOnly(this.env),
     };
 
     return new GmailSessionImpl(ctx);
@@ -1899,6 +1930,7 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
 
   /** --------------------------------------------------------------------------- */
   async applyAction(actionId: number): Promise<void> {
+    requireWritable(this.env);
     const pendingActions = new PendingActionStore<GmailAction>(this.ctx.storage.kv);
     const action = pendingActions.get(actionId);
     if (!action) throw new Error(`Unknown pending Gmail action: ${actionId}`);
@@ -2205,11 +2237,12 @@ export class GoogleDocGatekeeperImpl
   }
 
   async getTypeScriptTypes(): Promise<string> {
-    return DOCS_TYPES_CODE;
+    return readOnlyTypes(this.env, DOCS_TYPES_CODE);
   }
 
   async getAutoApprovableActions(): Promise<ActionKind[]> {
-    return [EDIT_DOCUMENT_ACTION];
+    // Nothing to auto-approve when nothing can be written.
+    return isReadOnly(this.env) ? [] : [EDIT_DOCUMENT_ACTION];
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>)
@@ -2222,10 +2255,12 @@ export class GoogleDocGatekeeperImpl
         approvalQueue.dup(),
         pendingActions,
         this.ctx.storage,
-        this.#simulationCache);
+        this.#simulationCache,
+        isReadOnly(this.env));
   }
 
   async applyAction(actionId: number): Promise<void> {
+    requireWritable(this.env);
     let pendingActions = new PendingActionStore<GoogleDocAction>(this.ctx.storage.kv);
     let pending = pendingActions.list();
     let pendingIndex = pending.findIndex(({id}) => id === actionId);
@@ -2345,6 +2380,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
   #pendingActions: PendingActionStore<GoogleDocAction>;
   #storage: DurableObjectStorage;
   #simulationCache: GoogleDocSimulationCacheHolder;
+  #readOnly: boolean;
 
   constructor(
     docsApi: GoogleDocsApi,
@@ -2353,6 +2389,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
     pendingActions: PendingActionStore<GoogleDocAction>,
     storage: DurableObjectStorage,
     simulationCache: GoogleDocSimulationCacheHolder,
+    readOnly: boolean = false,
   ) {
     super();
     this.#docsApi = docsApi;
@@ -2361,6 +2398,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
     this.#pendingActions = pendingActions;
     this.#storage = storage;
     this.#simulationCache = simulationCache;
+    this.#readOnly = readOnly;
   }
 
   async #getSnapshot(forceRefresh?: boolean): Promise<DocSnapshot> {
@@ -2452,6 +2490,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
   }
 
   async replaceText(oldMarkdown: string, newMarkdown: string): Promise<void> {
+    if (this.#readOnly) throw new Error(READ_ONLY_MESSAGE);
     if (oldMarkdown === newMarkdown) {
       return;
     }
@@ -2493,6 +2532,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
   }
 
   async appendText(markdown: string): Promise<void> {
+    if (this.#readOnly) throw new Error(READ_ONLY_MESSAGE);
     let {snapshot} = await this.#getSimulatedContent();
 
     let action: GoogleDocAction = {
@@ -2879,7 +2919,7 @@ export class GoogleCalendarGatekeeperImpl
   }
 
   async getTypeScriptTypes(): Promise<string> {
-    return CALENDAR_TYPES_CODE;
+    return readOnlyTypes(this.env, CALENDAR_TYPES_CODE);
   }
 
   async getAutoApprovableActions(): Promise<ActionKind[]> {
@@ -2897,10 +2937,12 @@ export class GoogleCalendarGatekeeperImpl
       approvalQueue.dup(),
       pendingActions,
       calendarIds => this.#prepareAvailabilityCalendarObservation(calendarIds),
+      isReadOnly(this.env),
     );
   }
 
   async applyAction(actionId: number): Promise<void> {
+    requireWritable(this.env);
     let pendingActions = new PendingActionStore<GoogleCalendarAction>(this.ctx.storage.kv);
     let action = pendingActions.get(actionId);
     if (!action) {
@@ -3085,6 +3127,7 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
   #approvalQueue: RpcStub<ApprovalQueue>;
   #pendingActions: PendingActionStore<GoogleCalendarAction>;
   #observeAvailabilityCalendars: (calendarIds: string[]) => Promise<ObserverCheck<string>>;
+  #readOnly: boolean;
 
   constructor(
     api: GoogleCalendarApi,
@@ -3093,6 +3136,7 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
     approvalQueue: RpcStub<ApprovalQueue>,
     pendingActions: PendingActionStore<GoogleCalendarAction>,
     observeAvailabilityCalendars: (calendarIds: string[]) => Promise<ObserverCheck<string>>,
+    readOnly: boolean = false,
   ) {
     super();
     this.#api = api;
@@ -3101,6 +3145,7 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
     this.#approvalQueue = approvalQueue;
     this.#pendingActions = pendingActions;
     this.#observeAvailabilityCalendars = observeAvailabilityCalendars;
+    this.#readOnly = readOnly;
   }
 
   async getCapabilities(): Promise<GoogleCalendarCapabilities> {
@@ -3180,6 +3225,7 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
     event: CalendarEventDraft,
     opts?: { sendUpdates?: CalendarSendUpdates },
   ): Promise<void> {
+    if (this.#readOnly) throw new Error(READ_ONLY_MESSAGE);
     if (!event.title.trim()) throw new Error("Event title is required.");
     validateEventTimes(event.start, event.end);
     let action: GoogleCalendarAction = {
@@ -3212,6 +3258,7 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
     patch: CalendarEventPatch,
     opts?: { sendUpdates?: CalendarSendUpdates },
   ): Promise<void> {
+    if (this.#readOnly) throw new Error(READ_ONLY_MESSAGE);
     if (!eventId.trim()) throw new Error("eventId is required.");
     if (Object.keys(patch).length === 0) throw new Error("patch must change at least one field.");
     if (patch.start !== undefined || patch.end !== undefined) {

@@ -15,7 +15,10 @@ declare global {
 
       // AI Gateway mode: when CF_AI_GATEWAY is set, supported providers are routed through
       // Cloudflare AI Gateway with server-managed keys. Users don't need their own keys.
-      CF_AI_GATEWAY?: string;            // Gateway name (enables gateway mode)
+      CF_AI_GATEWAY?: string;            // Gateway name (enables gateway mode). With DIRECT_MODELS
+                                         // set and this unset, the Workshop runs in direct-only
+                                         // mode: no gateway, no Workers AI models, and the first
+                                         // direct model is also the quick model.
       CF_AI_GATEWAY_PROVIDERS?: string;   // Comma-separated list: "anthropic,openai,google,cloudflare"
       // JSON array of deployment-managed models reached directly, not through the gateway; see
       // DirectModel in ai-gateway.ts. Each entry names the Worker secret holding its API key.

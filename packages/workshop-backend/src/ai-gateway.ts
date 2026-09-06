@@ -89,10 +89,13 @@ export function parseDirectModels(raw: string | undefined): DirectModel[] {
   });
 }
 
-// The model used for quick tasks like title generation when AI Gateway mode is active.
+// The model used for quick tasks like title generation when a platform AI Gateway is configured.
 //
 // This 70B model is quite fast and cheap and produces pretty good titles. The cost is insignificant
 // compared to the actual coding model so there's not much reason to use a smaller model.
+//
+// A deployment with DIRECT_MODELS and no gateway (see {@link AiGatewayConfig}) has no Workers AI
+// route to put this on, so its quick model is the first direct model instead.
 const QUICK_MODEL_ID = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
 /**
@@ -110,15 +113,27 @@ const QUICK_MODEL_ID = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
  */
 const HTTPS_ONLY_PROVIDERS = new Set(["google"]);
 
+/**
+ * The deployment-managed model configuration. Present in two shapes:
+ *
+ * - Gateway mode (CF_AI_GATEWAY set): the built-in catalog of the enabled providers rides the
+ *   platform AI Gateway, plus any DIRECT_MODELS the Workshop calls itself.
+ * - Direct-only mode (DIRECT_MODELS set, no CF_AI_GATEWAY): only the direct models exist. There is
+ *   no gateway, no Workers AI transport and no provider a user could add a model for, and the
+ *   quick model (chat titles) is the first direct model. {@link gateway} is unset in this mode;
+ *   everything that routes through the gateway must check it first.
+ */
 export class AiGatewayConfig {
-  readonly gateway: string;
+  /** The platform AI Gateway's name, or unset in direct-only mode. */
+  readonly gateway?: string;
   /**
    * The gateway name for Workers-AI-binding calls (webFetch's toMarkdown): binding calls only
    * reach gateways in the Worker's own account, so this is the platform gateway whenever the
    * binding transport is active, and unset when it isn't (see {@link binding}).
    */
   readonly sameAccountGateway?: string;
-  readonly accountId: string;
+  /** Account owning the gateway; unset in direct-only mode. */
+  readonly accountId?: string;
   readonly apiToken?: string;
   /**
    * Workers AI binding, used as the gateway transport whenever present unless
@@ -152,7 +167,20 @@ export class AiGatewayConfig {
   constructor(env: Cloudflare.Env) {
     this.#env = env;
     this.directModels = parseDirectModels(env.DIRECT_MODELS);
-    this.gateway = env.CF_AI_GATEWAY!;
+    if (!env.CF_AI_GATEWAY) {
+      // Direct-only mode. The transport, token and provider checks below are all about the
+      // gateway, so none of them apply; what must hold instead is that there is a model at all,
+      // since a deployment with neither would be one with an empty picker and no quick model.
+      if (this.directModels.length === 0) {
+        throw new Error(
+            "AiGatewayConfig needs CF_AI_GATEWAY (gateway mode) or a non-empty DIRECT_MODELS " +
+            "(direct-only mode).");
+      }
+      this.providers = new Set();
+      this.catalog = "none";
+      return;
+    }
+    this.gateway = env.CF_AI_GATEWAY;
     if (!env.CF_AI_GATEWAY_ACCOUNT_ID) {
       throw new Error("CF_AI_GATEWAY_ACCOUNT_ID is required when CF_AI_GATEWAY is set.");
     }
@@ -272,6 +300,12 @@ export class AiGatewayConfig {
    * Get the AiModelConfig for the quick model (used for title generation).
    */
   getQuickModelConfig(): AiModelConfig | undefined {
+    if (!this.gateway) {
+      // Direct-only mode: the first direct model is what a new chat starts on, so it is also
+      // what names the chat. resolveModel() throws if its secret is missing, which is the right
+      // outcome: the same secret is what every chat turn needs.
+      return this.resolveModel(this.directModels[0].id)?.config;
+    }
     // Always use Workers AI here.
     return {
       provider: "cloudflare",
@@ -282,11 +316,12 @@ export class AiGatewayConfig {
 }
 
 /**
- * Parse AI Gateway configuration from environment variables. Returns null if AI Gateway
- * mode is not enabled (i.e. CF_AI_GATEWAY is not set).
+ * Parse the deployment-managed model configuration from environment variables. Returns null when
+ * the deployment manages no models at all (neither CF_AI_GATEWAY nor DIRECT_MODELS is set), in
+ * which case each user supplies their own models and keys.
  */
 export function getAiGatewayConfig(env: Cloudflare.Env): AiGatewayConfig | null {
-  if (!env.CF_AI_GATEWAY) return null;
+  if (!env.CF_AI_GATEWAY && !env.DIRECT_MODELS?.trim()) return null;
   return new AiGatewayConfig(env);
 }
 

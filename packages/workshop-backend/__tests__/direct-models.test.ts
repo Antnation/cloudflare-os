@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AiGatewayConfig, parseDirectModels } from "../src/ai-gateway.js";
+import { AiGatewayConfig, getAiGatewayConfig, parseDirectModels } from "../src/ai-gateway.js";
 
 const ZAI = {
   id: "glm-5.3",
@@ -127,5 +127,61 @@ describe("AiGatewayConfig catalog", () => {
       .toEqual([]);
     expect(() => new AiGatewayConfig(gatewayEnv({ CF_AI_GATEWAY_CATALOG: "some" })))
       .toThrow(/CF_AI_GATEWAY_CATALOG/);
+  });
+});
+
+describe("AiGatewayConfig direct-only mode (DIRECT_MODELS without CF_AI_GATEWAY)", () => {
+  const bearer = { ...ZAI, auth: "bearer", secret: "GATEWAY_LLM_TOKEN" };
+  function directOnlyEnv(extra: Record<string, unknown> = {}): Cloudflare.Env {
+    return {
+      DIRECT_MODELS: JSON.stringify([bearer]),
+      GATEWAY_LLM_TOKEN: "ggw_token",
+      ...extra,
+    } as unknown as Cloudflare.Env;
+  }
+
+  it("is a deployment-managed configuration with no gateway behind it", () => {
+    const config = getAiGatewayConfig(directOnlyEnv());
+    expect(config).not.toBeNull();
+    expect(config!.gateway).toBeUndefined();
+    expect(config!.accountId).toBeUndefined();
+    expect(config!.sameAccountGateway).toBeUndefined();
+    expect(config!.binding).toBeUndefined();
+    // No provider is enabled, so nothing but the direct models is offered and addModel() refuses
+    // every provider, the same as a gateway deployment with an empty provider list would.
+    expect(config!.providers.size).toBe(0);
+    expect(config!.getModelList())
+      .toEqual([{ type: "agent", id: "glm-5.3", name: "GLM 5.3 (Z.AI)" }]);
+    expect(config!.resolveModel("@cf/moonshotai/kimi-k2.7-code")).toBeUndefined();
+  });
+
+  it("uses the first direct model as the quick model, credentials included", () => {
+    const config = new AiGatewayConfig(directOnlyEnv());
+    expect(config.getQuickModelConfig()).toEqual({
+      provider: "anthropic",
+      model: "glm-5.3",
+      apiToken: "ggw_token",
+      apiUrl: "https://api.z.ai/api/anthropic",
+      authScheme: "bearer",
+      contextWindow: 200000,
+      outputLimit: 128000,
+    });
+    expect(() => new AiGatewayConfig(directOnlyEnv({ GATEWAY_LLM_TOKEN: undefined }))
+      .getQuickModelConfig()).toThrow(/GATEWAY_LLM_TOKEN/);
+  });
+
+  it("is absent when the deployment manages no models, and refuses an empty list", () => {
+    expect(getAiGatewayConfig({} as Cloudflare.Env)).toBeNull();
+    expect(getAiGatewayConfig({ DIRECT_MODELS: "  " } as Cloudflare.Env)).toBeNull();
+    expect(() => new AiGatewayConfig({ DIRECT_MODELS: "[]" } as Cloudflare.Env))
+      .toThrow(/DIRECT_MODELS/);
+  });
+
+  it("keeps the Workers AI quick model whenever a gateway is configured", () => {
+    const config = new AiGatewayConfig(gatewayEnv({
+      DIRECT_MODELS: JSON.stringify([bearer]), GATEWAY_LLM_TOKEN: "ggw_token",
+    }));
+    expect(config.gateway).toBe("default");
+    expect(config.getQuickModelConfig()?.provider).toBe("cloudflare");
   });
 });

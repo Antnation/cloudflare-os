@@ -372,7 +372,7 @@ export function getModel(env: Cloudflare.Env, config: AiModelConfig,
   // Workshop must call itself. User-added models never carry one in gateway mode (the client
   // strips it), so this cannot let a user route around the gateway.
   let gwConfig = getAiGatewayConfig(env);
-  if (gwConfig && !config.apiUrl) {
+  if (gwConfig?.gateway && !config.apiUrl) {
     return getModelViaGateway(gwConfig, config, initiator, options);
   }
 
@@ -450,6 +450,11 @@ function getModelViaGateway(
   options: ModelRoutingOptions,
 ): ModelHandle {
   const metadata = buildMetadata(initiator, options.metadata);
+  // getModel() only comes here with a gateway; a direct-only config (no gateway) never routes a
+  // model this way because every model it knows carries an apiUrl.
+  if (!gwConfig.gateway || !gwConfig.accountId) {
+    throw new Error("getModelViaGateway needs a platform AI Gateway, but the deployment has none.");
+  }
   const binding = gwConfig.bindingFor(config.provider);
   // No binding means either the provider can't ride one or the deployment has none; the second
   // case already required a token in the constructor, so this only fires for the first
@@ -466,14 +471,15 @@ function getModelViaGateway(
     Authorization: null,
     "x-api-key": null,
   };
+  const accountId = gwConfig.accountId;
   const gatewayBase =
-      `https://gateway.ai.cloudflare.com/v1/${gwConfig.accountId}`;
+      `https://gateway.ai.cloudflare.com/v1/${accountId}`;
   // Cost-log reads are same-account, so the binding arm applies whenever the binding transport
   // is active (gwConfig.binding is unset when CF_AI_GATEWAY_USE_BINDING=false opts out) --
   // even for Google inference, which itself rides HTTPS (see AiGatewayConfig.bindingFor).
   const logRoute = (gateway: string): AiGatewayLogRoute => gwConfig.binding
       ? { gateway }
-      : { gateway, accountId: gwConfig.accountId, apiToken: gwConfig.apiToken! };
+      : { gateway, accountId, apiToken: gwConfig.apiToken! };
 
   // Every provider -- Workers AI included -- rides the same gateway, with the same log route
   // and attribution metadata. Binding-routed providers address it on the binding's host, which
