@@ -13,7 +13,7 @@ import { deploymentOutputForBlueprint, listFormatOffers, readAdminConfig } from 
 
 // Re-export the optional-feature Durable Objects + entrypoints so they can be bound in wrangler.
 export { PendingLogin, LoginConnectCallbackImpl };
-import { GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
+import { AccountDetails, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { LanguageModelGatekeeper } from "./ai-models";
 import { getAiGatewayConfig } from "./ai-gateway.js";
 import { AdminSettings, AdminApiImpl } from "./admin-settings.js";
@@ -341,6 +341,10 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
   reconnectAccount(accountId: number): Promise<{url: string}> {
     return this.#user.reconnectAccount(accountId);
+  }
+
+  getConnectedAccountDetails(accountId: number): Promise<AccountDetails | null> {
+    return this.#user.getConnectedAccountDetails(accountId);
   }
 
   startResourceConfigurator(

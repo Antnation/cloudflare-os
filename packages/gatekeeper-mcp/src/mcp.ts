@@ -54,7 +54,8 @@ import {
   type ToolScope,
 } from "@gadgets/mcp-shared/scope";
 import { validateCustomEndpoint } from "@gadgets/mcp-shared/endpoint";
-import { fetchOptions } from "@gadgets/mcp-shared/fetch";
+import { fetchOptions, sdkFetch } from "@gadgets/mcp-shared/fetch";
+import type { AccountDetails } from "@gadgets/workshop-shared/gatekeeper";
 import {
   htmlResponse,
   INVALID_LINK_HTML,
@@ -175,13 +176,14 @@ async function continueConnect(
 @validateRpc()
 export class GatekeeperVendor extends WorkerEntrypoint<Env> implements GatekeeperVendorIface {
   async describe(): Promise<VendorDescription> {
+    // Green Hat fork: a deployment may present this vendor under its own name (GreenGateway).
     return {
-      displayName: "MCP Server",
+      displayName: this.env.MCP_DISPLAY_NAME?.trim() || "MCP Server",
       url: "https://modelcontextprotocol.io",
       logo: MCP_AVATAR,
       color: "#1a1d21",
-      tagline: "Connect any Model Context Protocol server",
-      description:
+      tagline: this.env.MCP_TAGLINE?.trim() || "Connect any Model Context Protocol server",
+      description: this.env.MCP_DESCRIPTION?.trim() ||
         "Connect a Model Context Protocol server and use its tools from a Gadget. Reads happen " +
         "straight away. Anything that writes waits for your approval.",
     };
@@ -289,6 +291,59 @@ export class GatekeeperUserImpl
       throw new Error(`${server.endpoint} is not an ambient endpoint of this deployment.`);
     }
     return (await this.getGatekeeperClassFor(server.endpoint)).class;
+  }
+
+  /**
+   * Green Hat fork. What sits behind an ambient endpoint, for the Integrations page: one line per
+   * enabled system that contributes tools, read live from the gateway's connections listing with
+   * this account's own bearer. Best effort: null for non-ambient accounts and on any failure.
+   */
+  async getAccountDetails(): Promise<AccountDetails | null> {
+    const server = await this.#account().getServer();
+    if (!isAmbientEndpoint(this.env, server.endpoint)) return null;
+    try {
+      const lines = await this.#connectionsBehind(server.endpoint);
+      return lines ? { lines } : null;
+    } catch (err) {
+      logger.warn("could not list the systems behind the gateway", {
+        event: "account.details.failed", error: err,
+      });
+      return null;
+    }
+  }
+
+  async #connectionsBehind(endpoint: string): Promise<string[] | null> {
+    const { authorization } = await this.#account().getConnection(endpoint);
+    if (!authorization) return null;
+    const path = this.env.MCP_CONNECTIONS_PATH?.trim() || "/v1/admin/connections";
+    const url = new URL(path, new URL(endpoint).origin);
+    url.searchParams.set("limit", "100");
+    const response = await sdkFetch(fetchOptions(this.env))(url.toString(), {
+      headers: { Accept: "application/json", Authorization: `Bearer ${authorization}` },
+    });
+    if (!response.ok) return null;
+    const page = await response.json() as {
+      connections?: {
+        display_name?: unknown; enabled?: unknown; capability_count?: unknown;
+        status?: { state?: unknown };
+      }[];
+    };
+    if (!Array.isArray(page.connections)) return null;
+    const lines: string[] = [];
+    for (const row of page.connections) {
+      if (row.enabled === false) continue;
+      const count = typeof row.capability_count === "number" ? row.capability_count : 0;
+      // Connections that publish no tools (e.g. a model lane the gateway proxies) are not
+      // something the agent can use, so they stay off the card.
+      if (count === 0) continue;
+      const name = typeof row.display_name === "string"
+        ? row.display_name.replace(/\s+/g, " ").trim().slice(0, 80) : "";
+      if (!name) continue;
+      const state = typeof row.status?.state === "string" ? row.status.state : "unknown";
+      lines.push(`${name} · ${count} tool${count === 1 ? "" : "s"} · ${state}`);
+      if (lines.length >= 20) break;
+    }
+    return lines;
   }
 
   async getGatekeeperClassFor(url: string): Promise<{

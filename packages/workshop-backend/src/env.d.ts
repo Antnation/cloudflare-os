@@ -20,6 +20,9 @@ declare global {
       // JSON array of deployment-managed models reached directly, not through the gateway; see
       // DirectModel in ai-gateway.ts. Each entry names the Worker secret holding its API key.
       DIRECT_MODELS?: string;
+      // "all" (default) or "none": whether the SUGGESTED_MODELS catalog of the enabled providers
+      // is offered in the picker alongside DIRECT_MODELS. See AiGatewayConfig.catalog.
+      CF_AI_GATEWAY_CATALOG?: string;
       CF_AI_GATEWAY_ACCOUNT_ID?: string;  // Gateway owner account ID (required with CF_AI_GATEWAY)
       CF_AI_GATEWAY_API_TOKEN?: string;   // Run + Read token; optional when the binding transport
                                           // applies (still required for google)

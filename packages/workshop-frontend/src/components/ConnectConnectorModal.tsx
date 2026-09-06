@@ -165,7 +165,7 @@ export default function ConnectConnectorModal({
           ? accountDescription?.uniqueName
             ? `${accountDisplayName} / ${accountDescription.uniqueName}`
             : accountDisplayName
-          : 'Credentials expired; reconnect from the Gatekeepers page'}
+          : 'Credentials expired; reconnect from the Integrations page'}
       </span>
     </div>
   ) : (
@@ -251,7 +251,7 @@ export default function ConnectConnectorModal({
                   ? isManage
                     ? 'Resources'
                     : 'Resources to enable'
-                  : 'What this gatekeeper can do'}
+                  : 'What this integration can do'}
               </h3>
               <ul className="space-y-2">
                 {supportedResources.map((resource) => {

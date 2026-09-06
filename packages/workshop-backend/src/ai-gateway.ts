@@ -137,6 +137,16 @@ export class AiGatewayConfig {
   readonly providers: Set<string>;
   /** Deployment-managed models the Workshop calls directly; see {@link DirectModel}. */
   readonly directModels: DirectModel[];
+  /**
+   * Which built-in models getModelList() offers besides the direct ones. "all" (default) lists
+   * every SUGGESTED_MODELS entry of an enabled provider; "none" lists only the direct models, so a
+   * deployment can put one deployment-managed model in front of users while the gateway keeps
+   * carrying everything that never came from the picker: the quick model (title generation),
+   * webFetch's toMarkdown, cost-log reads. Hidden is not removed: resolveModel() still resolves a
+   * catalog id, so a chat pinned to one before the switch keeps working. From
+   * CF_AI_GATEWAY_CATALOG.
+   */
+  readonly catalog: "all" | "none";
   readonly #env: Cloudflare.Env;
 
   constructor(env: Cloudflare.Env) {
@@ -176,6 +186,12 @@ export class AiGatewayConfig {
           `${names} provider${httpsOnly.length > 1 ? "s" : ""} requires ` +
           "CF_AI_GATEWAY_API_TOKEN.");
     }
+    const catalog = env.CF_AI_GATEWAY_CATALOG?.trim().toLowerCase() || "all";
+    if (catalog !== "all" && catalog !== "none") {
+      throw new Error(
+          `CF_AI_GATEWAY_CATALOG must be "all" or "none", not "${env.CF_AI_GATEWAY_CATALOG}".`);
+    }
+    this.catalog = catalog;
   }
 
   /**
@@ -196,10 +212,12 @@ export class AiGatewayConfig {
     for (let model of this.directModels) {
       result.push({ type: "agent", id: model.id, name: model.name });
     }
-    for (let [provider, models] of Object.entries(SUGGESTED_MODELS)) {
-      if (this.providers.has(provider)) {
-        for (let [id, model] of Object.entries(models)) {
-          result.push({ type: "agent", id, name: model.name });
+    if (this.catalog === "all") {
+      for (let [provider, models] of Object.entries(SUGGESTED_MODELS)) {
+        if (this.providers.has(provider)) {
+          for (let [id, model] of Object.entries(models)) {
+            result.push({ type: "agent", id, name: model.name });
+          }
         }
       }
     }

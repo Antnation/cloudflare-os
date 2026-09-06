@@ -442,7 +442,7 @@ type ModalTarget =
   | null
 
 function ConnectorsPage() {
-  useDocumentTitle('Gatekeepers')
+  useDocumentTitle('Integrations')
   const siteName = useSiteName()
 
   const { authenticatedApi } = useAuthenticatedApi()
@@ -462,6 +462,8 @@ function ConnectorsPage() {
   // only difference is that confirming adds the account directly (no OAuth redirect).
   const [addable, setAddable] = useState<GatekeeperVendorInfo[]>([])
   const [loadError, setLoadError] = useState(false)
+  // Green Hat fork: live detail lines per singleton account (what sits behind GreenGateway).
+  const [accountDetails, setAccountDetails] = useState<Map<number, string[]>>(() => new Map())
 
   const [modalTarget, setModalTarget] = useState<ModalTarget>(null)
   const [connecting, setConnecting] = useState(false)
@@ -549,6 +551,31 @@ function ConnectorsPage() {
       subscription[Symbol.dispose]()
     }
   }, [authenticatedApi])
+
+  // Green Hat fork: for accounts that declare an agent singleton (the ambient GreenGateway
+  // account), ask the gatekeeper what is connected behind it and show that on the card.
+  useEffect(() => {
+    let cancelled = false
+    for (const account of accounts) {
+      if (!account.accountDescription.singleton || !account.credentialsValid) continue
+      if (accountDetails.has(account.id)) continue
+      authenticatedApi.getConnectedAccountDetails(account.id)
+        .then((result) => {
+          if (cancelled) return
+          setAccountDetails((prev) => {
+            const next = new Map(prev)
+            next.set(account.id, result?.lines ?? [])
+            return next
+          })
+        })
+        .catch((err) => {
+          logRpcFailure('Failed to load account details:', err)
+        })
+    }
+    return () => {
+      cancelled = true
+    }
+  }, [accounts, accountDetails, authenticatedApi])
 
   const handleOpenConnect = (vendorId: string) => {
     setModalTarget({ kind: 'connect', vendorId })
@@ -720,7 +747,7 @@ function ConnectorsPage() {
         <header className="mb-8 grid gap-8 lg:grid-cols-[minmax(0,540px)_444px] lg:items-center lg:justify-between">
           <div>
             <h1 className="m-0 text-3xl font-semibold leading-tight tracking-tight text-kumo-default sm:text-[34px]">
-              Gatekeepers
+              Integrations
             </h1>
             <p className="mt-2 text-[14px] leading-[20px] font-normal tracking-[-0.25px] text-kumo-subtle">
               Add the apps and accounts your workspaces can use. Connect once, then wire
@@ -740,7 +767,7 @@ function ConnectorsPage() {
               type="text"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search gatekeepers…"
+              placeholder="Search integrations…"
               className="h-10 w-full rounded-lg border border-kumo-line bg-kumo-base pl-9 pr-4 text-[14px] leading-5 tracking-[-0.25px] text-kumo-default placeholder:text-kumo-inactive transition-[border-color,box-shadow] focus:border-kumo-ring focus:outline-none focus:ring-[3px] focus:ring-kumo-ring/15"
             />
           </div>
@@ -750,7 +777,7 @@ function ConnectorsPage() {
         {loadError && (
           <div className="rounded-2xl border border-kumo-line bg-kumo-base px-4 py-6 text-center">
             <p className="m-0 text-[13px] leading-[18px] font-medium tracking-[-0.25px] text-kumo-danger">
-              Something went wrong loading your gatekeepers.
+              Something went wrong loading your integrations.
             </p>
             <p className="mt-1 text-[12px] leading-4 font-normal tracking-[-0.2px] text-kumo-subtle">
               Check your connection and try refreshing the page.
@@ -760,7 +787,7 @@ function ConnectorsPage() {
 
         {initialLoading && (
           <div className="rounded-2xl border border-kumo-line bg-kumo-base px-4 py-8 text-center text-[13px] leading-[18px] font-normal tracking-[-0.25px] text-kumo-subtle">
-            Loading gatekeepers...
+            Loading integrations...
           </div>
         )}
 
@@ -773,7 +800,10 @@ function ConnectorsPage() {
                   account.accountDescription.displayName ??
                   account.accountDescription.uniqueName ??
                   'Connected'
-                const tagline = account.vendorDescription.tagline
+                const details = accountDetails.get(account.id)
+                const tagline = details?.length
+                  ? `Behind ${displayName}: ${details.join(' · ')}`
+                  : account.vendorDescription.tagline
                 return (
                   <ConnectorCard
                     key={account.id}
@@ -834,13 +864,13 @@ function ConnectorsPage() {
             <EmptyState
               title={
                 search
-                  ? 'No gatekeepers match'
-                  : 'No gatekeepers yet'
+                  ? 'No integrations match'
+                  : 'No integrations yet'
               }
               description={
                 search
                   ? "We couldn't find anything matching your search."
-                  : 'Gatekeepers will appear here as they become available in your workspace.'
+                  : 'Integrations will appear here as they become available in your workspace.'
               }
               icon={Plugs}
             />

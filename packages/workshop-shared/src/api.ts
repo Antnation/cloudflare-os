@@ -24,7 +24,7 @@
 // Gadget a stub pointing to the Gadget's server-side Durable Object interface.
 
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
-import { AccountDescription, ActionKind, ActionDescription, AvatarImage, GatekeeperUiFrame, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorDescription, HookDescription } from "./gatekeeper.js";
+import { AccountDescription, AccountDetails, ActionKind, ActionDescription, AvatarImage, GatekeeperUiFrame, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorDescription, HookDescription } from "./gatekeeper.js";
 import type { UiFeatureFlags } from "./feature-flags.js";
 
 export const SERVICE_SALT = new Uint8Array([
@@ -674,6 +674,13 @@ export interface AuthenticatedApi extends RpcTarget {
    * is updated and subscribers are notified with credentialsValid: true.
    */
   reconnectAccount(accountId: number): Promise<{url: string}>;
+
+  /**
+   * Green Hat fork. Live, best-effort status lines for one connected account that declares an
+   * agent singleton (e.g. the systems behind the ambient GreenGateway account). Null when the
+   * account has none or the gatekeeper cannot answer now.
+   */
+  getConnectedAccountDetails(accountId: number): Promise<AccountDetails | null>;
 
   // --- Gatekeeper management apps ---
 

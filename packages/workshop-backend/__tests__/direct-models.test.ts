@@ -105,3 +105,27 @@ describe("AiGatewayConfig direct models", () => {
     expect(() => config.resolveModel("glm-5.3")).toThrow(/ZAI_API_KEY/);
   });
 });
+
+describe("AiGatewayConfig catalog", () => {
+  it("offers only the direct models when CF_AI_GATEWAY_CATALOG=none", () => {
+    const config = new AiGatewayConfig(gatewayEnv({
+      DIRECT_MODELS: JSON.stringify([ZAI]), ZAI_API_KEY: "k", CF_AI_GATEWAY_CATALOG: "none",
+    }));
+    expect(config.getModelList())
+      .toEqual([{ type: "agent", id: "glm-5.3", name: "GLM 5.3 (Z.AI)" }]);
+    // Hidden, not removed: a chat pinned to a catalog model before the switch keeps resolving.
+    expect(config.resolveModel("@cf/moonshotai/kimi-k2.7-code")?.config.provider)
+      .toBe("cloudflare");
+    // The quick model never came from the catalog, so it is untouched.
+    expect(config.getQuickModelConfig()?.provider).toBe("cloudflare");
+  });
+
+  it("defaults to the whole catalog, normalizes the value, and rejects anything else", () => {
+    expect(new AiGatewayConfig(gatewayEnv()).catalog).toBe("all");
+    expect(new AiGatewayConfig(gatewayEnv()).getModelList().length).toBeGreaterThan(0);
+    expect(new AiGatewayConfig(gatewayEnv({ CF_AI_GATEWAY_CATALOG: " None " })).getModelList())
+      .toEqual([]);
+    expect(() => new AiGatewayConfig(gatewayEnv({ CF_AI_GATEWAY_CATALOG: "some" })))
+      .toThrow(/CF_AI_GATEWAY_CATALOG/);
+  });
+});

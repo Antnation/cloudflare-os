@@ -181,6 +181,15 @@ export type AccountDescription = {
   providesUi?: { title: string; icon?: AvatarImage };
 }
 
+/**
+ * Live, best-effort status lines for one connected account that declares an agent singleton: for
+ * example, the systems published behind an ambient gateway and how many tools each contributes.
+ * Green Hat fork; see GatekeeperUser.getAccountDetails.
+ */
+export interface AccountDetails {
+  lines: string[];
+}
+
 /** Describes metadata about a specific instance of a resource. Returned by Gatekeeper.describe(). */
 export type ResourceDescription = {
   /**
@@ -666,6 +675,14 @@ export interface GatekeeperUser extends WorkerEntrypoint {
    * fresh per open (not baked into the account) so admin-gated features reflect current status.
    */
   startAppUi?(context: AppUiContext): Promise<GatekeeperUiFrame>;
+
+  /**
+   * Green Hat fork. Live, best-effort detail lines for an account whose describe() sets
+   * AccountDescription.singleton (the Workshop gates on that flag, never probes). Null when the
+   * account has nothing to say or cannot reach its source right now; must never throw for a
+   * reachable account.
+   */
+  getAccountDetails?(): Promise<AccountDetails | null>;
 
   // TODO:
   // - Query whether account has scope to access a particular URL.

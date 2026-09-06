@@ -1,6 +1,6 @@
 import { RpcStub } from "capnweb";
 import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError } from '@gadgets/workshop-shared/api';
-import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
+import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, AccountDetails, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
@@ -53,6 +53,8 @@ export type ProvidedAccountInfo = {
 // usable directly, the way the runtime stub actually behaves.
 type AccountCreatorStub = Required<Pick<GatekeeperVendor, "createAccount">>;
 type SingletonAccountStub = Required<Pick<GatekeeperUser, "getSingletonGatekeeperClass" | "startAppUi">>;
+// Green Hat fork: the live detail lines of a singleton account (see getConnectedAccountDetails).
+type DetailedAccountStub = Required<Pick<GatekeeperUser, "getAccountDetails">>;
 
 function areCredentialsValid(record: ConnectedAccountRecord): boolean {
   if (record.credentialsExpired) return false;
@@ -1355,6 +1357,22 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     // SingletonAccountStub view (see its definition for why the cast is needed).
     if (!record?.description.singleton) return null;
     return (record.account as unknown as SingletonAccountStub).getSingletonGatekeeperClass();
+  }
+
+  /**
+   * Green Hat fork. Live, best-effort detail lines for a singleton account (what sits behind the
+   * ambient GreenGateway account). Gated on `description.singleton` like the other optional
+   * methods; null for anything else, for expired credentials, or when the gatekeeper fails.
+   */
+  async getConnectedAccountDetails(accountId: number): Promise<AccountDetails | null> {
+    let record = this.storage.connectedAccounts.get(accountId);
+    if (!record?.description.singleton) return null;
+    if (!areCredentialsValid(record)) return null;
+    try {
+      return await (record.account as unknown as DetailedAccountStub).getAccountDetails();
+    } catch {
+      return null;
+    }
   }
 
   /**
