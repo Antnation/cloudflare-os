@@ -114,9 +114,9 @@ describe("generateSessionTypes", { timeout: 15_000 }, () => {
         "action"),
     ]);
     const name = sessionTypeName("acme-crm", "https://acme.example/mcp");
-    expect(output).toContain(`callTool(name: "search", args: ${name}_SearchArgs)`);
+    expect(output).toContain(`callTool(name: "search", args: ${name}_SearchArgs, options?: McpCallOptions)`);
     expect(output).toContain(
-      `callTool(name: "create_contact", args: ${name}_CreateContactArgs)`);
+      `callTool(name: "create_contact", args: ${name}_CreateContactArgs, options?: McpCallOptions)`);
     expect(output).toContain(`export interface ${name} {`);
   });
 
@@ -167,7 +167,7 @@ session.listTools(ambiguousOptions);
 
   it("takes no args parameter when a tool declares no properties", () => {
     const output = generate([tool({ name: "ping" })]);
-    expect(output).toContain('callTool(name: "ping", args?: Record<string, never>)');
+    expect(output).toContain('callTool(name: "ping", args?: Record<string, never>, options?: McpCallOptions)');
   });
 
   it("maps JSON Schema constructs onto TypeScript", () => {
@@ -431,17 +431,17 @@ session.listTools(ambiguousOptions);
       name: "passthrough",
       inputSchema: { type: "object", additionalProperties: true },
     })]);
-    expect(output).toContain("passthrough(args?: Record<string, unknown>)");
+    expect(output).toContain("passthrough(args?: Record<string, unknown>, options?: McpCallOptions)");
     expect(output).toContain(
-      'callTool(name: "passthrough", args?: Record<string, unknown>)');
+      'callTool(name: "passthrough", args?: Record<string, unknown>, options?: McpCallOptions)');
     // No interface is generated for it: there are no members to name.
     expect(output).not.toContain("McpAcmeCrmSession_PassthroughArgs");
   });
 
   it("still omits the parameter for a tool that declares no inputs at all", () => {
     const output = generate([tool({ name: "ping", inputSchema: { type: "object" } })]);
-    expect(output).toContain("ping(): Promise<McpCallResult>;");
-    expect(output).toContain('callTool(name: "ping", args?: Record<string, never>)');
+    expect(output).toContain("ping(args?: Record<string, never>, options?: McpCallOptions): Promise<McpCallResult>;");
+    expect(output).toContain('callTool(name: "ping", args?: Record<string, never>, options?: McpCallOptions)');
   });
 
   it("always exposes discovery, generic calls, and action results", () => {
@@ -457,7 +457,7 @@ session.listTools(ambiguousOptions);
 
   it("keeps discovery stable when an upstream tool collides with its method name", () => {
     const output = generate([tool({ name: "search_tools" })]);
-    expect(output).toContain("searchTools(): Promise<McpCallResult>;");
+    expect(output).toContain("searchTools(args?: Record<string, never>, options?: McpCallOptions): Promise<McpCallResult>;");
     expect(output).toContain("listTools(options: { search: string; name?: never })");
     expect(output).toContain('callTool(name: "search_tools"');
   });
@@ -499,7 +499,7 @@ it("gives colliding tool names distinct argument interfaces", () => {
   expect(declared.length).toBe(2);
 
   // Every overload has to reference a name that was actually declared, or the file will not compile.
-  for (const name of declared) expect(output).toContain(`args: ${name})`);
+  for (const name of declared) expect(output).toContain(`args: ${name}, options?: McpCallOptions)`);
 });
 
 it("numbers colliding interfaces by wire name, not by catalog order", () => {
@@ -512,7 +512,7 @@ it("numbers colliding interfaces by wire name, not by catalog order", () => {
   const forward = generate([one, two]);
   const reversed = generate([two, one]);
   const names = (output: string) =>
-    [...output.matchAll(/callTool\(name: "(\S+)", args: (\S+Args)\)/g)]
+    [...output.matchAll(/callTool\(name: "(\S+)", args: (\S+Args), options\?: McpCallOptions\)/g)]
       .map(match => `${match[1]}=${match[2]}`)
       .toSorted();
   expect(names(forward)).toEqual(names(reversed));

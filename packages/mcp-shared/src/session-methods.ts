@@ -61,7 +61,9 @@ export function toolMethodNames(tools: ClassifiedTool[]): Map<string, string> {
 }
 
 // A class whose instances have a `callTool` method, which is all the generated delegates need.
-type CallsTools = { callTool(name: string, args?: Record<string, unknown>): unknown };
+type CallsTools = {
+  callTool(name: string, args?: Record<string, unknown>, options?: { intent?: string }): unknown;
+};
 
 // Constructor shape of a class that can be extended here. `any[]` because TypeScript requires
 // exactly this of a mixin base (TS2545); the constructor arguments are never touched.
@@ -77,8 +79,10 @@ export function installToolMethods<T extends SessionBase>(Base: T, tools: Classi
 
   for (const [method, wireName] of toolMethodNames(tools)) {
     Object.defineProperty(WithTools.prototype, method, {
-      value: function(this: CallsTools, args?: Record<string, unknown>) {
-        return this.callTool(wireName, args);
+      value: function(
+        this: CallsTools, args?: Record<string, unknown>, options?: { intent?: string },
+      ) {
+        return this.callTool(wireName, args, options);
       },
       // Not enumerable, matching how class methods are declared.
       enumerable: false,

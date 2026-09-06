@@ -182,12 +182,23 @@ export class McpSessionBase extends RpcTarget {
       : `This binding does not grant a tool named "${name}".`;
   }
 
-  async callTool(name: string, args?: Record<string, unknown>): Promise<McpCallResult> {
+  async callTool(
+    name: string, args?: Record<string, unknown>, options?: { intent?: string },
+  ): Promise<McpCallResult> {
     requireToolName("callTool", name);
     const toolArgs = args ?? {};
     if (typeof toolArgs !== "object" || Array.isArray(toolArgs)) {
       throw new Error("callTool() arguments must be an object.");
     }
+    // Green Hat fork: the agent's plain-language statement for the approver (see McpCallOptions).
+    // Validated here so a wrong shape fails the agent's call rather than reaching the card.
+    if (options !== undefined && (typeof options !== "object" || Array.isArray(options))) {
+      throw new Error("callTool() options must be an object.");
+    }
+    if (options?.intent !== undefined && typeof options.intent !== "string") {
+      throw new Error("callTool() options.intent must be a string.");
+    }
+    const intent = options?.intent;
 
     const host = this.#host;
     const entry = await host.findTool(name);
@@ -200,6 +211,7 @@ export class McpSessionBase extends RpcTarget {
       toolArgs,
       mode: entry.mode,
       classifiedBy: entry.classifiedBy,
+      intent,
     });
 
     if (entry.mode === "read") {

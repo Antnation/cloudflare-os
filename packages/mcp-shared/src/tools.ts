@@ -217,6 +217,83 @@ export function plainInline(text: string, max = MAX_INLINE_TEXT): string {
   return clipped || "(unnamed)";
 }
 
+// Green Hat fork: the plain-language head of an approval card.
+//
+// Two lines, the agent's own statement first (labelled as such: it is agent-authored text, so it
+// is a claim, and the arguments below it remain what is actually sent) and a sentence generated
+// from the arguments second, so an approver who reads nothing else still knows what will change.
+const MAX_INTENT = 400;
+const MAX_SUMMARY_FIELDS = 12;
+const MAX_SUMMARY_VALUE = 60;
+const MAX_SUMMARY_DEPTH = 3;
+
+/** "domainName" -> "domain name", "account_status" -> "account status", "companyId" -> "company id". */
+function humanizeKey(key: string): string {
+  return key
+    .replace(/[_-]+/g, " ")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .toLowerCase()
+    .trim();
+}
+
+function summarizeValue(value: unknown): string {
+  if (value === null || value === undefined) return "empty";
+  if (typeof value === "string") return `"${plainInline(value, MAX_SUMMARY_VALUE)}"`;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "none";
+    if (value.length <= 5 && value.every(item => typeof item !== "object" || item === null)) {
+      return `[${value.map(summarizeValue).join(", ")}]`;
+    }
+    return `${value.length} item${value.length === 1 ? "" : "s"}`;
+  }
+  return "(nested)";
+}
+
+function collectFields(
+  value: Record<string, unknown>, prefix: string, depth: number, out: string[],
+): void {
+  for (const [key, entry] of Object.entries(value)) {
+    const label = prefix ? `${prefix} \u203a ${humanizeKey(key)}` : humanizeKey(key);
+    if (entry !== null && typeof entry === "object" && !Array.isArray(entry)
+        && depth < MAX_SUMMARY_DEPTH) {
+      collectFields(entry as Record<string, unknown>, label, depth + 1, out);
+    } else {
+      out.push(`${label}: ${summarizeValue(entry)}`);
+    }
+  }
+}
+
+/** A sentence built from the tool and its arguments, with nothing the agent wrote in prose. */
+export function plainSummary(tool: McpTool, toolArgs: Record<string, unknown>): string {
+  const verb = tool.description
+    ? plainInline(tool.description, 80)
+    : plainInline(humanizeKey(tool.name), 80).replace(/^./, first => first.toUpperCase());
+  const fields: string[] = [];
+  try {
+    collectFields(toolArgs, "", 0, fields);
+  } catch {
+    return `${verb} (arguments could not be summarized).`;
+  }
+  if (fields.length === 0) return `${verb} (no arguments).`;
+  const shown = fields.slice(0, MAX_SUMMARY_FIELDS);
+  const more = fields.length > shown.length ? ` \u2026 and ${fields.length - shown.length} more` : "";
+  return `${verb} with: ${shown.join("; ")}${more}.`;
+}
+
+function plainTermsBlock(args: {
+  tool: McpTool; toolArgs: Record<string, unknown>; mode: "read" | "action"; intent?: string;
+}): string {
+  const summary = plainSummary(args.tool, args.toolArgs);
+  const intent = args.intent?.trim() ? plainInline(args.intent, MAX_INTENT) : undefined;
+  if (args.mode === "read") return `> **In plain terms:** ${summary}`;
+  return intent
+    ? `> **In plain terms** (the agent's own words): ${intent}\n>\n> **What will be sent:** ${summary}`
+    : `> **In plain terms:** ${summary}\n>\n> _The agent gave no summary; this line is generated ` +
+      "from the arguments below._";
+}
+
 /** Renders a tool call as the Markdown an approver reads before deciding. */
 export function describeCall(args: {
   serverName: string;
@@ -225,6 +302,8 @@ export function describeCall(args: {
   toolArgs: Record<string, unknown>;
   mode: "read" | "action";
   classifiedBy: ClassificationSource;
+  /** Green Hat fork: the agent's plain-language statement, see McpCallOptions. */
+  intent?: string;
 }): { title: string; description: string } {
   // The arguments are the agent's text, and the agent is who this prompt protects the user from, so
   // they get the same treatment as the server's description. `JSON.stringify` escapes quotes and
@@ -249,6 +328,8 @@ export function describeCall(args: {
 
   const description = [
     `**${plainInline(args.serverName)}** \u2192 ${codeSpan(args.tool.name)}`,
+    "",
+    plainTermsBlock(args),
     "",
     args.tool.description
       ? quoteUntrusted(args.tool.description, MAX_DESCRIPTION)

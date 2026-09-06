@@ -92,4 +92,18 @@ export type McpToolSummary = Omit<McpToolInfo, "inputSchema">;
 export type McpToolListOptions =
   | { search: string; name?: never }
   | { name: string; search?: never };
+
+/**
+ * Options accepted as the last argument of every tool method and of callTool.
+ *
+ * intent: one or two plain sentences, written for the human who will approve the call, saying
+ * what it does in their terms: name records by their names rather than ids, and say exactly what
+ * will change ("Add the company Nullify with website nullify.ai as a partner", "Link Jane Doe to
+ * Nullify"). Shown on the approval card as the agent's own statement, above the exact arguments,
+ * which remain what is actually sent. Always supply it for actions; it is ignored for read-only
+ * tools.
+ */
+export type McpCallOptions = {
+  intent?: string;
+};
 `;

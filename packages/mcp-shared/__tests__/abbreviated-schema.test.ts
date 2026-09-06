@@ -102,10 +102,10 @@ describe("clampToolDefinition with an oversized schema", () => {
     const output = generate([
       { tool, mode: "action", autoApprovable: false, classifiedBy: "server-annotation" },
     ]);
-    expect(output).toMatch(/createOneCompany\(args: \w+_CreateOneCompanyArgs\)/);
+    expect(output).toMatch(/createOneCompany\(args: \w+_CreateOneCompanyArgs, options\?: McpCallOptions\)/);
     expect(output).toContain("domainName?: Record<string, unknown>");
     expect(output).toContain("Object with fields: primaryLinkLabel, primaryLinkUrl, secondaryLinks");
-    expect(output).not.toContain('callTool(name: "createOneCompany", args?: Record<string, never>)');
+    expect(output).not.toContain('callTool(name: "createOneCompany", args?: Record<string, never>');
   });
 
   it("still drops a schema that is oversized without being an object", () => {

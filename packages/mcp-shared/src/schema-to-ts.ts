@@ -216,9 +216,11 @@ function toolDoc(entry: ClassifiedTool, all: ClassifiedTool[]): string {
   const { tool, mode, autoApprovable } = entry;
   const detail = mode === "read"
     ? "Read-only: returns `{ status: \"ok\" }` and is recorded as an observation."
-    : autoApprovable
+    : (autoApprovable
       ? "Action: queued for approval, and may be auto-applied if you have opted in to its kind."
-      : "Action: queued for approval; the result arrives via `getActionResult`.";
+      : "Action: queued for approval; the result arrives via `getActionResult`.") +
+      " Pass `{ intent }` as the last argument: one or two plain sentences for the approver, " +
+      "naming records by name (not id) and saying what will change.";
   const method = toMethodName(tool.name);
   // Say the wire name whenever it is not obvious from the method name, so an agent reading only this
   // comment can still reach the tool through `callTool`.
@@ -348,6 +350,11 @@ export function generateSessionTypes(args: {
   lines.push(" * When using this session from `executeCode`, return from that executeCode call as soon as");
   lines.push(" * an action is pending so its approval can appear in chat. Approval resumes the agent;");
   lines.push(" * denial ends the turn. Call `getActionResult` after approval.");
+  lines.push(" *");
+  lines.push(" * Every action must carry `{ intent }` as its last argument (see `McpCallOptions`): one or");
+  lines.push(" * two plain sentences for the human approver, in their terms, naming records by name rather");
+  lines.push(" * than id and saying exactly what will change. It appears on the approval card above the");
+  lines.push(" * exact arguments, which are what is actually sent.");
   if (args.trust === "byo") {
     lines.push(" *");
     lines.push(" * This server was supplied by the user, so no action is ever applied automatically.");
@@ -374,13 +381,13 @@ export function generateSessionTypes(args: {
     lines.push(docComment(toolDoc(entry, args.tools), "  ").trimEnd());
     switch (argumentStyle(entry.tool.inputSchema)) {
       case "none":
-        lines.push(`  ${method}(): Promise<McpCallResult>;`);
+        lines.push(`  ${method}(args?: Record<string, never>, options?: McpCallOptions): Promise<McpCallResult>;`);
         break;
       case "freeform":
-        lines.push(`  ${method}(args?: Record<string, unknown>): Promise<McpCallResult>;`);
+        lines.push(`  ${method}(args?: Record<string, unknown>, options?: McpCallOptions): Promise<McpCallResult>;`);
         break;
       case "typed":
-        lines.push(`  ${method}(args: ${argsNames.get(entry.tool.name)}): Promise<McpCallResult>;`);
+        lines.push(`  ${method}(args: ${argsNames.get(entry.tool.name)}, options?: McpCallOptions): Promise<McpCallResult>;`);
         break;
     }
     lines.push("");
@@ -395,13 +402,13 @@ export function generateSessionTypes(args: {
   for (const { tool } of args.tools) {
     switch (argumentStyle(tool.inputSchema)) {
       case "none":
-        lines.push(`  callTool(name: ${quote(tool.name)}, args?: Record<string, never>): Promise<McpCallResult>;`);
+        lines.push(`  callTool(name: ${quote(tool.name)}, args?: Record<string, never>, options?: McpCallOptions): Promise<McpCallResult>;`);
         break;
       case "freeform":
-        lines.push(`  callTool(name: ${quote(tool.name)}, args?: Record<string, unknown>): Promise<McpCallResult>;`);
+        lines.push(`  callTool(name: ${quote(tool.name)}, args?: Record<string, unknown>, options?: McpCallOptions): Promise<McpCallResult>;`);
         break;
       case "typed": {
-        lines.push(`  callTool(name: ${quote(tool.name)}, args: ${argsNames.get(tool.name)}): Promise<McpCallResult>;`);
+        lines.push(`  callTool(name: ${quote(tool.name)}, args: ${argsNames.get(tool.name)}, options?: McpCallOptions): Promise<McpCallResult>;`);
         break;
       }
     }
@@ -412,7 +419,7 @@ export function generateSessionTypes(args: {
   lines.push("    name: Name,");
   lines.push(`    ...args: Name extends ${knownToolNames}`);
   lines.push("      ? [args: never]");
-  lines.push("      : [args?: Record<string, unknown>]");
+  lines.push("      : [args?: Record<string, unknown>, options?: McpCallOptions]");
   lines.push("  ): Promise<McpCallResult>;");
   lines.push("");
 
