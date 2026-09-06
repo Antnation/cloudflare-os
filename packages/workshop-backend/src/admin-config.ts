@@ -2,14 +2,15 @@
 // mirrored to one reserved BLUEPRINTS KV key, so the per-(re)connect getServerConfig() path and the
 // agent can resolve it with a single cheap KV get.
 //
-// This covers the "soft" deployment customizations only (branding, agent instructions, and which
-// gatekeeper connectors/resources are offered). Authentication/authorization config (sign-in
-// providers, password login) is deliberately NOT here — it stays env-var driven so it can't be
-// changed by a compromised admin session. Everything here is enabled by default; the admin UI opts
-// things *out*.
+// This covers mutable deployment customizations only (branding, agent instructions, and which
+// gatekeeper connectors/resources are available). Resource switches are re-checked at the runtime
+// authority boundaries, but do not revoke an upstream provider's OAuth grant. Authentication config
+// (sign-in providers, password login) is deliberately NOT here — it stays env-var driven so it can't
+// be changed by a compromised admin session. Everything here is enabled by default; the admin UI
+// opts things *out*.
 
-import { AmbientGatekeeperMode, BannerConfig, BlueprintBinding, BlueprintMetadata, BlueprintOutput, DEFAULT_BANNER_COLOR, OutputFormatOffer, isAmbientGatekeeperMode, isBannerColor, isOutputIcon } from "@gadgets/workshop-shared/api";
-import { SupportedResource } from "@gadgets/workshop-shared/gatekeeper";
+import { AmbientGatekeeperMode, BannerConfig, BlueprintBinding, BlueprintMetadata, BlueprintOutput, DEFAULT_BANNER_COLOR, GatekeeperCreationSpec, OutputFormatOffer, isAmbientGatekeeperMode, isBannerColor, isOutputIcon } from "@gadgets/workshop-shared/api";
+import { SupportedResource, matchesResourceUrlPattern } from "@gadgets/workshop-shared/gatekeeper";
 import { ADMIN_CONFIG_KEY, BlueprintKvEnv, readBlueprintKvRecord, sanitizeBlueprintOutput } from "./blueprint-archive.js";
 
 export type AdminConfig = {
@@ -281,15 +282,16 @@ function strings(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
 }
 
-export function parseAdminConfig(raw: string | null): AdminConfig {
-  if (!raw) return { ...DEFAULT_ADMIN_CONFIG };
-  try {
-    let p = JSON.parse(raw) as Partial<AdminConfig>;
+function normalizeAdminConfig(p: Partial<AdminConfig>): AdminConfig {
     let disabledResources: Record<string, string[]> = {};
     if (p.disabledResources && typeof p.disabledResources === "object") {
       for (let [vendorId, patterns] of Object.entries(p.disabledResources)) {
-        let list = strings(patterns);
-        if (list.length > 0) disabledResources[vendorId] = list;
+        let key = vendorId.toLowerCase();
+        let list = [...new Set([
+          ...(disabledResources[key] ?? []),
+          ...strings(patterns),
+        ])];
+        if (list.length > 0) disabledResources[key] = list;
       }
     }
     let ambientGatekeeperModes: Record<string, AmbientGatekeeperMode> = {};
@@ -298,48 +300,278 @@ export function parseAdminConfig(raw: string | null): AdminConfig {
         if (isAmbientGatekeeperMode(mode)) ambientGatekeeperModes[vendorId.toLowerCase()] = mode;
       }
     }
-    return {
-      signupsEnabled: typeof p.signupsEnabled === "boolean" ? p.signupsEnabled : true,
-      siteName: typeof p.siteName === "string" ? p.siteName : "",
-      siteLogoConfigured: typeof p.siteLogoConfigured === "boolean" ? p.siteLogoConfigured : false,
-      instanceInstructions: typeof p.instanceInstructions === "string" ? p.instanceInstructions : "",
-      announcement: typeof p.announcement === "string" ? p.announcement : "",
-      banner: {
-        text: typeof p.banner?.text === "string" ? p.banner.text : "",
-        color: isBannerColor(p.banner?.color) ? p.banner!.color : DEFAULT_BANNER_COLOR,
-      },
-      accentColor: typeof p.accentColor === "string" ? p.accentColor : "",
-      disabledResources,
-      disabledGatekeepers: strings(p.disabledGatekeepers).map(v => v.toLowerCase()),
-      ambientGatekeeperModes,
-      formats: parseFormats(p.formats),
-    };
+  return {
+    signupsEnabled: typeof p.signupsEnabled === "boolean" ? p.signupsEnabled : true,
+    siteName: typeof p.siteName === "string" ? p.siteName : "",
+    siteLogoConfigured: typeof p.siteLogoConfigured === "boolean" ? p.siteLogoConfigured : false,
+    instanceInstructions: typeof p.instanceInstructions === "string" ? p.instanceInstructions : "",
+    announcement: typeof p.announcement === "string" ? p.announcement : "",
+    banner: {
+      text: typeof p.banner?.text === "string" ? p.banner.text : "",
+      color: isBannerColor(p.banner?.color) ? p.banner!.color : DEFAULT_BANNER_COLOR,
+    },
+    accentColor: typeof p.accentColor === "string" ? p.accentColor : "",
+    disabledResources,
+    disabledGatekeepers: [...new Set(strings(p.disabledGatekeepers).map(v => v.toLowerCase()))],
+    ambientGatekeeperModes,
+    formats: parseFormats(p.formats),
+  };
+}
+
+export function parseAdminConfig(raw: string | null): AdminConfig {
+  if (!raw) return { ...DEFAULT_ADMIN_CONFIG };
+  try {
+    return normalizeAdminConfig(JSON.parse(raw) as Partial<AdminConfig>);
   } catch {
     return { ...DEFAULT_ADMIN_CONFIG };
   }
+}
+
+/**
+ * Parse the KV copy used at authority-bearing call sites. Missing KV is the valid first-deploy
+ * default, but a present malformed policy must not silently turn every disabled integration back
+ * on. The admin UI reads the authoritative typed Durable Object record, so throwing here does not
+ * remove the recovery path: a subsequent admin write repairs the mirror.
+ */
+export function parseAdminConfigForAuthority(raw: string | null): AdminConfig {
+  if (raw === null) return { ...DEFAULT_ADMIN_CONFIG };
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error("The deployment admin policy is malformed.", {cause: error});
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("The deployment admin policy is malformed.");
+  }
+
+  let policy = parsed as Record<string, unknown>;
+  if ("disabledGatekeepers" in policy &&
+      (!Array.isArray(policy.disabledGatekeepers) ||
+       policy.disabledGatekeepers.some(value => typeof value !== "string"))) {
+    throw new Error("The deployment gatekeeper policy is malformed.");
+  }
+  if ("disabledResources" in policy) {
+    let resources = policy.disabledResources;
+    if (!resources || typeof resources !== "object" || Array.isArray(resources) ||
+        Object.values(resources).some(patterns =>
+          !Array.isArray(patterns) || patterns.some(pattern => typeof pattern !== "string"))) {
+      throw new Error("The deployment resource policy is malformed.");
+    }
+  }
+  if ("ambientGatekeeperModes" in policy) {
+    let modes = policy.ambientGatekeeperModes;
+    if (!modes || typeof modes !== "object" || Array.isArray(modes) ||
+        Object.values(modes).some(mode => !isAmbientGatekeeperMode(mode))) {
+      throw new Error("The deployment ambient gatekeeper policy is malformed.");
+    }
+  }
+
+  return normalizeAdminConfig(parsed as Partial<AdminConfig>);
 }
 
 export function serializeAdminConfig(config: AdminConfig): string {
   return JSON.stringify(config);
 }
 
-/** Read the admin config from the KV mirror. Cheap enough for the hot path (a single KV get). */
+/** Read presentation/discovery config from the KV mirror, tolerating a corrupt copy for recovery. */
 export async function readAdminConfig(env: Cloudflare.Env): Promise<AdminConfig> {
   return parseAdminConfig(await env.BLUEPRINTS.get(ADMIN_CONFIG_KEY));
 }
 
+/**
+ * Read the same mirror for an authority-bearing operation. Unlike presentation reads, a present
+ * malformed record fails closed so corruption cannot silently re-enable every integration.
+ */
+export async function readAdminConfigForAuthority(env: Cloudflare.Env): Promise<AdminConfig> {
+  return parseAdminConfigForAuthority(await env.BLUEPRINTS.get(ADMIN_CONFIG_KEY));
+}
+
 // --- Resource-disable helpers ---
+
+/** Whether an ordinary gatekeeper vendor is disabled by deployment policy. */
+export function isGatekeeperDisabled(config: AdminConfig, vendorId: string): boolean {
+  return config.disabledGatekeepers.includes(vendorId.toLowerCase());
+}
 
 export function isResourceDisabled(
     config: AdminConfig, vendorId: string, urlPattern: string): boolean {
-  return config.disabledResources[vendorId]?.includes(urlPattern) ?? false;
+  return config.disabledResources[vendorId.toLowerCase()]?.includes(urlPattern) ?? false;
 }
 
 export function filterEnabledResources(
     config: AdminConfig, vendorId: string, resources: SupportedResource[]): SupportedResource[] {
-  let disabled = config.disabledResources[vendorId];
+  let disabled = config.disabledResources[vendorId.toLowerCase()];
   if (!disabled || disabled.length === 0) return resources;
   return resources.filter(r => !disabled.includes(r.urlPattern));
+}
+
+/** Why an already-minted gatekeeper capability is unavailable under the current admin policy. */
+export type GatekeeperAvailabilityBlock = {
+  kind: "gatekeeper";
+  vendorId: string;
+} | {
+  kind: "resource";
+  vendorId?: string;
+  urlPattern: string;
+};
+
+/**
+ * Resolve the current policy block for a persisted gatekeeper record. This is intentionally usable
+ * after a capability has been minted: runtime call sites pass the stored creation spec before
+ * opening a session, authorizing a read, applying a write, or delivering a hook.
+ *
+ * Very old records may predate creation specs. When their vendor is known, their concrete resource
+ * URL is matched only against that vendor. Without provenance, a concrete URL is matched against
+ * every resource rule. Ambiguous broad rules and whole-vendor disables deliberately quarantine
+ * such a record: allowing it would let an unidentifiable legacy capability bypass admin policy.
+ * Cleanup remains available, and all newly-created records carry provenance.
+ */
+export function gatekeeperAvailabilityBlock(
+    config: AdminConfig,
+    creationSpec: GatekeeperCreationSpec | undefined,
+    resourceUrl?: string,
+    legacyVendorId?: string): GatekeeperAvailabilityBlock | undefined {
+  if (creationSpec && "vendorId" in creationSpec) {
+    let vendorId = creationSpec.vendorId.toLowerCase();
+    let disabledPatterns = config.disabledResources[vendorId] ?? [];
+    if (isGatekeeperDisabled(config, vendorId) ||
+        creationSpec.type === "ambient" &&
+        config.ambientGatekeeperModes[vendorId] === "disabled") {
+      return {kind: "gatekeeper", vendorId};
+    }
+    if (creationSpec.type === "gatekeeper") {
+      if (creationSpec.typeUrlPattern &&
+          isResourceDisabled(config, vendorId, creationSpec.typeUrlPattern)) {
+        return {kind: "resource", vendorId, urlPattern: creationSpec.typeUrlPattern};
+      }
+      // Historical ordinary records may have a creationSpec from before typeUrlPattern was added.
+      // Their vendor provenance is still trustworthy, so fall back to matching the concrete URL
+      // against that vendor's policy. Do not do this for modern records: a broad sibling pattern
+      // such as https://* must not shadow their explicit enabled type.
+      if (!creationSpec.typeUrlPattern) {
+        let concreteUrl = creationSpec.resourceUrl || resourceUrl;
+        if (concreteUrl) {
+          for (let urlPattern of disabledPatterns) {
+            if (matchesResourceUrlPattern(urlPattern, concreteUrl)) {
+              return {kind: "resource", vendorId, urlPattern};
+            }
+          }
+        } else if (disabledPatterns.length > 0) {
+          return {kind: "resource", vendorId, urlPattern: disabledPatterns[0]};
+        }
+      }
+    }
+
+    // Ambient records do not carry a typeUrlPattern. Match their concrete described URL against
+    // this vendor's disabled patterns so the same policy still governs a retained singleton
+    // capability. An ordinary record's stored typeUrlPattern is authoritative: matching its URL
+    // against broader sibling types (especially `https://*`) would disable an enabled resource.
+    if (creationSpec.type === "ambient" && resourceUrl) {
+      for (let urlPattern of disabledPatterns) {
+        if (matchesResourceUrlPattern(urlPattern, resourceUrl)) {
+          return {kind: "resource", vendorId, urlPattern};
+        }
+      }
+    } else if (creationSpec.type === "ambient" && disabledPatterns.length > 0) {
+      return {kind: "resource", vendorId, urlPattern: disabledPatterns[0]};
+    }
+    return undefined;
+  }
+
+  if (legacyVendorId) {
+    let vendorId = legacyVendorId.toLowerCase();
+    if (isGatekeeperDisabled(config, vendorId) ||
+        config.ambientGatekeeperModes[vendorId] === "disabled") {
+      return {kind: "gatekeeper", vendorId};
+    }
+    let patterns = config.disabledResources[vendorId] ?? [];
+    if (!resourceUrl && patterns.length > 0) {
+      return {kind: "resource", vendorId, urlPattern: patterns[0]};
+    }
+  } else if (!creationSpec && config.disabledGatekeepers.length > 0) {
+    // There is no sound way to prove that this historical record is unrelated to the disabled
+    // vendor. Fail closed until it is removed/reconnected with a creation spec.
+    return {kind: "gatekeeper", vendorId: config.disabledGatekeepers[0]};
+  } else if (!creationSpec && !resourceUrl) {
+    for (let [vendorId, patterns] of Object.entries(config.disabledResources)) {
+      if (patterns.length > 0) {
+        return {kind: "resource", vendorId, urlPattern: patterns[0]};
+      }
+    }
+  }
+
+  if (resourceUrl) {
+    let resources: Array<[string, string[]]> = legacyVendorId
+        ? [[legacyVendorId.toLowerCase(),
+            config.disabledResources[legacyVendorId.toLowerCase()] ?? []]]
+        : Object.entries(config.disabledResources);
+    for (let [vendorId, patterns] of resources) {
+      for (let urlPattern of patterns) {
+        if (matchesResourceUrlPattern(urlPattern, resourceUrl)) {
+          return {kind: "resource", vendorId, urlPattern};
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Validate and narrow an OAuth/resource-grant selection to enabled, independently grantable
+ * resource types. An omitted selection keeps its legacy "all" meaning only when this vendor has no
+ * resource policy at all; otherwise it becomes the explicit enabled subset. This stays safe when a
+ * user-specific or stale provider catalog omits the disabled type: forwarding `undefined` there
+ * would turn the request back into "grant everything" at the provider.
+ */
+export function normalizeResourceGrantSelection(
+    config: AdminConfig,
+    vendorId: string,
+    supportedResources: SupportedResource[],
+    requested: string[] | undefined): string[] | undefined {
+  let grantable = supportedResources.filter(resource => resource.grantable === true);
+  let byPattern = new Map(grantable.map(resource => [resource.urlPattern, resource]));
+
+  if (requested !== undefined) {
+    let normalized = [...new Set(requested)];
+    for (let urlPattern of normalized) {
+      let resource = byPattern.get(urlPattern);
+      if (!resource) {
+        throw new Error(`Unknown or non-grantable resource type: ${urlPattern}`);
+      }
+      if (isResourceDisabled(config, vendorId, urlPattern)) {
+        throw new Error(
+            `The "${resource.title}" resource is disabled on this deployment by an administrator.`);
+      }
+    }
+    return normalized;
+  }
+
+  if ((config.disabledResources[vendorId.toLowerCase()]?.length ?? 0) === 0) {
+    return undefined;
+  }
+  return grantable
+      .filter(resource => !isResourceDisabled(config, vendorId, resource.urlPattern))
+      .map(resource => resource.urlPattern);
+}
+
+/**
+ * Whether a connected account's current grant may contain an administratively disabled resource.
+ * Explicit grant metadata is compared directly with policy rather than intersected with today's
+ * provider catalog: a disabled scope must not become allowed merely because it stopped being
+ * advertised. Missing grant metadata means "all" for legacy accounts and therefore fails closed
+ * whenever the vendor has any disabled resource policy.
+ */
+export function accountGrantIncludesDisabledResource(
+    config: AdminConfig,
+    vendorId: string,
+    grantedResourceUrlPatterns: string[] | undefined): boolean {
+  let disabled = config.disabledResources[vendorId.toLowerCase()] ?? [];
+  if (disabled.length === 0) return false;
+  if (grantedResourceUrlPatterns === undefined) return true;
+  let granted = new Set(grantedResourceUrlPatterns);
+  return disabled.some(urlPattern => granted.has(urlPattern));
 }
 
 // --- Agent system-prompt instructions ---
