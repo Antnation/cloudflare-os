@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { GatekeeperUser, GatekeeperUserVerifier } from "@gadgets/workshop-shared/gatekeeper";
 import { UserDurableObject } from "../src/user.js";
+import {DEFAULT_ADMIN_CONFIG} from "../src/admin-config.js";
 
 function makeUserWithAccount(vendorId: string) {
   const verifier = {} as Fetcher<GatekeeperUserVerifier>;
@@ -13,10 +14,8 @@ function makeUserWithAccount(vendorId: string) {
   } as Fetcher<GatekeeperUser>;
   const user = Object.create(UserDurableObject.prototype) as UserDurableObject;
   Object.assign(user, {
-    env: {
-      BLUEPRINTS: {
-        get: async () => null,
-      },
+    adminSettings: {
+      getByName: () => ({getAdminConfig: async () => DEFAULT_ADMIN_CONFIG}),
     },
     storage: {
       connectedAccounts: {
@@ -68,7 +67,9 @@ describe("UserDurableObject.getVerifier", () => {
     let current: any = {id: 7, account, vendorId: "notion", accountGeneration: 0};
     let user = Object.create(UserDurableObject.prototype) as UserDurableObject;
     Object.assign(user, {
-      env: {BLUEPRINTS: {get: async () => null}},
+      adminSettings: {
+        getByName: () => ({getAdminConfig: async () => DEFAULT_ADMIN_CONFIG}),
+      },
       storage: {connectedAccounts: {get: () => current}},
     });
 
@@ -81,32 +82,27 @@ describe("UserDurableObject.getVerifier", () => {
     expect(disposeVerifier).toHaveBeenCalledTimes(1);
   });
 
-  it("coalesces overlapping authority KV reads without caching settled policy", async () => {
-    let releaseConfig!: () => void;
-    let reads = 0;
-    let firstRead = new Promise<string | null>(resolve => { releaseConfig = () => resolve(null); });
-    let verifier = {} as Fetcher<GatekeeperUserVerifier>;
-    let account = {getVerifier: async () => verifier} as Fetcher<GatekeeperUser>;
-    let record = {id: 7, account, vendorId: "notion"};
+  it("does not coalesce overlapping authoritative Durable Object reads", async () => {
+    let releases: Array<() => void> = [];
+    let getAdminConfig = vi.fn(() => new Promise<typeof DEFAULT_ADMIN_CONFIG>(resolve => {
+      releases.push(() => resolve(DEFAULT_ADMIN_CONFIG));
+    }));
     let user = Object.create(UserDurableObject.prototype) as UserDurableObject;
     Object.assign(user, {
-      env: {BLUEPRINTS: {get: async () => {
-        reads++;
-        if (reads === 1) return firstRead;
-        return null;
-      }}},
-      storage: {connectedAccounts: {get: () => record}},
+      adminSettings: {getByName: () => ({getAdminConfig})},
     });
 
-    let first = user.getVerifier(7, "notion");
-    let second = user.getVerifier(7, "notion");
+    let first = (user as any).readAuthorityConfig();
+    let second = (user as any).readAuthorityConfig();
     await new Promise(resolve => setTimeout(resolve, 0));
-    expect(reads).toBe(1);
-    releaseConfig();
+    expect(getAdminConfig).toHaveBeenCalledTimes(2);
+    releases.splice(0).forEach(release => release());
     await Promise.all([first, second]);
-    // The final post-mint checks overlap too, but a later operation would start a fresh read.
-    expect(reads).toBe(2);
-    await user.getVerifier(7, "notion");
-    expect(reads).toBe(4);
+
+    let third = (user as any).readAuthorityConfig();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(getAdminConfig).toHaveBeenCalledTimes(3);
+    releases.splice(0).forEach(release => release());
+    await third;
   });
 });

@@ -198,16 +198,19 @@ export class ActionStore {
     log.info("tool call applied", { event: "action.applied", actionId: id, toolName: stored.toolName });
   }
 
-  reject(id: number): void {
+  reject(id: number): "rejected" | "applied" | "unknown" {
     const stored = this.get(id);
-    if (!stored || stored.state === "rejected") return;
-    if (stored.state !== "pending") {
-      throw new Error(stored.state === "applying"
-        ? `MCP action ${id} is already being applied.`
-        : `MCP action ${id} is already ${stored.state}.`);
+    if (!stored) return "unknown";
+    if (stored.state === "applied") return "applied";
+    if (stored.state === "rejected") return "rejected";
+    if (stored.state === "applying") {
+      throw new Error(`MCP action ${id} is already being applied.`);
     }
+    if (stored.state === "failed" && stored.retryable === false) return "unknown";
+
     this.#sql.exec("UPDATE mcp_actions SET state = 'rejected' WHERE id = ?", id);
     this.#prune();
+    return "rejected";
   }
 
   #prune(): void {

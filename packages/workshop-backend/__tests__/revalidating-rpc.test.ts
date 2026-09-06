@@ -111,8 +111,8 @@ describe("recursive revalidating RPC membrane", () => {
     let childPromise = (session as any).child();
     let pipelinedRead = childPromise.read();
     await Promise.all([
-      expectRejection(childPromise, /Calendar is disabled/),
-      expectRejection(pipelinedRead, /Calendar is disabled/),
+      expectRejection(childPromise, /RPC capability is no longer available/),
+      expectRejection(pipelinedRead, /RPC capability is no longer available/),
     ]);
     expect(childRead).not.toHaveBeenCalled();
   });
@@ -138,7 +138,46 @@ describe("recursive revalidating RPC membrane", () => {
     enabled = false;
     finish("private calendar data");
 
-    await expectRejection(pending, /Calendar is disabled/);
+    await expectRejection(pending, /RPC capability is no longer available/);
+  });
+
+  it("does not release a provider rejection when policy changes while the call is in flight",
+      async () => {
+    let enabled = true;
+    let started!: () => void;
+    let reject!: (reason: unknown) => void;
+    let didStart = new Promise<void>(resolve => { started = resolve; });
+    let providerResult = new Promise<never>((_resolve, rejectPromise) => {
+      reject = rejectPromise;
+    });
+    class Root extends RpcTarget {
+      async read() {
+        started();
+        return providerResult;
+      }
+    }
+
+    using source = new NativeRpcStub(new Root());
+    using session = makeRevalidatingRpcStub(
+        () => source,
+        () => { if (!enabled) throw new Error("Calendar is disabled."); });
+    let pending = (session as any).read();
+    await didStart;
+    enabled = false;
+    reject(Object.assign(new Error("private calendar data"), {
+      providerDetail: "secret attendee notes",
+    }));
+
+    let caught: any;
+    try {
+      await pending;
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught.message).toBe("RPC capability is no longer available.");
+    expect(caught.message).not.toContain("private calendar data");
+    expect(caught.providerDetail).toBeUndefined();
   });
 
   it("guards a provider-retained callback after its originating call returns", async () => {
@@ -248,7 +287,8 @@ describe("recursive revalidating RPC membrane", () => {
       }
     }
 
-    using session = makeRevalidatingRpcStub(() => new Root(), () => undefined);
+    using source = new NativeRpcStub(new Root());
+    using session = makeRevalidatingRpcStub(() => source, () => undefined);
     await expectRejection(
         (session as any).returnedError(), /Error object with unsupported nested state/);
 
@@ -403,5 +443,51 @@ describe("recursive revalidating RPC membrane", () => {
     result[Symbol.dispose]();
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(disposed).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases an explicitly-owned proxied RPC result when traversal fails before a later stub",
+      async () => {
+    let childDisposed = vi.fn();
+    let rootDisposed = vi.fn();
+    class DisposableChild extends RpcTarget {
+      [Symbol.dispose]() {
+        childDisposed();
+      }
+    }
+    class Root extends RpcTarget {
+      invalidResult() {
+        return {
+          oversized: Array.from({length: 4096}, () => null),
+          later: new DisposableChild(),
+        };
+      }
+
+      [Symbol.dispose]() {
+        rootDisposed();
+      }
+    }
+
+    using source = new NativeRpcStub(new Root());
+    let proxiedSource = new Proxy(source as any, {
+      get(target, prop) {
+        if (prop === Symbol.dispose) return () => target[Symbol.dispose]();
+        return Reflect.get(target, prop, target);
+      },
+      getPrototypeOf() {
+        return RpcTarget.prototype;
+      },
+    });
+    expect(proxiedSource).not.toBeInstanceOf(NativeRpcStub);
+
+    using session = makeRevalidatingRpcStub(
+        () => proxiedSource,
+        () => undefined,
+        undefined,
+        {disposeResolvedTarget: true, resultOwnership: "rpc-container"});
+    await expectRejection((session as any).invalidResult(), /size limit/);
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(childDisposed).toHaveBeenCalledTimes(1);
+    expect(rootDisposed).toHaveBeenCalledTimes(1);
   });
 });

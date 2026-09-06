@@ -166,6 +166,12 @@ describe("gatekeeper resource policy", () => {
     expect(() => parseAdminConfigForAuthority(JSON.stringify({
       signupsEnabled: "false",
     }))).toThrow(/signup policy is malformed/);
+    expect(() => parseAdminConfigForAuthority(JSON.stringify({
+      revision: -1,
+    }))).toThrow(/revision is malformed/);
+    expect(() => parseAdminConfigForAuthority(JSON.stringify({
+      revision: 1.5,
+    }))).toThrow(/revision is malformed/);
   });
 
   it("blocks retained ordinary, ambient, and legacy capabilities", () => {

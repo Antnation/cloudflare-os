@@ -3,6 +3,7 @@
 
 import { DurableObject, type RpcStub } from "cloudflare:workers";
 import type {
+  ActionRejectionResult,
   ActionKind,
   ApprovalQueue,
   Gatekeeper,
@@ -265,8 +266,9 @@ export abstract class McpFacetBase<
   }
 
   /** Rejects a pending action. */
-  async rejectAction(action: number): Promise<void> {
-    this.#actions().reject(action);
+  async rejectAction(action: number): Promise<void | ActionRejectionResult> {
+    const outcome = this.#actions().reject(action);
+    return outcome === "rejected" ? undefined : { outcome };
   }
 
   /** Reports that MCP actions cannot be reverted. */

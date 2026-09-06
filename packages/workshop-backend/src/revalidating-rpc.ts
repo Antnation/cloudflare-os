@@ -15,6 +15,11 @@ type TransferDirection = "argument" | "result";
 type MembraneOptions = {
   /** Release a target created solely for one forwarded call, after that call settles. */
   disposeResolvedTarget?: boolean;
+  /**
+   * The target is a proxy around an RPC stub, so its non-primitive results carry the RPC
+   * runtime's owning result-container disposer even though `instanceof RpcStub` is false.
+   */
+  resultOwnership?: "rpc-container";
 };
 
 type TraversalBudget = {
@@ -223,6 +228,7 @@ function makeChildMembrane(
     value: RpcCapability,
     revalidate: Revalidate,
     direction: TransferDirection,
+    rpcResultContainerOwnsCapabilities: boolean,
     transferredSources: Array<() => void>,
     owned: Array<() => void>): NativeRpcStub<RpcTarget> {
   let target: RpcCapability;
@@ -232,7 +238,9 @@ function makeChildMembrane(
     // reference may be released when the enclosing RPC settles. Hold an independent reference.
     target = value.dup();
     disposeTarget = () => dispose(target);
-    if (direction === "result") transferredSources.push(() => dispose(value));
+    if (direction === "result" && !rpcResultContainerOwnsCapabilities) {
+      transferredSources.push(() => dispose(value));
+    }
   } else {
     target = value;
     // A local target returned by a provider transfers ownership to us. A local callback argument
@@ -254,6 +262,7 @@ function wrapRpcValue(
     value: unknown,
     revalidate: Revalidate,
     direction: TransferDirection,
+    rpcResultContainerOwnsCapabilities: boolean,
     transferredSources: Array<() => void>,
     budget: TraversalBudget,
     ancestors: Set<object>,
@@ -302,7 +311,8 @@ function wrapRpcValue(
   if (isRemoteStub(value) || value instanceof RpcTarget || typeof value === "function") {
     charge(budget);
     return makeChildMembrane(
-        value as RpcCapability, revalidate, direction, transferredSources, owned);
+        value as RpcCapability, revalidate, direction,
+        rpcResultContainerOwnsCapabilities, transferredSources, owned);
   }
 
   let atomic = wrapAtomicValue(value, budget);
@@ -346,7 +356,8 @@ function wrapRpcValue(
           throw new Error("RPC value contains an unsupported accessor property.");
         }
         result[i] = wrapRpcValue(
-            descriptor.value, revalidate, direction, transferredSources,
+            descriptor.value, revalidate, direction, rpcResultContainerOwnsCapabilities,
+            transferredSources,
             budget, ancestors, owned, depth + 1);
       }
       return result;
@@ -376,7 +387,8 @@ function wrapRpcValue(
         enumerable: true,
         writable: true,
         value: wrapRpcValue(
-            descriptor.value, revalidate, direction, transferredSources,
+            descriptor.value, revalidate, direction, rpcResultContainerOwnsCapabilities,
+            transferredSources,
             budget, ancestors, owned, depth + 1),
       });
     }
@@ -440,6 +452,16 @@ function sanitizedError(error: unknown): Error {
   }
 }
 
+async function revalidateAfterProviderOutcome(revalidate: Revalidate): Promise<void> {
+  try {
+    await revalidate();
+  } catch {
+    // A provider error can contain resource data in its message or custom fields. Once authority
+    // is gone, reveal neither that error nor policy internals observed during the post-call check.
+    throw new Error("RPC capability is no longer available.");
+  }
+}
+
 async function forwardCall(
     resolveTarget: () => RpcCapability | Promise<RpcCapability>,
     revalidate: Revalidate,
@@ -451,32 +473,46 @@ async function forwardCall(
   let argumentOwnership: Array<() => void> = [];
   let resultOwnership: Array<() => void> = [];
   let transferredResultSources: Array<() => void> = [];
+  let resultHasRpcContainer = false;
   try {
     target = await resolveTarget();
+    resultHasRpcContainer = options.resultOwnership === "rpc-container" || isRemoteStub(target);
     let forwardedArgs = wrapRpcValue(
-        args, revalidate, "argument", [],
+        args, revalidate, "argument", false, [],
         {nodes: 0, bytes: 0}, new Set(), argumentOwnership, 0) as
         unknown[];
     // Target resolution and argument preparation may await. Check at the last point before the
-    // provider call, then again after it settles before releasing any result.
+    // provider call, then again after either outcome before releasing provider-derived data.
     await revalidate();
-    sourceResult = await callCapability(target, prop, forwardedArgs);
-    let result = wrapRpcValue(
-        sourceResult, revalidate, "result", transferredResultSources,
-        {nodes: 0, bytes: 0}, new Set(),
-        resultOwnership, 0);
-    await revalidate();
+    try {
+      sourceResult = await callCapability(target, prop, forwardedArgs);
+    } catch (providerError) {
+      await revalidateAfterProviderOutcome(revalidate);
+      throw sanitizedError(providerError);
+    }
+
+    let result: unknown;
+    try {
+      result = wrapRpcValue(
+          sourceResult, revalidate, "result", resultHasRpcContainer,
+          transferredResultSources, {nodes: 0, bytes: 0}, new Set(),
+          resultOwnership, 0);
+    } catch (resultError) {
+      await revalidateAfterProviderOutcome(revalidate);
+      throw resultError;
+    }
+    await revalidateAfterProviderOutcome(revalidate);
 
     // An RPC response owns its original returned stubs. Child membranes hold dup()s, so release
     // the response container without invalidating the guarded copies.
     releaseAll(transferredResultSources);
-    if (isRemoteStub(target)) dispose(sourceResult);
+    if (resultHasRpcContainer) dispose(sourceResult);
     resultOwnership.length = 0;
     return result;
   } catch (error) {
     releaseAll(resultOwnership);
     releaseAll(transferredResultSources);
-    if (target !== undefined && isRemoteStub(target)) dispose(sourceResult);
+    if (resultHasRpcContainer) dispose(sourceResult);
     throw sanitizedError(error);
   } finally {
     // A provider retaining a callback must dup() it. Releasing these handles after the call leaves
@@ -488,9 +524,9 @@ async function forwardCall(
 
 /**
  * Wrap a provider-owned capability in a recursive, reacquisition-safe membrane. The policy callback
- * runs immediately before every provider call and again before its result is released. Capabilities
- * nested in arguments or results get child membranes with the same policy, including capabilities
- * returned by earlier child calls.
+ * runs immediately before every provider call and again before its result or error is released.
+ * Capabilities nested in arguments or results get child membranes with the same policy, including
+ * capabilities returned by earlier child calls.
  *
  * `resolveTarget` may return either a local RpcTarget/function or a remote stub. Local targets are
  * never duped; remote child stubs are duped explicitly and owned by their child membrane.

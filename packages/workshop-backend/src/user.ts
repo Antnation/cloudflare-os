@@ -45,6 +45,26 @@ type ConnectedAccountRecord = {
   autoProvisioned?: boolean;
 };
 
+type ConnectionAttemptState = "pending" | "completing" | "completed" | "rejected";
+
+/**
+ * Durable, one-shot authorization for a provider OAuth callback. The random id binds the callback
+ * capability to the exact user/account/vendor/requested grant, while generation makes stale
+ * callbacks fail closed even if an account id were ever reused. Terminal rows are tombstones and
+ * are intentionally retained because account ids are monotonic and callback replays can arrive
+ * arbitrarily late.
+ */
+type ConnectionAttemptRecord = {
+  accountId: number;
+  attemptId: string;
+  generation: number;
+  vendorId: string;
+  resourceUrlPatterns?: string[];
+  state: ConnectionAttemptState;
+  createdAt: Date;
+  completedAt?: Date;
+};
+
 /**
  * Metadata about an auto-provisioned account that provides an agent singleton and/or a management UI.
  * Returned to the overseer (ambient capsules / catalog) and the management-UI listing.
@@ -77,6 +97,11 @@ function areCredentialsValid(record: ConnectedAccountRecord): boolean {
 
 function accountGeneration(record: ConnectedAccountRecord): number {
   return record.accountGeneration ?? 0;
+}
+
+function sameResourceSelection(left: string[] | undefined, right: string[] | undefined): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function disposeRpcCapability(value: unknown): void {
@@ -196,6 +221,9 @@ function makeUserStorage(storage: DurableObjectStorage) {
       connectedAccounts: collection<ConnectedAccountRecord>()({
         primaryKey: "id"
       }),
+      connectionAttempts: collection<ConnectionAttemptRecord>()({
+        primaryKey: "accountId",
+      }),
       sessions: collection<LoginSessionRecord>()({
         primaryKey: "tokenId",
       }),
@@ -240,6 +268,7 @@ function makeUserStorage(storage: DurableObjectStorage) {
       outputsBackfillCursor: "",
 
       nextAccountId: 0,
+      nextConnectionAttemptGeneration: 0,
       pinnedBlueprints: <string[]>[],
 
       // Per-user free-tier daily LLM-call counter (only used when ENABLE_CLOUDFLARE_LIMITS is on).
@@ -313,9 +342,6 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   private storage: UserStorage;
   private vendors: Map<string, Service<GatekeeperVendor>>;
   private adminSettings: DurableObjectNamespace<AdminSettings>;
-  // Share only concurrent authority reads. The entry clears as soon as the KV promise settles, so
-  // a later operation never inherits a stale deployment policy snapshot.
-  private authorityConfigRead?: Promise<AdminConfig>;
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
@@ -335,15 +361,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   private readAuthorityConfig(): Promise<AdminConfig> {
-    let existing = this.authorityConfigRead;
-    if (existing) return existing;
-
-    let read = readAdminConfigForAuthority(this.env);
-    let tracked = read.finally(() => {
-      if (this.authorityConfigRead === tracked) this.authorityConfigRead = undefined;
-    });
-    this.authorityConfigRead = tracked;
-    return tracked;
+    // Positive authority is deliberately never coalesced: every security boundary observes a
+    // fresh, strongly-consistent revision from the singleton AdminSettings Durable Object.
+    return readAdminConfigForAuthority(this.adminSettings);
   }
 
   private requireAccountIncarnation(
@@ -353,6 +373,34 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       throw new Error("The connected account changed while this operation was in progress.");
     }
     return current;
+  }
+
+  private requireConnectionAttempt(
+      accountId: number, attemptId: string, generation: number, vendorId: string,
+      resourceUrlPatterns: string[] | undefined,
+      expectedState: ConnectionAttemptState = "pending"): ConnectionAttemptRecord {
+    let attempt = this.storage.connectionAttempts.get(accountId);
+    if (!attempt || attempt.attemptId !== attemptId || attempt.generation !== generation ||
+        attempt.vendorId !== vendorId || attempt.state !== expectedState ||
+        !sameResourceSelection(attempt.resourceUrlPatterns, resourceUrlPatterns)) {
+      throw new Error("This authorization attempt is no longer valid. Start a new connection.");
+    }
+    return attempt;
+  }
+
+  private finishConnectionAttempt(
+      attempt: ConnectionAttemptRecord, state: "completed" | "rejected"): void {
+    let current = this.storage.connectionAttempts.get(attempt.accountId);
+    if (!current || current.attemptId !== attempt.attemptId ||
+        current.generation !== attempt.generation || current.state !== "completing") return;
+    this.storage.connectionAttempts.put({...current, state, completedAt: new Date()});
+  }
+
+  private rejectPendingConnectionAttempt(attempt: ConnectionAttemptRecord): void {
+    let current = this.storage.connectionAttempts.get(attempt.accountId);
+    if (!current || current.attemptId !== attempt.attemptId ||
+        current.generation !== attempt.generation || current.state !== "pending") return;
+    this.storage.connectionAttempts.put({...current, state: "rejected", completedAt: new Date()});
   }
 
   async authenticate(token: string): Promise<void> {
@@ -1220,31 +1268,63 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     let accountId = this.storage.nextAccountId.get();
+    let attemptGeneration = this.storage.nextConnectionAttemptGeneration.get();
+    if (accountId >= Number.MAX_SAFE_INTEGER || attemptGeneration >= Number.MAX_SAFE_INTEGER) {
+      throw new Error("No more connected-account identifiers are available.");
+    }
     this.storage.nextAccountId.put(accountId + 1);
+    this.storage.nextConnectionAttemptGeneration.put(attemptGeneration + 1);
+    let attempt: ConnectionAttemptRecord = {
+      accountId,
+      attemptId: crypto.randomUUID(),
+      generation: attemptGeneration,
+      vendorId,
+      resourceUrlPatterns: normalizedResourceUrlPatterns,
+      state: "pending",
+      createdAt: new Date(),
+    };
+    // Persist before handing the callback to the provider. OAuth callbacks can arrive before the
+    // connectAccount() RPC that minted the URL has returned.
+    this.storage.connectionAttempts.put(attempt);
 
     let props = {
       userId: this.ctx.id.toString(),
       accountId,
       vendorId,
       accountGeneration: 0,
+      connectionAttemptId: attempt.attemptId,
+      connectionAttemptGeneration: attempt.generation,
       resourceUrlPatterns: normalizedResourceUrlPatterns,
     };
 
     let callback = this.ctx.exports.GatekeeperConnectCallbackImpl({props});
 
-    let {url} = await vendor.connectAccount(
-        callback, {resourceUrlPatterns: normalizedResourceUrlPatterns});
+    let url: string;
+    try {
+      ({url} = await vendor.connectAccount(
+          callback, {resourceUrlPatterns: normalizedResourceUrlPatterns}));
+    } catch {
+      // A provider rejection is itself an outcome. Re-check policy before exposing any remote error
+      // details; if policy is still enabled, return a fixed local error instead.
+      try {
+        await this.assertRequestedGrantAvailable(vendorId, normalizedResourceUrlPatterns);
+      } catch (policyError) {
+        this.rejectPendingConnectionAttempt(attempt);
+        throw policyError;
+      }
+      this.rejectPendingConnectionAttempt(attempt);
+      logger.warn("account connect provider rejected", {
+        event: "account.connect.provider.rejected", vendorId, accountId,
+      });
+      throw new Error("The authorization provider could not start this connection.");
+    }
     // The provider may take time to mint its authorization URL. Do not return a flow whose scope
     // became forbidden while that RPC was in flight; its completion callback is checked again.
-    config = await this.readAuthorityConfig();
-    if (isGatekeeperDisabled(config, vendorId) ||
-        (normalizedResourceUrlPatterns === undefined &&
-          (config.disabledResources[vendorId.toLowerCase()]?.length ?? 0) > 0) ||
-        normalizedResourceUrlPatterns?.some(pattern =>
-          isResourceDisabled(config, vendorId, pattern))) {
-      throw new Error(
-          "This authorization flow includes a resource disabled by an administrator. Start it " +
-          "again using only currently enabled resources.");
+    try {
+      await this.assertRequestedGrantAvailable(vendorId, normalizedResourceUrlPatterns);
+    } catch (error) {
+      this.rejectPendingConnectionAttempt(attempt);
+      throw error;
     }
     logger.info("account connect started", {
       event: "account.connect.started", vendorId, accountId,
@@ -1625,17 +1705,63 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
           "This account still grants a resource disabled by an administrator. Replace the " +
           "provider grant before adding more resources.");
     }
-    let result = await record.account.ensureResources(normalized ?? []);
+    let result: {url?: string};
+    try {
+      result = await record.account.ensureResources(normalized ?? []);
+    } catch {
+      // Provider rejections can carry account/resource data. Observe a fresh local policy before
+      // deciding what can cross this boundary, and otherwise return only a fixed local error.
+      record = this.requireAccountIncarnation(accountId, vendorId, generation);
+      config = await this.readAuthorityConfig();
+      record = this.requireAccountIncarnation(accountId, vendorId, generation);
+      if (isGatekeeperDisabled(config, vendorId) ||
+          accountGrantIncludesDisabledResource(
+              config, vendorId, record.description.grantedResourceUrlPatterns) ||
+          normalized?.some(pattern => isResourceDisabled(config, vendorId, pattern))) {
+        throw new Error(
+            "This resource authorization was disabled by an administrator while it was starting.");
+      }
+      logger.warn("account resource expansion provider rejected", {
+        event: "account.resources.ensure.rejected", vendorId, accountId,
+      });
+      throw new Error("The authorization provider could not update this connection.");
+    }
+    record = this.requireAccountIncarnation(accountId, vendorId, generation);
+
+    // Do not trust the cached pre-call description as proof of the provider's current grant. The
+    // provider may apply scopes immediately or may return an OAuth URL for a later callback; either
+    // way a fresh description is the only safe postcondition we can verify here.
+    let freshDescription: AccountDescription;
+    try {
+      freshDescription = await record.account.describe();
+    } catch {
+      record = this.requireAccountIncarnation(accountId, vendorId, generation);
+      config = await this.readAuthorityConfig();
+      record = this.requireAccountIncarnation(accountId, vendorId, generation);
+      if (isGatekeeperDisabled(config, vendorId) ||
+          accountGrantIncludesDisabledResource(
+              config, vendorId, record.description.grantedResourceUrlPatterns) ||
+          normalized?.some(pattern => isResourceDisabled(config, vendorId, pattern))) {
+        throw new Error(
+            "This resource authorization was disabled by an administrator while it was starting.");
+      }
+      logger.warn("expanded account grant description failed", {
+        event: "account.resources.describe.failed", vendorId, accountId,
+      });
+      throw new Error("The authorization provider could not verify this connection.");
+    }
     record = this.requireAccountIncarnation(accountId, vendorId, generation);
     config = await this.readAuthorityConfig();
     record = this.requireAccountIncarnation(accountId, vendorId, generation);
     if (isGatekeeperDisabled(config, vendorId) ||
         accountGrantIncludesDisabledResource(
-            config, vendorId, record.description.grantedResourceUrlPatterns) ||
+            config, vendorId, freshDescription.grantedResourceUrlPatterns) ||
         normalized?.some(pattern => isResourceDisabled(config, vendorId, pattern))) {
       throw new Error(
           "This resource authorization was disabled by an administrator while it was starting.");
     }
+    record.description = freshDescription;
+    this.storage.connectedAccounts.put(record);
     return result;
   }
 
@@ -1990,21 +2116,60 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       accountId: number,
       account: Fetcher<GatekeeperUser>,
       vendorId: string,
+      connectionAttemptId: string,
+      connectionAttemptGeneration: number,
       resourceUrlPatterns: string[] | undefined,
       expiresAt?: Date): Promise<void> {
+    let attempt = this.requireConnectionAttempt(
+        accountId, connectionAttemptId, connectionAttemptGeneration,
+        vendorId, resourceUrlPatterns);
     // This check intentionally precedes account.describe(): a callback that was opened before a
     // whole-vendor/resource disable must not initiate provider reads from an already-forbidden
-    // authorization flow. putConnectedAccount() re-checks the actual returned grant afterwards.
-    await this.assertRequestedGrantAvailable(vendorId, resourceUrlPatterns);
-    let description = await account.describe();
-    await this.putConnectedAccount({
-      id: accountId,
-      account,
-      description,
-      vendorId,
-      accountGeneration: 0,
-      credentialExpiresAt: expiresAt,
-    });
+    // authorization flow. Claim the persisted attempt after that await and before provider I/O so
+    // concurrent/replayed callbacks cannot both cross the side-effect boundary.
+    try {
+      await this.assertRequestedGrantAvailable(vendorId, resourceUrlPatterns);
+    } catch (error) {
+      this.rejectPendingConnectionAttempt(attempt);
+      throw error;
+    }
+    attempt = this.requireConnectionAttempt(
+        accountId, connectionAttemptId, connectionAttemptGeneration,
+        vendorId, resourceUrlPatterns);
+    this.storage.connectionAttempts.put({...attempt, state: "completing"});
+
+    try {
+      let description: AccountDescription;
+      try {
+        description = await account.describe();
+      } catch {
+        // Re-check the local policy after both provider success and rejection. Provider errors can
+        // contain account/resource data and are never forwarded across this callback boundary.
+        await this.assertRequestedGrantAvailable(vendorId, resourceUrlPatterns);
+        logger.warn("connected account description failed", {
+          event: "account.connect.description.failed", vendorId, accountId,
+        });
+        throw new Error("The authorization provider could not finish this connection.");
+      }
+      this.requireConnectionAttempt(
+          accountId, connectionAttemptId, connectionAttemptGeneration,
+          vendorId, resourceUrlPatterns, "completing");
+      await this.putConnectedAccount({
+        id: accountId,
+        account,
+        description,
+        vendorId,
+        accountGeneration: 0,
+        credentialExpiresAt: expiresAt,
+      });
+      this.requireConnectionAttempt(
+          accountId, connectionAttemptId, connectionAttemptGeneration,
+          vendorId, resourceUrlPatterns, "completing");
+      this.finishConnectionAttempt(attempt, "completed");
+    } catch (error) {
+      this.finishConnectionAttempt(attempt, "rejected");
+      throw error;
+    }
   }
 
   async putConnectedAccount(record: ConnectedAccountRecord) {
@@ -2028,7 +2193,27 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       // OAuth providers often return the currently logged-in identity when the user tries to add
       // another account. Avoid showing duplicate account rows: keep the existing record stable for
       // any UI references, and revoke the newly-created duplicate grant.
-      await record.account.revoke();
+      try {
+        await record.account.revoke();
+      } catch {
+        config = await this.readAuthorityConfig();
+        if (isGatekeeperDisabled(config, record.vendorId) ||
+            accountGrantIncludesDisabledResource(
+                config, record.vendorId, record.description.grantedResourceUrlPatterns)) {
+          throw new Error("This connection is no longer available.");
+        }
+        logger.warn("duplicate connected account revoke failed", {
+          event: "account.connect.duplicate.revoke.failed",
+          vendorId: record.vendorId, accountId: record.id,
+        });
+        throw new Error("The authorization provider could not finish this connection.");
+      }
+      config = await this.readAuthorityConfig();
+      if (isGatekeeperDisabled(config, record.vendorId) ||
+          accountGrantIncludesDisabledResource(
+              config, record.vendorId, record.description.grantedResourceUrlPatterns)) {
+        throw new Error("This connection is no longer available.");
+      }
       return;
     }
 
@@ -2196,6 +2381,8 @@ type GatekeeperConnectCallbackProps = {
   accountId: number;
   vendorId: string;
   accountGeneration?: number;
+  connectionAttemptId?: string;
+  connectionAttemptGeneration?: number;
   resourceUrlPatterns?: string[];
 }
 
@@ -2208,11 +2395,19 @@ export class GatekeeperConnectCallbackImpl
   }
 
   async complete(account: Fetcher<GatekeeperUser>, expiresAt?: Date): Promise<void> {
+    if (this.ctx.props.connectionAttemptId === undefined ||
+        this.ctx.props.connectionAttemptGeneration === undefined) {
+      // Fail closed for callbacks minted before durable one-shot attempts were introduced. Those
+      // flows must be restarted; accepting them would recreate the replay window.
+      throw new Error("This authorization attempt has expired. Start a new connection.");
+    }
     let userStub = this.#getUserStub();
     await userStub.completeConnectedAccount(
         this.ctx.props.accountId,
         account,
         this.ctx.props.vendorId,
+        this.ctx.props.connectionAttemptId,
+        this.ctx.props.connectionAttemptGeneration,
         this.ctx.props.resourceUrlPatterns,
         expiresAt);
   }

@@ -706,7 +706,8 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
 
     let email = this.accessPayload.email as string;
     let userId = this.users.idFromName(email);
-    let signupsEnabled = (await readAdminConfigForAuthority(this.env)).signupsEnabled;
+    let signupsEnabled =
+      (await readAdminConfigForAuthority(this.ctx.exports.AdminSettings)).signupsEnabled;
     let accountCreated =
         await this.users.get(userId).authenticateFromCfAccess(email, signupsEnabled);
     if (accountCreated) {
@@ -755,7 +756,7 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     if (!isPasswordAuthEnabled(this.env)) {
       throw new Error("Password signup is disabled on this deployment. Use a sign-in option.");
     }
-    if (!(await readAdminConfigForAuthority(this.env)).signupsEnabled) {
+    if (!(await readAdminConfigForAuthority(this.ctx.exports.AdminSettings)).signupsEnabled) {
       throw new Error("New signups are currently disabled on this deployment.");
     }
 

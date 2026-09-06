@@ -1,10 +1,9 @@
 import {describe, expect, it, vi} from "vitest";
 import {env} from "cloudflare:workers";
-import {runInDurableObject} from "cloudflare:test";
+import {abortAllDurableObjects, runInDurableObject} from "cloudflare:test";
 import {
-  AdminConfig, DEFAULT_ADMIN_CONFIG, serializeAdminConfig,
+  AdminConfig, DEFAULT_ADMIN_CONFIG,
 } from "../src/admin-config.js";
-import {ADMIN_CONFIG_KEY} from "../src/blueprint-archive.js";
 import {UserDurableObject} from "../src/user.js";
 
 declare module "cloudflare:workers" {
@@ -88,11 +87,17 @@ function makeUser() {
   let currentRecord: typeof connectedRecord | Record<string, unknown> | undefined = connectedRecord;
   let putConnectedAccount = vi.fn();
   let deleteConnectedAccount = vi.fn();
+  let connectionAttempts = new Map<number, Record<string, unknown>>();
+  let putConnectionAttempt = vi.fn((attempt: Record<string, unknown>) => {
+    connectionAttempts.set(attempt.accountId as number, attempt);
+  });
+  let callbackProps: Record<string, unknown> | undefined;
+  let getAdminConfig = vi.fn(async () => activeConfig as AdminConfig);
+  let adminSettings = {getByName: () => ({getAdminConfig})};
   let user = Object.create(UserDurableObject.prototype) as UserDurableObject;
   Object.assign(user, {
-    env: {BLUEPRINTS: {get: async () => typeof activeConfig === "string"
-      ? activeConfig
-      : serializeAdminConfig(activeConfig)}},
+    env: {},
+    adminSettings,
     vendors: new Map([["google", {
       getSupportedResources: getVendorSupportedResources,
       connectAccount,
@@ -100,6 +105,11 @@ function makeUser() {
     storage: {
       profile: {get: () => ({id: "user@example.com"})},
       nextAccountId: {get: () => 4, put: vi.fn()},
+      nextConnectionAttemptGeneration: {get: () => 12, put: vi.fn()},
+      connectionAttempts: {
+        get: (accountId: number) => connectionAttempts.get(accountId),
+        put: putConnectionAttempt,
+      },
       connectedAccounts: {
         get: () => currentRecord,
         put: putConnectedAccount,
@@ -108,7 +118,10 @@ function makeUser() {
     },
     ctx: {
       id: {toString: () => "user-do-id"},
-      exports: {GatekeeperConnectCallbackImpl: ({props}: {props: object}) => props},
+      exports: {GatekeeperConnectCallbackImpl: ({props}: {props: Record<string, unknown>}) => {
+        callbackProps = props;
+        return props;
+      }},
     },
   });
   return {
@@ -119,6 +132,7 @@ function makeUser() {
     reconnect,
     describeAccount,
     putConnectedAccount,
+    putConnectionAttempt,
     deleteConnectedAccount,
     connectedRecord,
     listCalendars,
@@ -129,6 +143,23 @@ function makeUser() {
     startAppUi,
     getVendorSupportedResources,
     getAccountSupportedResources,
+    getCallbackProps() {
+      return callbackProps;
+    },
+    seedConnectionAttempt(
+        accountId: number, vendorId = "google", resourceUrlPatterns?: string[]) {
+      let attempt = {
+        accountId,
+        attemptId: `attempt-${accountId}`,
+        generation: 19,
+        vendorId,
+        resourceUrlPatterns,
+        state: "pending",
+        createdAt: new Date(),
+      };
+      connectionAttempts.set(accountId, attempt);
+      return attempt;
+    },
     setConfig(config: AdminConfig) {
       activeConfig = config;
     },
@@ -184,7 +215,9 @@ describe("UserDurableObject resource policy", () => {
   });
 
   it("does not return an authorization URL disabled while the provider minted it", async () => {
-    let {user, connectAccount, setConfig} = makeUser();
+    let {
+      user, connectAccount, describeAccount, getCallbackProps, setConfig,
+    } = makeUser();
     setConfig(DEFAULT_ADMIN_CONFIG);
     connectAccount.mockImplementationOnce(async () => {
       setConfig({...DEFAULT_ADMIN_CONFIG, disabledResources: {google: [CALENDAR_PATTERN]}});
@@ -193,6 +226,17 @@ describe("UserDurableObject resource policy", () => {
 
     await expect(user.connectAccount("google")).rejects.toThrow(/disabled/);
     expect(connectAccount).toHaveBeenCalledTimes(1);
+
+    let props = getCallbackProps()!;
+    await expect(user.completeConnectedAccount(
+        props.accountId as number,
+        {describe: describeAccount} as any,
+        props.vendorId as string,
+        props.connectionAttemptId as string,
+        props.connectionAttemptGeneration as number,
+        props.resourceUrlPatterns as string[] | undefined))
+        .rejects.toThrow(/no longer valid/);
+    expect(describeAccount).not.toHaveBeenCalled();
   });
 
   it("rejects disabled resource expansion and configurator entry", async () => {
@@ -269,6 +313,38 @@ describe("UserDurableObject resource policy", () => {
 
     await expect(user.ensureAccountResources(3, [CALENDAR_PATTERN])).rejects.toThrow(/disabled/);
     expect(ensureResources).toHaveBeenCalledTimes(1);
+  });
+
+  it("checks the provider's fresh grant after resource expansion", async () => {
+    let {
+      user, ensureResources, describeAccount, connectedRecord,
+    } = makeUser();
+    connectedRecord.description.grantedResourceUrlPatterns = [GMAIL_PATTERN];
+
+    await expect(user.ensureAccountResources(3, [GMAIL_PATTERN]))
+        .rejects.toThrow(/disabled/);
+    expect(ensureResources).toHaveBeenCalledTimes(1);
+    expect(describeAccount).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not expose a provider error when the fresh expanded grant cannot be described", async () => {
+    let {
+      user, describeAccount, connectedRecord, setConfig,
+    } = makeUser();
+    setConfig(DEFAULT_ADMIN_CONFIG);
+    connectedRecord.description.grantedResourceUrlPatterns = [GMAIL_PATTERN];
+    describeAccount.mockRejectedValueOnce(
+        Object.assign(new Error("private provider account"), {privateData: "secret"}));
+
+    let caught: any;
+    try {
+      await user.ensureAccountResources(3, [GMAIL_PATTERN]);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught.message).toBe("The authorization provider could not verify this connection.");
+    expect(caught.privateData).toBeUndefined();
   });
 
   it("rejects an unknown resource configurator before forwarding it", async () => {
@@ -358,14 +434,85 @@ describe("UserDurableObject resource policy", () => {
   });
 
   it("preflights an old OAuth callback before describing its provider account", async () => {
-    let {user, connectedRecord, describeAccount, putConnectedAccount, setConfig} = makeUser();
+    let {
+      user, connectedRecord, describeAccount, putConnectedAccount, setConfig,
+      seedConnectionAttempt,
+    } = makeUser();
     setConfig({...DEFAULT_ADMIN_CONFIG, disabledGatekeepers: ["google"]});
+    let attempt = seedConnectionAttempt(7);
 
     await expect(user.completeConnectedAccount(
-        7, connectedRecord.account as any, "google", undefined))
+        7, connectedRecord.account as any, "google",
+        attempt.attemptId, attempt.generation, undefined))
         .rejects.toThrow(/disabled/);
     expect(describeAccount).not.toHaveBeenCalled();
     expect(putConnectedAccount).not.toHaveBeenCalled();
+
+    // A rejected callback is tombstoned; re-enabling later cannot resurrect the old OAuth flow.
+    setConfig(DEFAULT_ADMIN_CONFIG);
+    await expect(user.completeConnectedAccount(
+        7, connectedRecord.account as any, "google",
+        attempt.attemptId, attempt.generation, undefined))
+        .rejects.toThrow(/no longer valid/);
+    expect(describeAccount).not.toHaveBeenCalled();
+  });
+
+  it("claims a durable OAuth attempt exactly once across concurrent callback replays", async () => {
+    let {
+      user, connectedRecord, describeAccount, putConnectedAccount, setConfig,
+      seedConnectionAttempt,
+    } = makeUser();
+    setConfig(DEFAULT_ADMIN_CONFIG);
+    let attempt = seedConnectionAttempt(7);
+    let releaseDescription!: () => void;
+    let descriptionEntered!: () => void;
+    let entered = new Promise<void>(resolve => { descriptionEntered = resolve; });
+    describeAccount.mockImplementationOnce(async () => {
+      descriptionEntered();
+      await new Promise<void>(resolve => { releaseDescription = resolve; });
+      return {grantedResourceUrlPatterns: [GMAIL_PATTERN]};
+    });
+
+    let first = user.completeConnectedAccount(
+        7, connectedRecord.account as any, "google",
+        attempt.attemptId, attempt.generation, undefined);
+    await entered;
+    await expect(user.completeConnectedAccount(
+        7, connectedRecord.account as any, "google",
+        attempt.attemptId, attempt.generation, undefined))
+        .rejects.toThrow(/no longer valid/);
+    releaseDescription();
+
+    await expect(first).resolves.toBeUndefined();
+    expect(describeAccount).toHaveBeenCalledTimes(1);
+    expect(putConnectedAccount).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a terminal OAuth attempt tombstone across a Durable Object restart", async () => {
+    let objectName = "oauth-tombstone-" + crypto.randomUUID();
+    let stub = env.TEST_USER.getByName(objectName);
+    await runInDurableObject(stub, (user: UserDurableObject) => {
+      (user as any).storage.connectionAttempts.put({
+        accountId: 41,
+        attemptId: "completed-attempt",
+        generation: 8,
+        vendorId: "google",
+        state: "completed",
+        createdAt: new Date(),
+        completedAt: new Date(),
+      });
+    });
+    await abortAllDurableObjects();
+    stub = env.TEST_USER.getByName(objectName);
+
+    let describeAccount = vi.fn();
+    await runInDurableObject(stub, async (user: UserDurableObject) => {
+      await expect(user.completeConnectedAccount(
+          41, {describe: describeAccount} as any, "google",
+          "completed-attempt", 8, undefined))
+          .rejects.toThrow(/no longer valid/);
+    });
+    expect(describeAccount).not.toHaveBeenCalled();
   });
 
   it("re-checks policy after reconnect discovery before restoring credentials", async () => {
@@ -481,12 +628,12 @@ describe("UserDurableObject ambient provisioning policy", () => {
       disabledGatekeepers: ["library"],
       ambientGatekeeperModes: {library: "optional" as const},
     };
-    await env.BLUEPRINTS.put(ADMIN_CONFIG_KEY, serializeAdminConfig(config));
     let stub = env.TEST_USER.getByName("ambient-disabled-" + crypto.randomUUID());
     await runInDurableObject(stub, async (user: UserDurableObject) => {
       let describeVendor = vi.fn();
       let createAccount = vi.fn();
       Object.assign(user, {
+        adminSettings: {getByName: () => ({getAdminConfig: async () => config})},
         vendors: new Map([["library", {describe: describeVendor, createAccount}]]),
       });
 
@@ -501,16 +648,16 @@ describe("UserDurableObject ambient provisioning policy", () => {
       ...DEFAULT_ADMIN_CONFIG,
       ambientGatekeeperModes: {library: "enabled" as const},
     };
-    await env.BLUEPRINTS.put(ADMIN_CONFIG_KEY, serializeAdminConfig(enabled));
     let stub = env.TEST_USER.getByName("ambient-mode-race-" + crypto.randomUUID());
     await runInDurableObject(stub, async (user: UserDurableObject) => {
+      let activeConfig: AdminConfig = enabled;
       let describeAccount = vi.fn();
       let revoke = vi.fn(async () => {});
       let createAccount = vi.fn(async () => {
-        await env.BLUEPRINTS.put(ADMIN_CONFIG_KEY, serializeAdminConfig({
+        activeConfig = {
           ...DEFAULT_ADMIN_CONFIG,
           ambientGatekeeperModes: {library: "optional"},
-        }));
+        };
         return {describe: describeAccount, revoke};
       });
       let describeVendor = vi.fn(async () => ({
@@ -519,6 +666,7 @@ describe("UserDurableObject ambient provisioning policy", () => {
         autoProvisionsAccount: true,
       }));
       Object.assign(user, {
+        adminSettings: {getByName: () => ({getAdminConfig: async () => activeConfig})},
         vendors: new Map([["library", {describe: describeVendor, createAccount}]]),
       });
 

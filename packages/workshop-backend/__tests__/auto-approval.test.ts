@@ -156,6 +156,31 @@ describe("AutoApprovalDrainer.drain", () => {
     expect(getAction(storage, 3).state).toBe("approved");
   });
 
+  it("never retries or skips past an action with an ambiguous earlier approval", async () => {
+    let storage = makeStorage();
+    enableRule(storage);
+    putAction(storage, 1);
+    putAction(storage, 2);
+    let first = getAction(storage, 1);
+    first.resolutionAttempt = {
+      attemptId: "failed-attempt",
+      decision: "approve",
+      phase: "failed",
+      startedAt: new Date(0),
+      failedAt: new Date(1),
+      resolvedBy: ENABLER,
+      autoApproved: true,
+    };
+    storage.actions.put(first);
+
+    let {applyFn, calls} = makeImmediateApply(storage);
+    await new AutoApprovalDrainer(storage, applyFn).drain(GK);
+
+    expect(calls).toEqual([]);
+    expect(getAction(storage, 1).state).toBe("pending");
+    expect(getAction(storage, 2).state).toBe("pending");
+  });
+
   // Two concurrent drains for the same gatekeeper must not double-apply. The input gate is open
   // across the apply await, so without the single-flight guard the second drain's pending re-check
   // would see the still-"pending" record and apply it again.

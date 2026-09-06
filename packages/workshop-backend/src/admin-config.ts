@@ -12,8 +12,15 @@
 import { AmbientGatekeeperMode, BannerConfig, BlueprintBinding, BlueprintMetadata, BlueprintOutput, DEFAULT_BANNER_COLOR, GatekeeperCreationSpec, OutputFormatOffer, isAmbientGatekeeperMode, isBannerColor, isOutputIcon } from "@gadgets/workshop-shared/api";
 import { SupportedResource, matchesResourceUrlPattern } from "@gadgets/workshop-shared/gatekeeper";
 import { ADMIN_CONFIG_KEY, BlueprintKvEnv, readBlueprintKvRecord, sanitizeBlueprintOutput } from "./blueprint-archive.js";
+import type { AdminSettings } from "./admin-settings.js";
 
 export type AdminConfig = {
+  /**
+   * Monotonic revision of the authoritative policy record. AdminSettings increments this for every
+   * committed mutation; callers use the Durable Object record, rather than the eventually-consistent
+   * KV presentation mirror, at every positive-authority boundary.
+   */
+  revision: number;
   /**
    * Whether new account signups are allowed (default true). Note: this is an access toggle, not
    * authentication config — which auth providers exist and whether password login is on stay
@@ -81,6 +88,7 @@ export type FormatCuration = {
 };
 
 export const DEFAULT_ADMIN_CONFIG: AdminConfig = {
+  revision: 0,
   signupsEnabled: true,
   siteName: "",
   siteLogoConfigured: false,
@@ -301,6 +309,7 @@ function normalizeAdminConfig(p: Partial<AdminConfig>): AdminConfig {
       }
     }
   return {
+    revision: Number.isSafeInteger(p.revision) && (p.revision ?? -1) >= 0 ? p.revision! : 0,
     signupsEnabled: typeof p.signupsEnabled === "boolean" ? p.signupsEnabled : true,
     siteName: typeof p.siteName === "string" ? p.siteName : "",
     siteLogoConfigured: typeof p.siteLogoConfigured === "boolean" ? p.siteLogoConfigured : false,
@@ -328,10 +337,9 @@ export function parseAdminConfig(raw: string | null): AdminConfig {
 }
 
 /**
- * Parse the KV copy used at authority-bearing call sites. Missing KV is the valid first-deploy
- * default, but a present malformed policy must not silently turn every disabled integration back
- * on. The admin UI reads the authoritative typed Durable Object record, so throwing here does not
- * remove the recovery path: a subsequent admin write repairs the mirror.
+ * Strictly parse a policy record used at an authority-bearing call site. Missing input represents
+ * the valid first-deploy default; a present malformed record must not silently turn every disabled
+ * integration back on. AdminSettings uses the same parser for its persisted singleton record.
  */
 export function parseAdminConfigForAuthority(raw: string | null): AdminConfig {
   if (raw === null) return { ...DEFAULT_ADMIN_CONFIG };
@@ -347,6 +355,10 @@ export function parseAdminConfigForAuthority(raw: string | null): AdminConfig {
   }
 
   let policy = parsed as Record<string, unknown>;
+  if ("revision" in policy &&
+      (!Number.isSafeInteger(policy.revision) || (policy.revision as number) < 0)) {
+    throw new Error("The deployment policy revision is malformed.");
+  }
   if ("signupsEnabled" in policy && typeof policy.signupsEnabled !== "boolean") {
     throw new Error("The deployment signup policy is malformed.");
   }
@@ -384,11 +396,18 @@ export async function readAdminConfig(env: Cloudflare.Env): Promise<AdminConfig>
 }
 
 /**
- * Read the same mirror for an authority-bearing operation. Unlike presentation reads, a present
- * malformed record fails closed so corruption cannot silently re-enable every integration.
+ * Read the strongly-consistent deployment policy used for positive authority. Workers KV remains
+ * a presentation/discovery mirror only: a successful KV write does not make an admin disable
+ * immediately visible in every location, and a cached missing lookup cannot distinguish a first
+ * deploy from a lost mirror. The singleton Durable Object is the sole authority and fails closed if
+ * its RPC is unavailable.
  */
-export async function readAdminConfigForAuthority(env: Cloudflare.Env): Promise<AdminConfig> {
-  return parseAdminConfigForAuthority(await env.BLUEPRINTS.get(ADMIN_CONFIG_KEY));
+export async function readAdminConfigForAuthority(
+    adminSettings: DurableObjectNamespace<AdminSettings>): Promise<AdminConfig> {
+  let config = await adminSettings.getByName("").getAdminConfig();
+  // The value is typed, but persisted records can predate fields and can be corrupt independently
+  // of TypeScript. Round-trip through the strict parser before it grants authority.
+  return parseAdminConfigForAuthority(serializeAdminConfig(config));
 }
 
 // --- Resource-disable helpers ---

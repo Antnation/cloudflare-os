@@ -152,6 +152,34 @@ describe("slash command helpers", () => {
     enabled = false;
     release({message: "private provider result"});
 
-    await expect(pending).rejects.toThrow(/Calendar is disabled/);
+    await expect(pending).rejects.toThrow("Slash command is no longer available.");
+  });
+
+  it("does not release a provider rejection when its resource is disabled in flight", async () => {
+    let reject!: (error: Error) => void;
+    let value = gatekeeper({
+      invoke: () => new Promise<SlashCommandResult>((_resolve, rejectPromise) => {
+        reject = rejectPromise;
+      }),
+    });
+    let enabled = true;
+    let pending = overseerTestInternals.invokeSlashCommandWithRevalidation(
+        value as never,
+        {id: {gatekeeperId: 1, commandId: "deploy"}, args: "production"},
+        {} as never,
+        async () => { if (!enabled) throw new Error("secret policy detail"); });
+    await vi.waitFor(() => expect(reject).toBeDefined());
+    enabled = false;
+    reject(Object.assign(new Error("private provider rejection"), {privateData: "secret"}));
+
+    let caught: any;
+    try {
+      await pending;
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught.message).toBe("Slash command is no longer available.");
+    expect(caught.privateData).toBeUndefined();
   });
 });

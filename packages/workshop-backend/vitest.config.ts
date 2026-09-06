@@ -15,9 +15,10 @@ export default defineConfig({
       main: './src/server.ts',
       miniflare: {
         compatibilityDate: '2026-02-02',
-        compatibilityFlags: ['experimental', 'nodejs_compat'],
+        compatibilityFlags: ['experimental', 'enhanced_error_serialization', 'nodejs_compat'],
         kvNamespaces: ['BLUEPRINTS'],
         durableObjects: {
+          TEST_ADMIN: { className: 'AdminSettings', useSQLite: true },
           TEST_OVERSEER: { className: 'OverseerDurableObject', useSQLite: true },
           TEST_USER: { className: 'UserDurableObject', useSQLite: true },
         },

@@ -1,7 +1,7 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, CodeUpdate, CodeSubscriber, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName } from '@gadgets/workshop-shared/api';
-import { Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, ActionKind } from "@gadgets/workshop-shared/gatekeeper";
+import { Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ActionRejectionResult, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, ActionKind } from "@gadgets/workshop-shared/gatekeeper";
 import {
   DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub,
   RpcTarget as NativeRpcTarget, restore,
@@ -64,6 +64,15 @@ import {
 import {makeRevalidatingRpcStub} from "./revalidating-rpc";
 
 const logger = createWorkshopLogger("workshop.overseer");
+
+const ACTION_APPROVAL_FAILED_MESSAGE =
+    "The provider could not confirm whether this action was applied. It will not be retried " +
+    "automatically; verify the target service, then deny the staged action.";
+const ACTION_REJECTION_FAILED_MESSAGE =
+    "The provider could not confirm that the staged action was discarded. Try denying it again.";
+const ACTION_POLICY_CHANGED_MESSAGE =
+    "The connection became unavailable while this action was being resolved. The provider " +
+    "outcome was not accepted; verify the target service, then deny the staged action.";
 export const AGENT_RUNNING_ERROR_MESSAGE = "Agent is running, wait for it to finish.";
 
 let CODE_MODE_HARNESS =
@@ -517,6 +526,22 @@ type ChatAttachmentContentRecord = {
 // the gatekeeper, so no lookup is ever attempted.
 const BUILTIN_TOOL_GATEKEEPER_ID = -1;
 
+// Durable claim around a pending action's externally-visible resolution. The action remains
+// client-visible as `pending` while the claim is in progress or failed, but the claim prevents a
+// second request from dispatching the same write while the Durable Object input gate is open. An
+// interrupted approval is never retried: most providers cannot prove whether the first write
+// landed. Rejection is a reduction of authority and is explicitly idempotent in the Gatekeeper
+// contract, so a failed rejection can be attempted again.
+type ActionResolutionAttempt = {
+  attemptId: string;
+  decision: "approve" | "reject";
+  phase: "resolving" | "failed";
+  startedAt: Date;
+  failedAt?: Date;
+  resolvedBy: AiChatAuthorInfo;
+  autoApproved: boolean;
+};
+
 export type ActionRecord = {
   id: number,
   gatekeeperId: WorkpieceId;
@@ -538,6 +563,7 @@ export type ActionRecord = {
   description: ActionDescription;
   resolvedBy?: AiChatAuthorInfo;  // set when resolved (approved/rejected); absent while pending (or legacy)
   autoApproved?: boolean;         // set when applied by an auto-approval rule rather than a human
+  resolutionAttempt?: ActionResolutionAttempt;
 } | {
   type: "observation";
   description: ObservationDescription;
@@ -560,6 +586,8 @@ export type ActionRecord = {
   enabled: boolean;
 });
 
+type HookDesiredState = "enabled" | "disabled" | "deleted";
+
 type BoundHookRecord = {
   id: number;
   actionId: number;
@@ -575,7 +603,46 @@ type BoundHookRecord = {
   controller: Fetcher<HookController<RpcTarget>>;
   callback: NativeRpcStub<RpcTarget>;
   description: HookDescription;
+
+  /** Whether the current generation is allowed to deliver callbacks. */
   enabled: boolean;
+
+  /**
+   * The durable target for provider reconciliation. Absent on legacy records, where `enabled`
+   * remains the source of truth until the first transition.
+   */
+  desiredState?: HookDesiredState;
+
+  /** Monotonic incarnation of the provider-side initiator. Absent legacy records are generation 0. */
+  generation?: number;
+
+  /**
+   * True after intent is persisted and until the corresponding provider RPC has been confirmed.
+   * A new Durable Object instance retries these records, making crash recovery idempotent.
+   */
+  transitionPending?: boolean;
+};
+
+function hookDesiredState(record: BoundHookRecord): HookDesiredState {
+  return record.desiredState ?? (record.enabled ? "enabled" : "disabled");
+}
+
+function hookGeneration(record: BoundHookRecord): number {
+  return record.generation ?? 0;
+}
+
+function nextHookGeneration(record: BoundHookRecord): number {
+  let generation = hookGeneration(record);
+  if (generation >= Number.MAX_SAFE_INTEGER) {
+    throw new Error("Hook generation exhausted.");
+  }
+  return generation + 1;
+}
+
+type HookTransition = {
+  generation: number;
+  desiredState: HookDesiredState;
+  promise: Promise<void>;
 };
 
 type ChatDraftUpdateRecord = {
@@ -1071,10 +1138,30 @@ async function invokeSlashCommandWithRevalidation(
     request: Parameters<typeof invokeSlashCommand>[1],
     authorizer: Parameters<typeof invokeSlashCommand>[2],
     revalidate: () => Promise<void>): ReturnType<typeof invokeSlashCommand> {
-  let result = await invokeSlashCommand(gatekeeper, request, authorizer);
+  let result: Awaited<ReturnType<typeof invokeSlashCommand>>;
+  try {
+    result = await invokeSlashCommand(gatekeeper, request, authorizer);
+  } catch {
+    // A provider rejection is an outcome too and may contain resource-derived data. Revalidate
+    // before crossing the boundary, suppress both provider and policy details, and log only on the
+    // enabled path where this really was a provider failure.
+    try {
+      await revalidate();
+    } catch {
+      throw new Error("Slash command is no longer available.");
+    }
+    logger.warn("slash command provider rejected", {
+      event: "slash.command.provider.rejected",
+    });
+    throw new Error("Slash command provider failed.");
+  }
   // Provider execution releases the input gate. Do not commit its message or skill after the
   // backing resource was disabled, replaced, or removed while the command was in flight.
-  await revalidate();
+  try {
+    await revalidate();
+  } catch {
+    throw new Error("Slash command is no longer available.");
+  }
   return result;
 }
 
@@ -1139,7 +1226,6 @@ class OverseerImpl implements AgentHooks {
 
   // Coalesce only overlapping authority reads. The promise is forgotten as soon as it settles so
   // later calls always observe a fresh deployment policy revision.
-  private authorityConfigRead?: Promise<AdminConfig>;
 
   // Tracks the size of the most-recent snapshot, and the size of all incremental updates since,
   // in order to help decide when to make a new snapshot.
@@ -1152,6 +1238,10 @@ class OverseerImpl implements AgentHooks {
   #autoApprovalDrainer: AutoApprovalDrainer;
 
   #preparingChatMessages = new Map<number, Promise<void>>();
+
+  // Provider-side hook mutations are serialized per hook. Intent and generation live in storage;
+  // this map only prevents two RPCs from overtaking each other in one Durable Object incarnation.
+  private hookTransitions = new Map<number, HookTransition>();
 
   // Set of chatIds that currently have a running agent turn. Used to manage the DO alarm (held
   // while any agent runs) and to let `alarm()` wait for all agents to finish.
@@ -1433,12 +1523,27 @@ class OverseerImpl implements AgentHooks {
     // agent-turn restoration below, hook deliveries, and [restore]()-based persistent callbacks.
     // The migration is fully synchronous, so nothing can observe pre-migration state.
     this.#migrateStorage();
+    this.#failInterruptedActionResolutions();
     this.defaultGadgetId = this.storage.defaultGadgetId.get();
 
     this.#autoApprovalDrainer = new AutoApprovalDrainer(
         this.storage,
         (record, resolvedBy, autoApproved) =>
             this.applyPendingAction(record, resolvedBy, autoApproved));
+
+    // Provider RPCs can land immediately before a Durable Object restart. Intent is already
+    // durable at that point, so replay any unconfirmed transition. HookController.enable replaces
+    // its prior initiator and disable is permanent, making both recovery calls idempotent.
+    for (let record of Array.from(this.storage.boundHooks.list())) {
+      if (!record.transitionPending) continue;
+      ctx.waitUntil(this.resumeHookTransition(record).catch(error => {
+        this.logger.warn("failed to recover a pending hook transition", {
+          event: "gatekeeper.hook.transition.recover.failed",
+          gatekeeperId: record.gatekeeperId,
+          error,
+        });
+      }));
+    }
 
     // Mirror every gadget-registry change into the owner's outputs index. Subscribing here makes
     // the registry the single chokepoint, so creation, acceptance, renaming, reverting and
@@ -1484,15 +1589,9 @@ class OverseerImpl implements AgentHooks {
   }
 
   readAuthorityConfig(): Promise<AdminConfig> {
-    let existing = this.authorityConfigRead;
-    if (existing) return existing;
-
-    let read = readAdminConfigForAuthority(this.env);
-    let tracked = read.finally(() => {
-      if (this.authorityConfigRead === tracked) this.authorityConfigRead = undefined;
-    });
-    this.authorityConfigRead = tracked;
-    return tracked;
+    // Do not share even concurrent positive-authority reads. Each boundary must observe the latest
+    // monotonic policy revision from the singleton AdminSettings Durable Object.
+    return readAdminConfigForAuthority(this.ctx.exports.AdminSettings);
   }
 
   // =======================================================================================
@@ -1958,24 +2057,279 @@ class OverseerImpl implements AgentHooks {
     this.ctx.facets.delete(facetName);
   }
 
-  // Disable (if needed) and delete a bound hook, updating its action-log record to match.
+  private updateHookAction(record: BoundHookRecord, enabled: boolean, deleted = false): void {
+    let actionRecord = this.storage.actions.get(record.actionId);
+    if (actionRecord?.type !== "bindHook") return;
+    actionRecord.enabled = enabled;
+    if (deleted) delete actionRecord.hookId;
+    this.storage.actions.put(actionRecord);
+  }
+
+  private persistHookIntent(
+      record: BoundHookRecord, desiredState: HookDesiredState, generation: number): void {
+    record.enabled = false;
+    record.desiredState = desiredState;
+    record.generation = generation;
+    record.transitionPending = true;
+    this.storage.boundHooks.put(record);
+    this.updateHookAction(record, false);
+  }
+
+  private hookTransitionMatches(
+      record: BoundHookRecord | undefined, generation: number,
+      desiredState: HookDesiredState): record is BoundHookRecord {
+    return !!record && hookGeneration(record) === generation &&
+        hookDesiredState(record) === desiredState;
+  }
+
+  private enqueueHookTransition(
+      id: number, generation: number, desiredState: HookDesiredState,
+      operation: () => Promise<void>): Promise<void> {
+    let current = this.hookTransitions.get(id);
+    if (current?.generation === generation && current.desiredState === desiredState) {
+      return current.promise;
+    }
+
+    // A later intent is written synchronously before it reaches this queue. Serializing only the
+    // provider RPCs prevents an old compensating disable from overtaking a newer enable.
+    let run = (current?.promise.catch(() => {}) ?? Promise.resolve()).then(operation);
+    let tracked = run.finally(() => {
+      if (this.hookTransitions.get(id)?.promise === tracked) {
+        this.hookTransitions.delete(id);
+      }
+    });
+    this.hookTransitions.set(id, {generation, desiredState, promise: tracked});
+    return tracked;
+  }
+
+  private settleFailedHookEnable(
+      id: number, generation: number, compensationFailed: boolean): void {
+    let current = this.storage.boundHooks.get(id);
+    if (!this.hookTransitionMatches(current, generation, "enabled")) return;
+    current.enabled = false;
+    current.desiredState = "disabled";
+    // A failed compensation leaves provider state uncertain. Persist that uncertainty so a new
+    // DO incarnation retries disable rather than treating this as a stable disabled hook.
+    current.transitionPending = compensationFailed;
+    this.storage.boundHooks.put(current);
+    this.updateHookAction(current, false);
+  }
+
+  private async compensateHookEnable(record: BoundHookRecord): Promise<boolean> {
+    try {
+      await record.controller.disable();
+      return false;
+    } catch {
+      // Provider errors can carry resource-derived data or arbitrary enumerable fields. Keep both
+      // logs and the caller-facing error local and fixed at this trust boundary.
+      this.logger.warn("failed to compensate a hook enable", {
+        event: "gatekeeper.hook.enable.compensate.failed",
+        gatekeeperId: record.gatekeeperId,
+      });
+      return true;
+    }
+  }
+
+  private async reconcileHookEnable(id: number, generation: number): Promise<void> {
+    let record = this.storage.boundHooks.get(id);
+    if (!this.hookTransitionMatches(record, generation, "enabled") ||
+        !record.transitionPending) {
+      throw new Error("Hook enable was superseded by a newer transition.");
+    }
+
+    try {
+      await this.assertGatekeeperAvailable(record.gatekeeperId, record.vendorId);
+    } catch {
+      this.settleFailedHookEnable(id, generation, false);
+      throw new Error("Hook is not available.");
+    }
+
+    // The authority read releases the input gate. Never start the provider RPC for stale intent.
+    record = this.storage.boundHooks.get(id)!;
+    if (!this.hookTransitionMatches(record, generation, "enabled") ||
+        !record.transitionPending) {
+      throw new Error("Hook enable was superseded by a newer transition.");
+    }
+
+    let props: GatekeeperHookLoopbackProps = {
+      overseerId: this.ctx.id.toString(),
+      hookId: id,
+      generation,
+    };
+    let providerFailed = false;
+    try {
+      await record.controller.enable(
+          this.ctx.exports.GatekeeperHookLoopback({props}) as unknown as
+              Fetcher<HookInitiator<RpcTarget>>,
+          {
+            workspaceId: this.ctx.id.toString(),
+            ...(record.gadgetId !== undefined ? {gadgetId: record.gadgetId} : {}),
+          });
+    } catch {
+      providerFailed = true;
+    }
+
+    if (providerFailed) {
+      // Rejections are provider-derived outcomes too. Revalidate before crossing the trust
+      // boundary, but never release either the provider's error or policy implementation details.
+      let stillAvailable = true;
+      try {
+        await this.assertGatekeeperAvailable(record.gatekeeperId, record.vendorId);
+      } catch {
+        stillAvailable = false;
+      }
+      let compensationFailed = await this.compensateHookEnable(record);
+      this.settleFailedHookEnable(id, generation, compensationFailed);
+      throw new Error(stillAvailable ? "Hook could not be enabled." : "Hook is no longer available.");
+    }
+
+    // Provider I/O and this authority read both release the input gate. The generation check is
+    // the commit fence: a disable/delete written during either await wins.
+    try {
+      await this.assertGatekeeperAvailable(record.gatekeeperId, record.vendorId);
+    } catch {
+      let compensationFailed = await this.compensateHookEnable(record);
+      this.settleFailedHookEnable(id, generation, compensationFailed);
+      throw new Error("Hook is no longer available.");
+    }
+
+    let current = this.storage.boundHooks.get(id);
+    if (!this.hookTransitionMatches(current, generation, "enabled") ||
+        !current.transitionPending) {
+      await this.compensateHookEnable(record);
+      throw new Error("Hook enable was superseded by a newer transition.");
+    }
+    current.enabled = true;
+    current.transitionPending = false;
+    this.storage.boundHooks.put(current);
+    this.updateHookAction(current, true);
+  }
+
+  private async reconcileHookDisable(
+      id: number, generation: number, desiredState: "disabled" | "deleted"): Promise<void> {
+    let record = this.storage.boundHooks.get(id);
+    if (!this.hookTransitionMatches(record, generation, desiredState) ||
+        !record.transitionPending) {
+      if (desiredState === "deleted" && !record) return;
+      throw new Error("Hook disable was superseded by a newer transition.");
+    }
+
+    try {
+      await record.controller.disable();
+    } catch {
+      this.logger.warn("hook provider cleanup failed", {
+        event: "gatekeeper.hook.disable.failed",
+        gatekeeperId: record.gatekeeperId,
+      });
+      // Keep the durable pending bit set. Constructor-driven recovery is best-effort and must not
+      // create an unhandled rejection; interactive callers inspect this bit below and get a fixed
+      // local error.
+      return;
+    }
+
+    // controller.disable() releases the input gate. Only the exact transition may publish its
+    // result; a later enable is already queued behind this provider call and owns the newer row.
+    let current = this.storage.boundHooks.get(id);
+    if (!this.hookTransitionMatches(current, generation, desiredState) ||
+        !current.transitionPending) {
+      if (desiredState === "deleted" && !current) return;
+      throw new Error("Hook disable was superseded by a newer transition.");
+    }
+
+    if (desiredState === "deleted") {
+      this.storage.boundHooks.delete(id);
+      this.updateHookAction(current, false, true);
+    } else {
+      current.enabled = false;
+      current.transitionPending = false;
+      this.storage.boundHooks.put(current);
+      this.updateHookAction(current, false);
+    }
+  }
+
+  private resumeHookTransition(record: BoundHookRecord): Promise<void> {
+    let desiredState = hookDesiredState(record);
+    let generation = hookGeneration(record);
+    if (desiredState === "enabled") {
+      return this.enqueueHookTransition(
+          record.id, generation, desiredState,
+          () => this.reconcileHookEnable(record.id, generation));
+    }
+    return this.enqueueHookTransition(
+        record.id, generation, desiredState,
+        () => this.reconcileHookDisable(record.id, generation, desiredState));
+  }
+
+  async enableHook(id: number): Promise<void> {
+    let record = this.storage.boundHooks.get(id);
+    if (!record || hookDesiredState(record) === "deleted") {
+      throw new Error("Invalid hook ID.");
+    }
+
+    // A pending disable may be compensating for an enable whose provider outcome is uncertain.
+    // Never overwrite that durable cleanup obligation with a new enable intent: if the provider
+    // remains unavailable and the subsequent enable fails its policy precheck, doing so would make
+    // the old remote subscription look stably disabled. Finish cleanup first or fail closed.
+    if (record.transitionPending && hookDesiredState(record) === "disabled") {
+      await this.resumeHookTransition(record);
+      record = this.storage.boundHooks.get(id);
+      if (!record || hookDesiredState(record) === "deleted") {
+        throw new Error("Invalid hook ID.");
+      }
+      if (record.transitionPending) {
+        throw new Error("Hook could not be enabled while provider cleanup is pending.");
+      }
+    }
+
+    if (record.enabled && hookDesiredState(record) === "enabled" &&
+        !record.transitionPending) {
+      return;
+    }
+
+    if (hookDesiredState(record) !== "enabled" || !record.transitionPending) {
+      this.persistHookIntent(record, "enabled", nextHookGeneration(record));
+    }
+    await this.resumeHookTransition(record);
+  }
+
+  async disableHook(id: number): Promise<void> {
+    let record = this.storage.boundHooks.get(id);
+    if (!record) throw new Error("Invalid hook ID.");
+    if (hookDesiredState(record) === "deleted") {
+      if (record.transitionPending) await this.resumeHookTransition(record);
+      return;
+    }
+    if (!record.enabled && hookDesiredState(record) === "disabled" &&
+        !record.transitionPending) {
+      return;
+    }
+
+    if (hookDesiredState(record) !== "disabled" || !record.transitionPending) {
+      this.persistHookIntent(record, "disabled", nextHookGeneration(record));
+    }
+    let generation = hookGeneration(record);
+    await this.resumeHookTransition(record);
+    let current = this.storage.boundHooks.get(id);
+    if (this.hookTransitionMatches(current, generation, "disabled") &&
+        current.transitionPending) {
+      throw new Error("Hook could not be disabled.");
+    }
+  }
+
+  // Mark deletion durably before external I/O. The tombstone blocks callbacks and resurrection;
+  // the row is removed only after the provider confirms cleanup.
   async deleteHook(id: number): Promise<void> {
     let record = this.storage.boundHooks.get(id);
     if (!record) return;
-    if (record.enabled) {
-      await record.controller.disable();
+    if (hookDesiredState(record) !== "deleted" || !record.transitionPending) {
+      this.persistHookIntent(record, "deleted", nextHookGeneration(record));
     }
-    // controller.disable() is an RPC await. A concurrent delete may already have reached the goal
-    // state; never put or otherwise resurrect the captured row afterwards.
+    let generation = hookGeneration(record);
+    await this.resumeHookTransition(record);
     let current = this.storage.boundHooks.get(id);
-    if (!current) return;
-    this.storage.boundHooks.delete(current.id);
-
-    let actionRecord = this.storage.actions.get(current.actionId);
-    if (actionRecord?.type === "bindHook") {
-      actionRecord.enabled = false;
-      delete actionRecord.hookId;
-      this.storage.actions.put(actionRecord);
+    if (this.hookTransitionMatches(current, generation, "deleted") &&
+        current.transitionPending) {
+      throw new Error("Hook could not be deleted.");
     }
   }
 
@@ -2678,6 +3032,11 @@ class OverseerImpl implements AgentHooks {
       // TODO: Make possible to return dynamic entrypoint stub over RPC. This Proxy is a hack.
       return new Proxy<RpcTarget>(ep as any, {
         get(target, prop, receiver) {
+          if (prop === Symbol.dispose) {
+            // A NativeRpcStub's disposer requires the real stub as its receiver. Returning it
+            // through this prototype-masking Proxy otherwise makes per-call cleanup a no-op.
+            return () => (target as unknown as {[Symbol.dispose](): void})[Symbol.dispose]();
+          }
           // Note: We need `target` to be used as the receiver. If we use `receiver` as the receiver,
           //   we'll get an illegal invocation, as `receiver` points to our Proxy.
           return Reflect.get(target, prop, target);
@@ -2708,8 +3067,8 @@ class OverseerImpl implements AgentHooks {
     let record = this.storage.gatekeepers.get(id);
     if (!record) throw new Error("No such gatekeeper.");
     let config = await this.readAuthorityConfig();
-    // The KV read releases the input gate. Removal must win over a stale retained reference, and a
-    // concurrent migration/update must be evaluated from its current provenance.
+    // The authority RPC releases the input gate. Removal must win over a stale retained reference,
+    // and a concurrent migration/update must be evaluated from its current provenance.
     record = this.storage.gatekeepers.get(id);
     if (!record) throw new Error("No such gatekeeper.");
     let block = gatekeeperAvailabilityBlock(
@@ -2722,10 +3081,90 @@ class OverseerImpl implements AgentHooks {
         `${record.resourceTitle || "This resource"} is disabled on this deployment by an administrator.`);
   }
 
-  // Apply a single pending action: invoke the gatekeeper, mark it approved, and persist (the put
-  // auto-notifies subscribeToActions). Shared by manual approval (`approveAction`) and the
-  // auto-approval drain (`drainAutoApprovals`). The caller is responsible for validating that the
-  // record is still pending before calling.
+  // A new activation cannot know whether an external call belonging to the previous activation
+  // landed. Convert its durable in-progress claim into a non-retryable failure synchronously, before
+  // any RPC entrypoint can observe the action. The user may still reject it to discard provider-side
+  // staging, but approval will never dispatch the write a second time.
+  #failInterruptedActionResolutions(): void {
+    for (let record of this.storage.actions.list()) {
+      if (record.type !== "action" || record.state !== "pending" ||
+          record.resolutionAttempt?.phase !== "resolving") {
+        continue;
+      }
+      record.resolutionAttempt.phase = "failed";
+      record.resolutionAttempt.failedAt = new Date();
+      this.storage.actions.put(record);
+    }
+  }
+
+  // Persist the winner of a resolution race before any provider RPC. Since typed-storage writes are
+  // synchronous, another event entering while the provider call is awaited observes this claim and
+  // cannot dispatch a competing apply/reject. A failed approval is deliberately non-retryable;
+  // rejection remains retryable because Gatekeeper.rejectAction() is an idempotent cleanup method.
+  beginActionResolution(
+      id: number, decision: "approve" | "reject", resolvedBy: AiChatAuthorInfo,
+      autoApproved: boolean): ActionRecord & {type: "action"} {
+    let record = this.storage.actions.get(id);
+    if (!record || record.type !== "action" || record.state !== "pending") {
+      throw new Error(`Action is not pending: ${id}`);
+    }
+
+    let previous = record.resolutionAttempt;
+    if (previous?.phase === "resolving") {
+      throw new Error(`Action resolution is already in progress: ${id}`);
+    }
+    if (decision === "approve" && previous !== undefined) {
+      throw new Error(
+          `Action ${id} had an earlier resolution attempt whose outcome cannot be confirmed. ` +
+          `It cannot be approved again safely; verify the target service, then deny it to discard ` +
+          `the staged action.`);
+    }
+
+    record.resolutionAttempt = {
+      attemptId: crypto.randomUUID(),
+      decision,
+      phase: "resolving",
+      startedAt: new Date(),
+      resolvedBy,
+      autoApproved,
+    };
+    this.storage.actions.put(record);
+    return record;
+  }
+
+  failActionResolution(id: number, attemptId: string): void {
+    let record = this.storage.actions.get(id);
+    if (record?.type !== "action" || record.state !== "pending" ||
+        record.resolutionAttempt?.attemptId !== attemptId ||
+        record.resolutionAttempt.phase !== "resolving") {
+      return;
+    }
+    record.resolutionAttempt.phase = "failed";
+    record.resolutionAttempt.failedAt = new Date();
+    this.storage.actions.put(record);
+  }
+
+  settleActionResolution(
+      id: number, attemptId: string, state: "approved" | "rejected",
+      resolvedBy: AiChatAuthorInfo, autoApproved: boolean): ActionRecord & {type: "action"} {
+    let record = this.storage.actions.get(id);
+    if (!record || record.type !== "action" || record.state !== "pending" ||
+        record.resolutionAttempt?.attemptId !== attemptId ||
+        record.resolutionAttempt.phase !== "resolving") {
+      throw new Error(`Action resolution changed while it was in progress: ${id}`);
+    }
+    record.state = state;
+    record.appliedAt = new Date();
+    record.resolvedBy = resolvedBy;
+    record.autoApproved = autoApproved;
+    delete record.resolutionAttempt;
+    this.storage.actions.put(record);
+    return record;
+  }
+
+  // Apply a single pending action: claim it durably, invoke the gatekeeper, mark it approved, and
+  // persist (the puts auto-notify subscribeToActions). Shared by manual approval (`approveAction`)
+  // and the auto-approval drain (`drainAutoApprovals`).
   //
   // `resolvedBy`/`autoApproved` are required (not defaulted) so that no apply path can omit how the
   // gate was cleared: this is the single chokepoint where an action transitions to "approved", so
@@ -2745,21 +3184,136 @@ class OverseerImpl implements AgentHooks {
           `deny it to discard the staged change.`, {cause: error});
     }
 
-    // The policy read above is an await, while explicit rejection intentionally remains usable on
-    // disabled connections. Re-read the row so a rejection that settled during that await wins and
-    // the stale approval request cannot still call the provider or overwrite it as approved.
-    let current = this.storage.actions.get(record.id);
-    if (!current || current.type !== "action" || current.state !== "pending") {
-      throw new Error(`Action is not pending: ${record.id}`);
-    }
-    record = current;
+    // The policy read above is an await, so take the durable claim from a fresh row. This is the
+    // linearization point for manual/manual and manual/automatic races.
+    record = this.beginActionResolution(record.id, "approve", resolvedBy, autoApproved);
+    let attemptId = record.resolutionAttempt!.attemptId;
     let gatekeeper = this.getGatekeeperFacet(record.gatekeeperId);
-    await gatekeeper.applyAction(record.action);
-    record.state = "approved";
-    record.appliedAt = new Date();
-    record.resolvedBy = resolvedBy;
-    record.autoApproved = autoApproved;
-    this.storage.actions.put(record);
+    try {
+      await gatekeeper.applyAction(record.action);
+    } catch {
+      // Do not expose provider-controlled error data until a fresh authority read succeeds. The
+      // claim stays resolving across that read, so a concurrent rejection cannot overwrite it.
+      try {
+        await this.assertGatekeeperAvailable(record.gatekeeperId);
+      } catch {
+        this.failActionResolution(record.id, attemptId);
+        throw new Error(ACTION_POLICY_CHANGED_MESSAGE);
+      }
+      this.failActionResolution(record.id, attemptId);
+      this.logger.warn("gatekeeper action apply failed", {
+        event: "action.apply.failed",
+        actionId: record.id,
+        gatekeeperId: record.gatekeeperId,
+      });
+      throw new Error(ACTION_APPROVAL_FAILED_MESSAGE);
+    }
+
+    // Provider execution released the input gate. A disable/removal that completed meanwhile wins:
+    // retain a failed claim rather than publishing the provider-derived success or retrying it.
+    try {
+      await this.assertGatekeeperAvailable(record.gatekeeperId);
+    } catch {
+      this.failActionResolution(record.id, attemptId);
+      throw new Error(ACTION_POLICY_CHANGED_MESSAGE);
+    }
+    this.settleActionResolution(
+        record.id, attemptId, "approved", resolvedBy, autoApproved);
+  }
+
+  async rejectPendingAction(id: number, resolvedBy: AiChatAuthorInfo): Promise<{
+    record: ActionRecord & {type: "action"};
+    restart: boolean;
+    outcomeUnknown: boolean;
+    shouldDrainAutoApprovals: boolean;
+  }> {
+    let requireRejectable = (): ActionRecord & {type: "action"} => {
+      let current = this.storage.actions.get(id);
+      if (!current) throw new Error(`No such action: ${id}`);
+      if (current.state !== "pending") throw new Error(`Action is not pending: ${id}`);
+      if (current.type !== "action") throw new Error(`Can't reject an observation: ${id}`);
+      if (current.resolutionAttempt?.phase === "resolving") {
+        throw new Error(`Action resolution is already in progress: ${id}`);
+      }
+      return current;
+    };
+
+    let settleWithoutProvider = (
+        record: ActionRecord & {type: "action"}): ActionRecord & {type: "action"} => {
+      record.state = "rejected";
+      record.appliedAt = new Date();
+      record.resolvedBy = resolvedBy;
+      record.autoApproved = false;
+      delete record.resolutionAttempt;
+      this.storage.actions.put(record);
+      return record;
+    };
+
+    let record = requireRejectable();
+
+    // Rejection remains available as a local reduction of authority when a connector is disabled.
+    // Re-read after the authority await so an approval claim that won meanwhile cannot be erased.
+    try {
+      await this.assertGatekeeperAvailable(record.gatekeeperId);
+    } catch {
+      return {
+        record: settleWithoutProvider(requireRejectable()),
+        restart: false,
+        outcomeUnknown: false,
+        shouldDrainAutoApprovals: false,
+      };
+    }
+
+    record = this.beginActionResolution(id, "reject", resolvedBy, false);
+    let attemptId = record.resolutionAttempt!.attemptId;
+    let gatekeeper = this.getGatekeeperFacet(record.gatekeeperId);
+    let result: void | ActionRejectionResult = undefined;
+    let providerFailure: {error: unknown} | undefined;
+    try {
+      result = await gatekeeper.rejectAction(record.action);
+    } catch (error) {
+      providerFailure = {error};
+    }
+
+    // Both a fulfilled result and a rejection can contain provider-controlled data. Re-check before
+    // inspecting either. If authority disappeared, ignore the outcome and complete only the local
+    // denial, which remains a safe reduction of authority.
+    try {
+      await this.assertGatekeeperAvailable(record.gatekeeperId);
+    } catch {
+      return {
+        record: this.settleActionResolution(
+            id, attemptId, "rejected", resolvedBy, false),
+        restart: false,
+        outcomeUnknown: false,
+        shouldDrainAutoApprovals: false,
+      };
+    }
+
+    if (providerFailure) {
+      let legacyOutcome = legacyGatekeeperActionOutcome(providerFailure.error);
+      if (legacyOutcome !== undefined) {
+        result = {outcome: legacyOutcome};
+      } else {
+        this.failActionResolution(id, attemptId);
+        this.logger.warn("gatekeeper action rejection failed", {
+          event: "action.reject.failed",
+          actionId: record.id,
+          gatekeeperId: record.gatekeeperId,
+        });
+        throw new Error(ACTION_REJECTION_FAILED_MESSAGE);
+      }
+    }
+
+    let outcomeUnknown = result?.outcome === "unknown";
+    let state: "approved" | "rejected" =
+        result?.outcome === "applied" ? "approved" : "rejected";
+    return {
+      record: this.settleActionResolution(id, attemptId, state, resolvedBy, false),
+      restart: state === "rejected" && result?.restart === true,
+      outcomeUnknown,
+      shouldDrainAutoApprovals: state === "rejected",
+    };
   }
 
   // Apply all currently-eligible pending actions of the given gatekeeper, in ascending id order.
@@ -3258,6 +3812,9 @@ class OverseerImpl implements AgentHooks {
       callback: callback as unknown as NativeRpcStub<RpcTarget>,
       description,
       enabled,
+      desiredState: "disabled",
+      generation: 0,
+      transitionPending: false,
     });
 
     let record: ActionRecord = {
@@ -6728,13 +7285,18 @@ type OverseerRestoreParams = {
   codeId?: string;
 };
 
-// Green Hat fork: does this error mean the gatekeeper's copy of an action is in a terminal state
-// (failed after being sent and not retryable, already rejected, already applied)? Those come from
-// mcp-shared's action store, whose messages are the only signal the Overseer gets.
-function gatekeeperActionIsTerminal(err: unknown): boolean {
+// Rolling-upgrade fallback for old gatekeepers that predate ActionRejectionResult. New gatekeepers
+// report terminal state structurally; this parser can be removed once no deployed worker speaks the
+// old contract.
+function legacyGatekeeperActionOutcome(
+    err: unknown): NonNullable<ActionRejectionResult["outcome"]> | undefined {
   let message = err instanceof Error ? err.message : String(err);
-  return /failed after it had been sent|cannot be retried|is already failed|was already rejected|is already rejected|already applied/i
-      .test(message);
+  if (/already applied/i.test(message)) return "applied";
+  if (/was already rejected|is already rejected/i.test(message)) return "rejected";
+  if (/failed after it had been sent|cannot be retried|is already failed/i.test(message)) {
+    return "unknown";
+  }
+  return undefined;
 }
 
 /** Internal implementation constructor exposed for focused unit tests, not a Worker entrypoint. */
@@ -7123,24 +7685,27 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
         () => this.impl.getGadgetHookEntrypoint(id),
         () => this.impl.assertGatekeeperAvailable(id),
         undefined,
-        {disposeResolvedTarget: true});
+        {disposeResolvedTarget: true, resultOwnership: "rpc-container"});
   }
 
-  async startHook(hookId: number): Promise<{
+  async startHook(hookId: number, generation: number = 0): Promise<{
     callback: NativeRpcStub<RpcTarget>, approvalQueue: ApprovalQueue
   }> {
-    let record = await requireLiveHook(this.impl, hookId);
+    let record = await requireLiveHook(this.impl, hookId, generation);
 
     return {
       callback: makeRevalidatingRpcStub(
           () => {
-            let callback = this.impl.storage.boundHooks.get(hookId)?.callback;
-            if (!callback) throw new Error("Hook has been deleted or disabled.");
-            return callback as unknown as RpcTarget;
+            let current = this.impl.storage.boundHooks.get(hookId);
+            if (!current?.enabled || hookDesiredState(current) !== "enabled" ||
+                hookGeneration(current) !== generation) {
+              throw new Error("Hook has been deleted or disabled.");
+            }
+            return current.callback as unknown as RpcTarget;
           },
-          async () => { await requireLiveHook(this.impl, hookId); }),
+          async () => { await requireLiveHook(this.impl, hookId, generation); }),
       approvalQueue: new ApprovalQueueImpl(
-          this.impl, record.gatekeeperId, {from: "hook"}, hookId),
+          this.impl, record.gatekeeperId, {from: "hook"}, hookId, generation),
     };
   }
 
@@ -7331,6 +7896,9 @@ export class GatekeeperLoopback extends WorkerEntrypoint<Cloudflare.Env, Gatekee
 type GatekeeperHookLoopbackProps = {
   overseerId: string;
   hookId: number;
+
+  /** Absent only on initiators persisted before hook generation fencing was introduced. */
+  generation?: number;
 };
 
 /**
@@ -7350,7 +7918,7 @@ export class GatekeeperHookLoopback
 
     // Get an ApprovalQueue for this hook invocation from the overseer.
     // @ts-ignore seems the RPC types aren't working here
-    return overseer.startHook(this.ctx.props.hookId);
+    return overseer.startHook(this.ctx.props.hookId, this.ctx.props.generation);
   }
 }
 
@@ -7813,15 +8381,14 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     this.impl.destroyAllLiveChats();
     // TODO: Revoke user sessions.
 
-    // Disable all enabled hooks so that the gatekeepers stop delivering events to this gadget.
-    // We do this before deleting storage so that we still have access to the hook controllers.
+    // Delete every hook, including an in-flight enable, before deleting storage. The persisted
+    // tombstone and per-hook provider queue make workspace deletion win that race without losing
+    // the controller needed for compensation.
     // TODO: If any disablement fails, deletion will be blocked. We could ignore failures, but that
     //   would leave gatekeepers pointing at gadgets that don't exist anymore, which is also bad.
     //   What do we really want here?
     for (let record of Array.from(this.impl.storage.boundHooks.list())) {
-      if (record.enabled) {
-        await this.disableHook(record.id);
-      }
+      await this.impl.deleteHook(record.id);
     }
 
     await this.impl.ctx.blockConcurrencyWhile(async () => {
@@ -8054,33 +8621,11 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // Resolve the approver's identity before applying, so a failed profile fetch can't leave the
     // action applied in the world but still "pending" in storage.
     let profile = await this.#getClientProfile();
-    try {
-      await this.impl.applyPendingAction(action, profile, false);
-    } catch (err) {
-      // Green Hat fork: when the gatekeeper reports the action as terminal (a call that failed
-      // after it had been sent is recorded there as failed and not retryable), leaving this record
-      // pending wedges the chat: Approve keeps throwing, Deny is refused as "already failed", and
-      // the composer stays locked on "Approve or reject the pending action above". Close the record
-      // as rejected, say so in the chat, and still surface the error to the caller.
-      if (gatekeeperActionIsTerminal(err)) {
-        action.state = "rejected";
-        action.appliedAt = new Date();
-        action.resolvedBy = profile;
-        this.impl.storage.actions.put(action);
-        if (action.caller.from === "agent") {
-          let detail = err instanceof Error ? err.message : String(err);
-          this.impl.addChatMessages(action.caller.chatId, profile, [{
-            type: "message",
-            message: `"${action.description.title}" could not be applied: ${detail} ` +
-                `Verify on the server, then ask for it to be staged again if it did not land.`,
-          }]);
-        }
-      }
-      throw err;
-    }
+    await this.impl.applyPendingAction(action, profile, false);
 
     // If this was an awaited agent action, resume only after all awaited actions in the turn are
-    // approved. If applyPendingAction throws, the action stays pending and the turn stays suspended.
+    // approved. If applyPendingAction throws, its durable failed claim prevents an ambiguous write
+    // from being retried and the action stays pending so the user can deny it after verification.
     if (action.caller.from === "agent" && action.description.awaitDecision) {
       await this.#maybeResumeAfterActionDecision(action.caller.chatId);
     }
@@ -8094,6 +8639,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     let defaultGadgetId = this.impl.defaultGadgetId;
     let result: BoundHookInfo[] = [];
     for (let record of this.impl.storage.boundHooks.list()) {
+      if (hookDesiredState(record) === "deleted") continue;
       let gatekeeper = this.impl.storage.gatekeepers.get(record.gatekeeperId);
       result.push({
         id: record.id,
@@ -8112,80 +8658,11 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async enableHook(id: number): Promise<void> {
-    let record = this.impl.storage.boundHooks.get(id);
-    if (!record) throw new Error("Invalid hook ID.");
-
-    if (!record.enabled) {
-      await this.impl.assertGatekeeperAvailable(record.gatekeeperId, record.vendorId);
-      let props: GatekeeperHookLoopbackProps = {
-        overseerId: this.impl.ctx.id.toString(),
-        hookId: id,
-      }
-
-      // TODO(hooks): enable()/disable() race. controller.enable() is awaited RPC to the gatekeeper;
-      // a concurrent disableHook() can finish its controller.disable() first, then this enable()
-      // still lands and recreates gatekeeper-side state (e.g. a scheduler driver row + alarm).
-      // Live firings stay safe because startHook() re-checks record.enabled, but the resurrected
-      // row can keep consuming quota/alarms until cleaned up.
-      await record.controller.enable(
-          this.impl.ctx.exports.GatekeeperHookLoopback({props}) as unknown as
-              Fetcher<HookInitiator<RpcTarget>>,
-          {
-            workspaceId: this.impl.ctx.id.toString(),
-            ...(record.gadgetId !== undefined ? {gadgetId: record.gadgetId} : {}),
-          });
-
-      try {
-        // Both the provider enable and this KV read release the input gate. Re-check policy and
-        // the live record before publishing the enabled bit; if the hook/connection disappeared
-        // or the admin disabled it in the meantime, compensate the remote subscription below.
-        await this.impl.assertGatekeeperAvailable(record.gatekeeperId, record.vendorId);
-        let current = this.impl.storage.boundHooks.get(id);
-        if (!current || current.gatekeeperId !== record.gatekeeperId) {
-          throw new Error("The connection or hook was removed while the hook was being enabled.");
-        }
-        current.enabled = true;
-        this.impl.storage.boundHooks.put(current);
-
-        let actionRecord = this.impl.storage.actions.get(current.actionId);
-        if (actionRecord?.type === "bindHook") {
-          actionRecord.enabled = true;
-          this.impl.storage.actions.put(actionRecord);
-        }
-      } catch (error) {
-        try {
-          await record.controller.disable();
-        } catch (disableError) {
-          this.impl.logger.warn("failed to compensate a hook enable rejected by policy", {
-            event: "gatekeeper.hook.enable.compensate.failed",
-            gatekeeperId: record.gatekeeperId, error: disableError,
-          });
-        }
-        throw error;
-      }
-    }
+    return this.impl.enableHook(id);
   }
 
   async disableHook(id: number): Promise<void> {
-    let record = this.impl.storage.boundHooks.get(id);
-    if (!record) throw new Error("Invalid hook ID.");
-
-    if (record.enabled) {
-      await record.controller.disable();
-
-      // Deletion while the provider RPC was in flight already reached the desired state. Never
-      // resurrect the stale captured row.
-      let current = this.impl.storage.boundHooks.get(id);
-      if (!current) return;
-      current.enabled = false;
-      this.impl.storage.boundHooks.put(current);
-
-      let actionRecord = this.impl.storage.actions.get(current.actionId);
-      if (actionRecord?.type === "bindHook") {
-        actionRecord.enabled = false;
-        this.impl.storage.actions.put(actionRecord);
-      }
-    }
+    return this.impl.disableHook(id);
   }
 
   async deleteHook(id: number): Promise<void> {
@@ -8234,85 +8711,40 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async rejectAction(id: number): Promise<void> {
-    let requirePending = (): ActionRecord & {type: "action"} => {
-      let current = this.impl.storage.actions.get(id);
-      if (!current) throw new Error(`No such action: ${id}`);
-      if (current.state !== "pending") throw new Error(`Action is not pending: ${id}`);
-      if (current.type !== "action") throw new Error(`Can't reject an observation: ${id}`);
-      return current;
-    };
-
-    let settle = (
-        action: ActionRecord & {type: "action"}, state: "approved" | "rejected",
-        profile: AiChatAuthorInfo): void => {
-      action.state = state;
-      action.appliedAt = new Date();
-      action.resolvedBy = profile;
-      this.impl.storage.actions.put(action);
-    };
-
-    let action = requirePending();
+    let action = this.impl.storage.actions.get(id);
+    if (!action) throw new Error(`No such action: ${id}`);
+    if (action.state !== "pending") throw new Error(`Action is not pending: ${id}`);
+    if (action.type !== "action") throw new Error(`Can't reject an observation: ${id}`);
 
     // Resolve the rejecter's identity before notifying the gatekeeper, so a failed profile fetch
     // can't leave the action rejected with the gatekeeper but still "pending" in storage.
     let profile = await this.#getClientProfile();
-    action = requirePending();
+    let result = await this.impl.rejectPendingAction(id, profile);
+    let resolvedAction = result.record;
+    if (resolvedAction.state === "approved") return;
 
-    // A denial is a local reduction of authority. If the provider is disabled, unavailable, or its
-    // authority configuration cannot be read, close the local pending record without invoking it.
-    // This keeps disabled connections removable and never grants or applies the staged change.
-    try {
-      await this.impl.assertGatekeeperAvailable(action.gatekeeperId);
-    } catch {
-      action = requirePending();
-      settle(action, "rejected", profile);
-      return;
+    if (result.outcomeUnknown && resolvedAction.caller.from === "agent") {
+      this.impl.addChatMessages(resolvedAction.caller.chatId, profile, [{
+        type: "message",
+        message:
+            `The result of applying "${resolvedAction.description.title}" could not be confirmed. ` +
+            `The staged action was discarded; verify the target service before staging it again.`,
+      }]);
     }
-    action = requirePending();
-    let gatekeeper = this.impl.getGatekeeperFacet(action.gatekeeperId);
-
-    let result: void | {restart?: boolean} = undefined;
-    try {
-      result = await gatekeeper.rejectAction(action.action);
-    } catch (err) {
-      // Green Hat fork: the gatekeeper refuses to reject an action it already recorded as failed
-      // (or rejected). That is a terminal state on its side, so the record here must close too or
-      // the chat stays locked; an action it already applied is recorded as approved instead.
-      if (!gatekeeperActionIsTerminal(err)) {
-        // The provider call may have raced an administrative disable. Once positive authority is
-        // gone, local rejection remains safe and must stay available for cleanup.
-        try {
-          await this.impl.assertGatekeeperAvailable(action.gatekeeperId);
-        } catch {
-          action = requirePending();
-          settle(action, "rejected", profile);
-          return;
-        }
-        throw err;
-      }
-      action = requirePending();
-      if (/already applied/i.test(err instanceof Error ? err.message : String(err))) {
-        settle(action, "approved", profile);
-        return;
-      }
-    }
-
-    action = requirePending();
-    settle(action, "rejected", profile);
 
     // Deny leaves the turn ended, like denyConnectionRequest. The rejected record also prevents a
     // sibling approval from resuming this turn.
 
-    if (result?.restart && action.caller.from === "gadget") {
-      let gadgetId = action.caller.gadgetId ?? this.impl.defaultGadgetId;
+    if (result.restart && resolvedAction.caller.from === "gadget") {
+      let gadgetId = resolvedAction.caller.gadgetId ?? this.impl.defaultGadgetId;
       if (gadgetId !== undefined) {
         this.impl.ctx.facets.abort(
             this.impl.gadgetFacetName(gadgetId),
             new Error("Gadget restarted because a pending action it depends on was rejected."));
       }
-    } else {
+    } else if (result.shouldDrainAutoApprovals) {
       // Rejecting a manual gate may unblock later auto-eligible actions on this connection.
-      this.impl.ctx.waitUntil(this.impl.drainAutoApprovals(action.gatekeeperId));
+      this.impl.ctx.waitUntil(this.impl.drainAutoApprovals(resolvedAction.gatekeeperId));
     }
   }
 
@@ -10038,37 +10470,52 @@ class SlashCommandAuthorizerImpl extends NativeRpcTarget implements ObservationA
 
 // Re-resolve a modern bound hook and its deployment policy. Hook callbacks and approval queues are
 // retained outside this DO, so both the record's enabled bit and AdminConfig are checked per call.
-async function requireLiveHook(impl: OverseerImpl, hookId: number): Promise<BoundHookRecord> {
+async function requireLiveHook(
+    impl: OverseerImpl, hookId: number, generation: number = 0): Promise<BoundHookRecord> {
   let record = impl.storage.boundHooks.get(hookId);
-  if (!record?.enabled) throw new Error("Hook has been deleted or disabled.");
+  if (!record?.enabled || hookDesiredState(record) !== "enabled" ||
+      hookGeneration(record) !== generation) {
+    throw new Error("Hook has been deleted or disabled.");
+  }
   await impl.assertGatekeeperAvailable(record.gatekeeperId, record.vendorId);
-  // The KV read above releases the input gate. Deletion/disable wins over the stale captured row.
+  // The authority read above releases the input gate. Deletion, disable, and re-enable all win
+  // over the stale captured generation.
   record = impl.storage.boundHooks.get(hookId);
-  if (!record?.enabled) throw new Error("Hook has been deleted or disabled.");
+  if (!record?.enabled || hookDesiredState(record) !== "enabled" ||
+      hookGeneration(record) !== generation) {
+    throw new Error("Hook has been deleted or disabled.");
+  }
   return record;
 }
 
 @validateRpc()
 class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
   constructor(private impl: OverseerImpl, private gatekeeperId: number,
-              private caller: GatekeeperCaller, private hookId?: number) {
+              private caller: GatekeeperCaller, private hookId?: number,
+              private hookGeneration?: number) {
     super();
   }
 
   async authorizeObservation(description: ObservationDescription): Promise<void> {
-    if (this.hookId !== undefined) await requireLiveHook(this.impl, this.hookId);
+    if (this.hookId !== undefined) {
+      await requireLiveHook(this.impl, this.hookId, this.hookGeneration);
+    }
     return this.impl.authorizeObservation(this.gatekeeperId, description, this.caller);
   }
 
   async submitAction(action: number, description: ActionDescription): Promise<void> {
-    if (this.hookId !== undefined) await requireLiveHook(this.impl, this.hookId);
+    if (this.hookId !== undefined) {
+      await requireLiveHook(this.impl, this.hookId, this.hookGeneration);
+    }
     return this.impl.submitAction(this.gatekeeperId, action, description, this.caller);
   }
 
   async bindHook<Hook extends RpcTarget>(
         controller: Fetcher<HookController<Hook>>, callback: NativeRpcStub<Hook>,
         description: HookDescription): Promise<void> {
-    if (this.hookId !== undefined) await requireLiveHook(this.impl, this.hookId);
+    if (this.hookId !== undefined) {
+      await requireLiveHook(this.impl, this.hookId, this.hookGeneration);
+    }
     return this.impl.bindHook(this.gatekeeperId, controller, callback, description, this.caller);
   }
 }

@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { RpcStub as NativeRpcStub } from "cloudflare:workers";
+import { env, RpcStub as NativeRpcStub } from "cloudflare:workers";
+import {abortAllDurableObjects, runInDurableObject} from "cloudflare:test";
 import {RpcTarget} from "capnweb";
+import type {AiChatAuthorInfo} from "@gadgets/workshop-shared/api";
 import { DEFAULT_ADMIN_CONFIG, gatekeeperAvailabilityBlock, parseAdminConfig, serializeAdminConfig } from "../src/admin-config.js";
 import { OverseerDurableObject, overseerTestInternals } from "../src/overseer.js";
 import {makeRevalidatingRpcStub} from "../src/revalidating-rpc.js";
@@ -8,6 +10,12 @@ import {makeRevalidatingRpcStub} from "../src/revalidating-rpc.js";
 vi.mock("capnweb-validate", () => ({ validateRpc: () => () => undefined }));
 
 type OverseerImplForTest = InstanceType<typeof overseerTestInternals.OverseerImpl>;
+
+declare module "cloudflare:workers" {
+  interface ProvidedEnv {
+    TEST_OVERSEER: DurableObjectNamespace<OverseerDurableObject>;
+  }
+}
 
 // Consume native JsRpcPromise rejections exactly once: expect(...).rejects forks them. Workerd still
 // prints its server-side "Uncaught (in promise)" diagnostic for a NativeRpcStub target that rejects,
@@ -24,7 +32,14 @@ async function expectRejection(call: PromiseLike<unknown>, pattern: RegExp): Pro
 
 function makeOverseer(
     getConfig: () => Promise<string | null>,
-    hook: { enabled: boolean; vendorId?: string; callback?: object } | null =
+    hook: {
+      enabled: boolean;
+      vendorId?: string;
+      callback?: object;
+      desiredState?: "enabled" | "disabled" | "deleted";
+      generation?: number;
+      transitionPending?: boolean;
+    } | null =
         { enabled: true, vendorId: "email" },
     legacyVendorId?: string,
     resourceUrl = "https://example.com",
@@ -167,6 +182,32 @@ describe("OverseerDurableObject.startHook", () => {
     expect(deliver).not.toHaveBeenCalled();
   });
 
+  it("revokes callback and approval capabilities from an older enabled generation", async () => {
+    let deliver = vi.fn(async () => "delivered");
+    let hook = {
+      enabled: true,
+      desiredState: "enabled" as const,
+      generation: 7,
+      transitionPending: false,
+      vendorId: "email",
+      callback: {deliver},
+    };
+    let overseer = makeOverseer(
+        async () => serializeAdminConfig(DEFAULT_ADMIN_CONFIG), hook);
+    let {callback, approvalQueue} = await overseer.startHook(1, 7);
+
+    // A disable/re-enable creates a new provider initiator. Capabilities returned through the old
+    // initiator must not silently attach themselves to the replacement generation.
+    hook.generation = 9;
+
+    await expectRejection((callback as any).deliver("event"), /deleted or disabled/);
+    await expect(approvalQueue.authorizeObservation({
+      title: "Old delivery",
+      description: "Must not be logged under the replacement hook",
+    })).rejects.toThrow(/deleted or disabled/);
+    expect(deliver).not.toHaveBeenCalled();
+  });
+
   it("re-checks a hook record after the async policy read", async () => {
     let release!: (config: string) => void;
     let hook = {enabled: true, vendorId: "email", callback: {}};
@@ -260,19 +301,21 @@ describe("observation authority", () => {
     expect(putProhibitAllSharing).not.toHaveBeenCalled();
   });
 
-  it("coalesces only overlapping deployment-policy reads", async () => {
-    let releaseConfig!: (value: string) => void;
+  it("performs an independent authoritative read at every boundary", async () => {
+    let releaseConfigReads: Array<() => void> = [];
     let reads = 0;
-    let firstConfig = new Promise<string>(resolve => { releaseConfig = resolve; });
     let impl = Object.create(
         overseerTestInternals.OverseerImpl.prototype) as OverseerImplForTest;
     Object.assign(impl, {
-      env: {BLUEPRINTS: {get: async () => {
-        reads++;
-        return reads === 1
-          ? firstConfig
-          : serializeAdminConfig(DEFAULT_ADMIN_CONFIG);
-      }}},
+      ctx: {exports: {AdminSettings: {getByName: () => ({
+        getAdminConfig: async () => {
+          reads++;
+          if (reads <= 2) {
+            await new Promise<void>(resolve => { releaseConfigReads.push(resolve); });
+          }
+          return DEFAULT_ADMIN_CONFIG;
+        },
+      })}}},
       storage: {
         gatekeepers: {get: () => ({id: 1, resourceUrl: "https://example.com"})},
       },
@@ -281,12 +324,12 @@ describe("observation authority", () => {
     let first = impl.assertGatekeeperAvailable(1, "email");
     let second = impl.assertGatekeeperAvailable(1, "email");
     await new Promise(resolve => setTimeout(resolve, 0));
-    expect(reads).toBe(1);
-    releaseConfig(serializeAdminConfig(DEFAULT_ADMIN_CONFIG));
+    expect(reads).toBe(2);
+    for (let release of releaseConfigReads) release();
     await Promise.all([first, second]);
 
     await impl.assertGatekeeperAvailable(1, "email");
-    expect(reads).toBe(2);
+    expect(reads).toBe(3);
   });
 });
 
@@ -299,7 +342,9 @@ describe("connection minting authority", () => {
     let impl = Object.create(
         overseerTestInternals.OverseerImpl.prototype) as OverseerImplForTest;
     Object.assign(impl, {
-      env: {BLUEPRINTS: {get: async () => serializeAdminConfig(activeConfig)}},
+      ctx: {exports: {AdminSettings: {getByName: () => ({
+        getAdminConfig: async () => activeConfig,
+      })}}},
       storage: {
         gatekeepers: {
           get: (id: number) => records.get(id),
@@ -336,10 +381,12 @@ describe("connection minting authority", () => {
     let impl = Object.create(
         overseerTestInternals.OverseerImpl.prototype) as OverseerImplForTest;
     Object.assign(impl, {
-      env: {BLUEPRINTS: {get: async () => serializeAdminConfig({
-        ...DEFAULT_ADMIN_CONFIG,
-        disabledGatekeepers: ["google"],
-      })}},
+      ctx: {exports: {AdminSettings: {getByName: () => ({
+        getAdminConfig: async () => ({
+          ...DEFAULT_ADMIN_CONFIG,
+          disabledGatekeepers: ["google"],
+        }),
+      })}}},
       storage: {
         gatekeepers: {get: () => ({
           id: 1,
@@ -357,46 +404,116 @@ async function makeTargetOverseer(
     assertGatekeeperAvailable: (gatekeeperId: number, vendorId?: string) => Promise<void> =
         async () => {}) {
   let controllerEnable = vi.fn(async (_initiator: object, _target: object) => {});
+  let controllerDisable = vi.fn(async () => {});
   let record = {
     id: 4,
     actionId: 12,
     gatekeeperId: 1,
     vendorId: "email",
     gadgetId,
-    controller: {enable: controllerEnable},
+    controller: {enable: controllerEnable, disable: controllerDisable},
     callback: {},
     description: {title: "Incoming email", description: "Receives email"},
     enabled: false,
   };
+  let impl = Object.create(
+      overseerTestInternals.OverseerImpl.prototype) as OverseerImplForTest;
+  Object.assign(impl, {
+    ownerId: "user-id",
+    ensureAmbientCapsules: async () => {},
+    markOutputsDirty: () => {},
+    joinPresence: () => () => {},
+    joinOutputsFanout: () => () => {},
+    assertGatekeeperAvailable,
+    hookTransitions: new Map(),
+    logger: {warn: vi.fn()},
+    users: {
+      idFromString: (id: string) => id,
+      get: () => ({
+        whoami: async () => ({id: "profile-id", name: "Test User"}),
+      }),
+    },
+    ctx: {
+      id: {toString: () => "workspace-id"},
+      exports: {GatekeeperHookLoopback: ({props}: {props: object}) => props},
+    },
+    storage: {
+      prohibitAllSharing: {get: () => false},
+      boundHooks: {get: () => record, put: vi.fn()},
+      actions: {get: () => undefined, put: vi.fn()},
+    },
+  });
   let overseer = {
     open: OverseerDurableObject.prototype.open,
-    impl: {
-      ownerId: "user-id",
-      ensureAmbientCapsules: async () => {},
-      markOutputsDirty: () => {},
-      joinPresence: () => () => {},
-      joinOutputsFanout: () => () => {},
-      assertGatekeeperAvailable,
-      users: {
-        idFromString: (id: string) => id,
-        get: () => ({
-          whoami: async () => ({id: "profile-id", name: "Test User"}),
-        }),
-      },
-      ctx: {
-        id: {toString: () => "workspace-id"},
-        exports: {GatekeeperHookLoopback: ({props}: {props: object}) => props},
-      },
-      storage: {
-        prohibitAllSharing: {get: () => false},
-        boundHooks: {get: () => record, put: vi.fn()},
-        actions: {get: () => undefined, put: vi.fn()},
-      },
-    },
+    impl,
   } satisfies Pick<OverseerDurableObject, "open"> & {impl: object};
   let notifyClosed = new NativeRpcStub<() => void>(() => {});
   let client = await overseer.open("user-id", "profile-id", notifyClosed);
-  return {client, controllerEnable};
+  return {client, controllerEnable, controllerDisable, record, impl};
+}
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  let promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return {promise, resolve, reject};
+}
+
+function makeHookTransitionHarness(options: {
+  enabled?: boolean;
+  desiredState?: "enabled" | "disabled" | "deleted";
+  generation?: number;
+  transitionPending?: boolean;
+  enable?: (initiator: object, target: object) => Promise<void>;
+  disable?: () => Promise<void>;
+  assertAvailable?: () => Promise<void>;
+} = {}) {
+  let controllerEnable = vi.fn(options.enable ?? (async () => {}));
+  let controllerDisable = vi.fn(options.disable ?? (async () => {}));
+  let record = {
+    id: 4,
+    actionId: 12,
+    gatekeeperId: 1,
+    vendorId: "email",
+    gadgetId: 17,
+    controller: {enable: controllerEnable, disable: controllerDisable},
+    callback: {},
+    description: {title: "Incoming email", description: "Receives email"},
+    enabled: options.enabled ?? false,
+    desiredState: options.desiredState ?? (options.enabled ? "enabled" : "disabled") as
+        "enabled" | "disabled" | "deleted",
+    generation: options.generation ?? 0,
+    transitionPending: options.transitionPending ?? false,
+  };
+  let action = {type: "bindHook" as const, enabled: record.enabled, hookId: record.id};
+  let records = new Map([[record.id, record]]);
+  let actions = new Map([[record.actionId, action]]);
+  let impl = Object.create(
+      overseerTestInternals.OverseerImpl.prototype) as OverseerImplForTest;
+  Object.assign(impl, {
+    hookTransitions: new Map(),
+    logger: {warn: vi.fn()},
+    assertGatekeeperAvailable: vi.fn(options.assertAvailable ?? (async () => {})),
+    ctx: {
+      id: {toString: () => "workspace-id"},
+      exports: {GatekeeperHookLoopback: ({props}: {props: object}) => props},
+    },
+    storage: {
+      boundHooks: {
+        get: (id: number) => records.get(id),
+        put: (next: typeof record) => { records.set(next.id, {...next}); },
+        delete: (id: number) => { records.delete(id); },
+      },
+      actions: {
+        get: (id: number) => actions.get(id),
+        put: (next: typeof action) => { actions.set(record.actionId, {...next}); },
+      },
+    },
+  });
+  return {impl, records, actions, controllerEnable, controllerDisable};
 }
 
 describe("hook target", () => {
@@ -426,8 +543,204 @@ describe("hook target", () => {
     let {client, controllerEnable} = await makeTargetOverseer(
         undefined, assertGatekeeperAvailable);
 
-    await expect(client.enableHook(4)).rejects.toThrow(/Gatekeeper is disabled/);
+    await expect(client.enableHook(4)).rejects.toThrow(/^Hook is not available\.$/);
     expect(controllerEnable).not.toHaveBeenCalled();
+  });
+
+  it("persists disable intent before an in-flight enable and compensates in provider order",
+      async () => {
+    let enableStarted = deferred();
+    let releaseEnable = deferred();
+    let providerOrder: string[] = [];
+    let harness = makeHookTransitionHarness({
+      enable: async () => {
+        providerOrder.push("enable:start");
+        enableStarted.resolve();
+        await releaseEnable.promise;
+        providerOrder.push("enable:end");
+      },
+      disable: async () => { providerOrder.push("disable"); },
+    });
+
+    let enabling = harness.impl.enableHook(4);
+    await enableStarted.promise;
+    let afterEnableIntent = harness.records.get(4)!;
+    expect(afterEnableIntent).toMatchObject({
+      enabled: false, desiredState: "enabled", generation: 1, transitionPending: true,
+    });
+    expect(harness.controllerEnable.mock.calls[0][0]).toEqual({
+      overseerId: "workspace-id", hookId: 4, generation: 1,
+    });
+
+    let disabling = harness.impl.disableHook(4);
+    expect(harness.records.get(4)).toMatchObject({
+      enabled: false, desiredState: "disabled", generation: 2, transitionPending: true,
+    });
+    expect(harness.controllerDisable).not.toHaveBeenCalled();
+
+    releaseEnable.resolve();
+    await expect(enabling).rejects.toThrow(/superseded/);
+    await expect(disabling).resolves.toBeUndefined();
+
+    expect(providerOrder).toEqual(["enable:start", "enable:end", "disable", "disable"]);
+    expect(harness.records.get(4)).toMatchObject({
+      enabled: false, desiredState: "disabled", generation: 2, transitionPending: false,
+    });
+  });
+
+  it("makes delete win over an in-flight enable and removes the durable tombstone last",
+      async () => {
+    let enableStarted = deferred();
+    let releaseEnable = deferred();
+    let harness = makeHookTransitionHarness({
+      enable: async () => {
+        enableStarted.resolve();
+        await releaseEnable.promise;
+      },
+    });
+
+    let enabling = harness.impl.enableHook(4);
+    await enableStarted.promise;
+    let deleting = harness.impl.deleteHook(4);
+    expect(harness.records.get(4)).toMatchObject({
+      enabled: false, desiredState: "deleted", generation: 2, transitionPending: true,
+    });
+    expect(harness.actions.get(12)).toMatchObject({enabled: false, hookId: 4});
+
+    releaseEnable.resolve();
+    await expect(enabling).rejects.toThrow(/superseded/);
+    await expect(deleting).resolves.toBeUndefined();
+
+    expect(harness.controllerDisable).toHaveBeenCalledTimes(2);
+    expect(harness.records.has(4)).toBe(false);
+    expect(harness.actions.get(12)).toEqual({type: "bindHook", enabled: false});
+  });
+
+  it("compensates when admin policy changes during provider enable", async () => {
+    let enabledByAdmin = true;
+    let enableStarted = deferred();
+    let releaseEnable = deferred();
+    let harness = makeHookTransitionHarness({
+      assertAvailable: async () => {
+        if (!enabledByAdmin) throw new Error("Gatekeeper is disabled.");
+      },
+      enable: async () => {
+        enableStarted.resolve();
+        await releaseEnable.promise;
+      },
+    });
+
+    let enabling = harness.impl.enableHook(4);
+    await enableStarted.promise;
+    enabledByAdmin = false;
+    releaseEnable.resolve();
+
+    await expect(enabling).rejects.toThrow(/^Hook is no longer available\.$/);
+    expect(harness.controllerDisable).toHaveBeenCalledTimes(1);
+    expect(harness.records.get(4)).toMatchObject({
+      enabled: false, desiredState: "disabled", generation: 1, transitionPending: false,
+    });
+  });
+
+  it("does not release provider error details from enable or disable", async () => {
+    let enableHarness = makeHookTransitionHarness({
+      enable: async () => {
+        let error = new Error("private calendar description");
+        Object.assign(error, {accessToken: "provider-secret"});
+        throw error;
+      },
+    });
+
+    await expect(enableHarness.impl.enableHook(4))
+        .rejects.toThrow(/^Hook could not be enabled\.$/);
+    expect(enableHarness.records.get(4)).toMatchObject({
+      enabled: false, desiredState: "disabled", transitionPending: false,
+    });
+
+    let disableHarness = makeHookTransitionHarness({
+      enabled: true,
+      desiredState: "enabled",
+      generation: 8,
+      disable: async () => { throw new Error("private calendar description"); },
+    });
+    await expect(disableHarness.impl.disableHook(4))
+        .rejects.toThrow(/^Hook could not be disabled\.$/);
+    expect(disableHarness.records.get(4)).toMatchObject({
+      enabled: false, desiredState: "disabled", generation: 9, transitionPending: true,
+    });
+  });
+
+  it("replays a persisted pending disable with the same generation after restart", async () => {
+    let harness = makeHookTransitionHarness({
+      enabled: false,
+      desiredState: "disabled",
+      generation: 23,
+      transitionPending: true,
+    });
+
+    // A fresh implementation has an empty in-memory transition queue but sees the durable intent.
+    await harness.impl.disableHook(4);
+
+    expect(harness.controllerDisable).toHaveBeenCalledTimes(1);
+    expect(harness.records.get(4)).toMatchObject({
+      enabled: false, desiredState: "disabled", generation: 23, transitionPending: false,
+    });
+  });
+
+  it("does not overwrite an uncertain provider cleanup with a new enable intent", async () => {
+    let harness = makeHookTransitionHarness({
+      enabled: false,
+      desiredState: "disabled",
+      generation: 23,
+      transitionPending: true,
+      disable: async () => { throw new Error("private provider failure"); },
+    });
+
+    await expect(harness.impl.enableHook(4))
+        .rejects.toThrow(/^Hook could not be enabled while provider cleanup is pending\.$/);
+
+    expect(harness.controllerDisable).toHaveBeenCalledTimes(1);
+    expect(harness.controllerEnable).not.toHaveBeenCalled();
+    expect(harness.records.get(4)).toMatchObject({
+      enabled: false, desiredState: "disabled", generation: 23, transitionPending: true,
+    });
+  });
+
+  it("keeps fail-closed hook intent across a real Durable Object restart",
+      async () => {
+    let objectName = "hook-transition-restart-" + crypto.randomUUID();
+    let stub = env.TEST_OVERSEER.getByName(objectName);
+    await runInDurableObject(stub, (instance: OverseerDurableObject) => {
+      // Locally-created RpcStubs cannot be persisted by the workerd test harness. Plain objects
+      // deliberately model an unavailable provider after restart: recovery must retain the
+      // pending, callback-blocking state rather than fail open or discard it.
+      (instance as any).impl.storage.boundHooks.put({
+        id: 4,
+        actionId: 12,
+        gatekeeperId: 1,
+        vendorId: "email",
+        gadgetId: 17,
+        controller: {},
+        callback: {},
+        description: {title: "Incoming email", description: "Receives email"},
+        enabled: false,
+        desiredState: "disabled",
+        generation: 31,
+        transitionPending: true,
+      });
+    });
+
+    await abortAllDurableObjects();
+    stub = env.TEST_OVERSEER.getByName(objectName);
+
+    await runInDurableObject(stub, (instance: OverseerDurableObject) => {
+      expect((instance as any).impl.storage.boundHooks.get(4)).toMatchObject({
+        enabled: false,
+        desiredState: "disabled",
+        generation: 31,
+        transitionPending: true,
+      });
+    });
   });
 
 });
@@ -474,6 +787,16 @@ describe("disabled connection recovery", () => {
           actions: {get: () => action, put: putAction},
         },
         applyPendingAction,
+        rejectPendingAction: async (_id: number, profile: AiChatAuthorInfo) => {
+          Object.assign(action, {state: "rejected", resolvedBy: profile, appliedAt: new Date()});
+          putAction(action);
+          return {
+            record: action,
+            restart: false,
+            outcomeUnknown: false,
+            shouldDrainAutoApprovals: false,
+          };
+        },
         assertGatekeeperAvailable: async () => {
           throw new Error("Google Calendar is disabled.");
         },

@@ -6,7 +6,7 @@ import { validateRpc } from 'capnweb-validate';
 import { collection, createTypedStorage } from '@gadgets/typed-storage';
 import { createWorkshopLogger } from "./observability";
 import { ADMIN_CONFIG_KEY, FEATURED_BLUEPRINTS_KEY, isReservedBlueprintKey, parseBlueprintKvRecord, readBlueprintKvRecord, sanitizeBlueprintOutput, serializeFeaturedBlueprints } from './blueprint-archive.js';
-import { AdminConfig, DEFAULT_ADMIN_CONFIG, FormatCuration, MAX_AGENT_HINT, defaultOutputFormatId, listPromotedFormats, reorderFormats, sanitizeOutputOverrides, serializeAdminConfig } from './admin-config.js';
+import { AdminConfig, DEFAULT_ADMIN_CONFIG, FormatCuration, MAX_AGENT_HINT, defaultOutputFormatId, listPromotedFormats, parseAdminConfigForAuthority, reorderFormats, sanitizeOutputOverrides, serializeAdminConfig } from './admin-config.js';
 import { SITE_LOGO_R2_KEY, siteLogoImage, validateSiteLogo } from './site-logo.js';
 import { ambientGatekeeperMode, DEFAULT_AMBIENT_GATEKEEPER_MODE } from './provisioning-policy.js';
 import { buildGatekeeperVendorMap } from './auth/auth-vendors.js';
@@ -26,8 +26,8 @@ function makeAdminSettingsStorage(storage: DurableObjectStorage) {
       }),
     },
     singletons: {
-      // Authoritative deployment admin config. Mirrored to BLUEPRINTS KV (ADMIN_CONFIG_KEY) so the
-      // connect/login/agent hot paths can read it without touching this singleton DO.
+      // Authoritative deployment admin config. BLUEPRINTS KV carries a presentation/discovery
+      // mirror only; every positive-authority boundary reads this singleton DO directly.
       adminConfig: DEFAULT_ADMIN_CONFIG as AdminConfig,
 
       // Which set of bundled format blueprints has been installed (see
@@ -50,9 +50,8 @@ type AdminSettingsStorage = ReturnType<typeof makeAdminSettingsStorage>;
  * Deployment-wide admin settings singleton.
  *
  * This durable object is always addressed as `getByName("")`. It contains settings that only
- * admins may modify. Settings modified through this DO are published to KV so that user requests
- * do not have to access the AdminSettings DO directly (which they could otherwise overload), but
- * having a singleton DO writing to KV avoids race conditions when updating KV.
+ * admins may modify. Settings modified through this DO are published to KV for cheap presentation
+ * reads, while security decisions use the strongly-consistent singleton record.
  */
 export class AdminSettings extends DurableObject<Cloudflare.Env> {
   private storage: AdminSettingsStorage;
@@ -263,7 +262,8 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   // is missing that field entirely, so reads must backfill from the defaults or the first
   // deployment to upgrade hits `undefined` on it.
   #config(): AdminConfig {
-    return { ...DEFAULT_ADMIN_CONFIG, ...this.storage.adminConfig.get() };
+    let stored = {...DEFAULT_ADMIN_CONFIG, ...this.storage.adminConfig.get()};
+    return parseAdminConfigForAuthority(serializeAdminConfig(stored));
   }
 
   getAdminConfig(): AdminConfig {
@@ -277,13 +277,22 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     await previousMutation;
     try {
       let current = this.#config();
-      let next = mutate(current);
+      if (current.revision >= Number.MAX_SAFE_INTEGER) {
+        throw new Error("The deployment policy revision is exhausted.");
+      }
+      // This Durable Object record is the policy authority. Commit it first with a monotonic
+      // revision, then update the eventually-consistent KV presentation mirror. Never roll back an
+      // authoritative enable/disable after another request may already have observed it.
+      let next = {...mutate(current), revision: current.revision + 1};
       this.storage.adminConfig.put(next);
       try {
         await this.env.BLUEPRINTS.put(ADMIN_CONFIG_KEY, serializeAdminConfig(next));
       } catch (error) {
-        this.storage.adminConfig.put(current);
-        throw error;
+        logger.error("admin config mirror failed", {
+          event: "admin.config.mirror.failed",
+          policyRevision: next.revision,
+          error,
+        });
       }
     } finally {
       release();
@@ -352,8 +361,8 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
       : Promise<void> {
     await this.#mutateAdminConfig(config => {
       let next = mutate(config.formats);
-      // A no-op may be a retry after the prior KV write failed but DO storage succeeded. Mirror the
-      // current config again so idempotent retries repair that partial failure.
+      // A no-op still advances the authoritative revision and rewrites the presentation mirror,
+      // which also gives a later idempotent request a chance to repair a failed mirror write.
       return next ? {...config, formats: next} : config;
     });
   }
@@ -364,7 +373,7 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
       throw new Error("Blueprint not found.");
     }
     await this.#mutateFormats(formats => {
-      // Idempotent so retrying after a KV mirror failure reaches #mutateFormats()'s repair write.
+      // Idempotent so a retry repairs the presentation mirror without duplicating the entry.
       if (formats.some(f => f.blueprintId === blueprintId)) return null;
       // A blueprint that declares no output still needs a stable grouping key before the admin can
       // name it. Generate that hidden implementation detail here; the panel only asks the admin for

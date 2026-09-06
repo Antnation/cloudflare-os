@@ -706,6 +706,22 @@ export interface GatekeeperUser extends WorkerEntrypoint {
 export interface GatekeeperUserVerifier extends WorkerEntrypoint {}
 
 /**
+ * Optional structured result from rejecting a staged action. Returning nothing means the rejection
+ * succeeded. A gatekeeper that can see a prior terminal outcome should report it explicitly so the
+ * Workshop never has to infer durable state from human-readable exception text.
+ */
+export type ActionRejectionResult = {
+  /**
+   * The terminal provider-side outcome. `unknown` means the write may have landed; the Workshop
+   * closes the local action but tells the user to verify the target service.
+   */
+  outcome?: "rejected" | "applied" | "unknown";
+
+  /** Whether cleaning up the rejected action requires restarting the Gadget. */
+  restart?: boolean;
+};
+
+/**
  * Interface exposed by a Gatekeeper instance implementing a specific resource binding on a
  * specific Gadget.
  *
@@ -825,8 +841,9 @@ export interface Gatekeeper<Session> extends DurableObject {
   /**
    * Action was approved. This call should apply the action (or schedule it to be applied).
    *
-   * If this throws an exception, the user will be informed that the action failed and given the
-   * opportunity to retry or discard.
+   * If this throws an exception, the action is not applied again: the Workshop cannot distinguish a
+   * pre-send failure from a lost response after the provider wrote. The user may verify the target
+   * service and discard the staged action.
    *
    * Depending on policy conditions, an action may be approved and applied automatically. However,
    * the gatekeeper is nevertheless expected to submit all actions for approval; there is no mode
@@ -836,14 +853,16 @@ export interface Gatekeeper<Session> extends DurableObject {
 
   /**
    * Indicates that an action was rejected by the user. The gatekeeper should clean up any
-   * associated storage.
+   * associated storage. This operation must be idempotent: a repeated rejection must not perform a
+   * positive side effect. If the gatekeeper knows that an earlier resolution already reached a
+   * terminal state, it should return that state in `outcome`.
    *
    * If the returned `restart` flag is true, rejecting this action requires restarting the Gadget.
    * This is sometimes needed by gatekeepers that simulate actions as if they had been approved --
    * the session may be in a state that is difficult to roll back without confusing the Gadget.
    * The Overseer will take care of the restart, possibly after rejecting other actions.
    */
-  rejectAction(action: number): Promise<void | {restart?: boolean}>;
+  rejectAction(action: number): Promise<void | ActionRejectionResult>;
 
   /**
    * Attempts to revert an action that was already applied.

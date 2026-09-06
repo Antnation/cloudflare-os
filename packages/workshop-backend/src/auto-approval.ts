@@ -65,6 +65,11 @@ export class AutoApprovalDrainer {
             rec.gatekeeperId === gatekeeperId && rec.type === "action" && rec.state === "pending");
 
     for (let record of pending) {
+      // A failed approval has an outcome the Workshop cannot prove, so it becomes a manual cleanup
+      // gate rather than being dispatched again. A resolving claim belongs to a concurrent manual
+      // approval or an earlier drain and likewise cannot be skipped past.
+      if (record.resolutionAttempt !== undefined) break;
+
       let tag = record.description.actionKind?.tag;
       let rule = tag !== undefined
           ? this.storage.autoApproveTags.get(`${gatekeeperId}:${tag}`)

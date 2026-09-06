@@ -85,6 +85,24 @@ describe("ActionStore", () => {
     expect(() => store.stage("send", {})).not.toThrow();
   });
 
+  it("reports terminal state structurally when rejection follows an earlier resolution", async () => {
+    const store = new ActionStore(fakeSql());
+    const applied = store.stage("send", {applied: true});
+    await store.apply(applied.id, fn => fn({callTool: ok} as never), log);
+
+    expect(store.reject(applied.id)).toBe("applied");
+    expect(store.reject(999_999)).toBe("unknown");
+
+    const failed = store.stage("send", {failed: true});
+    const disconnected = async () => {
+      throw new McpSessionExpiredError();
+    };
+    await expect(store.apply(
+      failed.id, fn => fn({callTool: disconnected} as never), log,
+    )).rejects.toThrow(/may or may not have taken effect/);
+    expect(store.reject(failed.id)).toBe("unknown");
+  });
+
   it("records a declined call as retryable, distinct from a rejection", async () => {
     // The server answered, so the tool did not run and another attempt cannot duplicate anything.
     const store = new ActionStore(fakeSql());
